@@ -42,6 +42,10 @@ pub const NABU_STATUS_VERSION: u16 = 1;
 pub const NABU_CAPABILITIES: u32 = 1;
 
 /// Состояние сессии драйвера (совпадает с `charger_core::State`).
+///
+/// В bring-up используются все варианты: `Idle`/`Detecting`/`Ready` — после
+/// подключения таймера детекции (см. `docs/HANDOVER.md`).
+#[allow(dead_code)]
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NabuState {
@@ -59,6 +63,7 @@ pub enum NabuState {
 
 impl NabuState {
     /// Переводит состояние ядра в контрактное представление.
+    #[allow(dead_code)] // Подключается вместе с таймером детекции.
     #[must_use]
     pub const fn from_core(state: charger_core::State) -> Self {
         match state {
@@ -136,6 +141,7 @@ pub struct NabuIclRequest {
 }
 
 /// Одна запись журнала в буфере [`IOCTL_NABU_GET_JOURNAL`].
+#[allow(dead_code)] // Заполняется при подключении выдачи журнала клиенту.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NabuJournalEntry {

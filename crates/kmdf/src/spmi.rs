@@ -36,6 +36,7 @@ use wdk_sys::{
 pub const IOCTL_RESOURCE_HUB_TRANSACT: u32 = 0x0032_C004;
 
 /// Тип устройства шины SPMI (старшие 16 бит кода).
+#[allow(dead_code)] // Используется при прямом открытии устройства без WDF.
 pub const FILE_DEVICE_RESOURCE_HUB: u32 = 0x32;
 
 /// Размер буфера обмена с шиной.
@@ -309,6 +310,7 @@ impl SpmiTransport {
     /// # Safety
     ///
     /// Дескрипторы должны быть валидны; вызов на пассивном уровне.
+    #[allow(dead_code)] // Вызывается из обработчика удаления устройства (bring-up).
     pub unsafe fn close(self) {
         // SAFETY: цель создана в `open`; закрываем корректно.
         unsafe {
@@ -355,7 +357,7 @@ unsafe fn reuse_request(request: WDFREQUEST) {
     params.Size = size_of_ulong::<WDF_REQUEST_REUSE_PARAMS>();
     // SAFETY: запрос завершён; параметры заполнены.
     unsafe {
-        call_unsafe_wdf_function_binding!(WdfRequestReuse, request, &raw mut params);
+        let _ = call_unsafe_wdf_function_binding!(WdfRequestReuse, request, &raw mut params);
     }
 }
 

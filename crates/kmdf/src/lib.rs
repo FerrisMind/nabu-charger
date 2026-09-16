@@ -129,6 +129,10 @@ fn static_journal() -> &'static RingJournal {
 }
 
 /// Контекст устройства: сессия драйвера зарядника.
+///
+/// Создаётся при подключении обработчика контекста устройства (bring-up),
+/// когда таймер детекции начинает работать с живой сессией.
+#[allow(dead_code)]
 struct DeviceContext {
     charger: Charger<'static, SpmiTransport, KernelClock, RingJournal>,
 }
