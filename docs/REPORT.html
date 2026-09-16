@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nabu-fastcharge — драйвер зарядки: отчёт о готовности</title>
+<style>
+  /* Оформление: Information Architects — системные шрифты, ноль декора,
+     читаемая мера строки, классические синие ссылки. */
+  html { font-size: 17px; }
+  body {
+    margin: 0 auto; padding: 3rem 1.25rem 6rem; max-width: 44rem;
+    font-family: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    line-height: 1.55; color: #111; background: #fff;
+  }
+  h1 { font-size: 1.6rem; line-height: 1.25; margin: 0 0 .25rem; }
+  h2 { font-size: 1.15rem; margin: 2.5rem 0 .75rem; padding-bottom: .3rem; border-bottom: 1px solid #ddd; }
+  h3 { font-size: 1rem; margin: 1.75rem 0 .5rem; }
+  p, li { margin: .6rem 0; }
+  .lead { color: #444; margin-bottom: 2rem; }
+  a { color: #0000EE; }
+  a:visited { color: #551A8B; }
+  code, pre { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: .86rem; }
+  code { background: #f4f4f4; padding: .1rem .3rem; border-radius: 2px; }
+  pre { background: #f7f7f7; border: 1px solid #e3e3e3; padding: .75rem .9rem; overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; margin: 1rem 0; font-size: .92rem; }
+  th, td { text-align: left; padding: .45rem .6rem; border-bottom: 1px solid #e3e3e3; vertical-align: top; }
+  th { border-bottom: 2px solid #ccc; font-weight: 600; }
+  .ok { color: #0a6b39; font-weight: 600; }
+  .no { color: #a01717; font-weight: 600; }
+  .wait { color: #8a5a00; font-weight: 600; }
+  .meta { color: #555; font-size: .88rem; }
+  ul { padding-left: 1.2rem; }
+  .note { border-left: 3px solid #ccc; padding-left: .9rem; color: #333; margin: 1.2rem 0; }
+</style>
+</head>
+<body>
+
+<h1>nabu-fastcharge: драйвер зарядки для Xiaomi Pad 5 под Windows on ARM64</h1>
+<p class="lead">Отчёт о готовности. Проверка от 16.09.2026, сборка на Rust 1.97.0 (edition 2024), цель драйвера — <code>aarch64-pc-windows-msvc</code>.</p>
+
+<h2>Задача</h2>
+<p>Под Windows планшет не заряжается ни от одного блока: от USB-A (Quick Charge) он разряжается, от USB-C (Power Delivery) ёмкость стоит на месте. Причина не в отсутствии «быстрой» зарядки, а в том, что <strong>аппаратная детекция адаптера в PMIC выполняется, но ни один компонент Windows не читает её результат</strong>, поэтому лимит входного тока не поднимается.</p>
+<p>Драйвер закрывает этот пробел: читает результат детекции (<code>APSD_RESULT_STATUS</code>) и выставляет лимит входного тока под распознанный тип адаптера.</p>
+
+<h2>Что сделано</h2>
+<table>
+  <tr><th>Часть</th><th>Содержимое</th><th>Проверка</th></tr>
+  <tr><td><code>crates/core</code></td><td>Ядро логики: разбор APSD, политика тока, состояния, таймауты, повторы, журнал. Без <code>std</code>, без <code>unsafe</code></td><td class="ok">37 unit-тестов</td></tr>
+  <tr><td><code>crates/host</code></td><td>Транспорты (мок, мок с журналом, TCP), журнал JSON Lines, мост в <code>tracing</code>, симулятор устройства, бенчмарки</td><td class="ok">9 интеграционных тестов</td></tr>
+  <tr><td><code>crates/cli</code></td><td>Утилита <code>nabu-charger</code>: <code>demo</code>, <code>detect</code>, <code>sim</code>, <code>verify</code></td><td class="ok">4 теста</td></tr>
+  <tr><td><code>crates/kmdf</code></td><td>Драйвер режима ядра: устройство, очередь IOCTL, транспорт к шине SPMI <code>\Device\RESOURCE_HUB</code></td><td class="wait">сборка WDK, см. ниже</td></tr>
+</table>
+
+<h2>Доказательства</h2>
+<table>
+  <tr><th>Проверка</th><th>Команда</th><th>Итог</th></tr>
+  <tr><td>Форматирование</td><td><code>cargo fmt --all --check</code></td><td class="ok">код возврата 0</td></tr>
+  <tr><td>Линтеры (педантичные, предупреждения = ошибки)</td><td><code>cargo clippy --workspace --all-targets -- -D warnings</code></td><td class="ok">код возврата 0</td></tr>
+  <tr><td>Релизная сборка</td><td><code>cargo build --workspace --release</code></td><td class="ok">успех</td></tr>
+  <tr><td>Тесты</td><td><code>cargo test --workspace</code></td><td class="ok">52 теста пройдено</td></tr>
+  <tr><td>Документация</td><td><code>cargo doc --workspace --no-deps</code></td><td class="ok">без предупреждений</td></tr>
+  <tr><td>Ядро без стандартной библиотеки</td><td><code>cargo build -p charger-core --no-default-features</code></td><td class="ok">успех</td></tr>
+  <tr><td>Демонстрация</td><td><code>cargo run -p cli -- demo</code></td><td class="ok">7 сценариев, включая 2 ожидаемых отказа</td></tr>
+  <tr><td>Самопроверка</td><td><code>cargo run -p cli -- verify</code></td><td class="ok">пройдена</td></tr>
+</table>
+
+<h3>Сценарии демонстрации</h3>
+<pre>сценарий   итог   адаптер    ток,мкА pump   пояснение
+HVDCP3P5   ок     HVDCP3     3000000 да     Quick Charge 3.0, 9 В и 3 А, возможен charge pump
+HVDCP3     ок     HVDCP3     3000000 да     Quick Charge 3.0, 9 В и 3 А, возможен charge pump
+HVDCP2     ок     HVDCP2     1500000 нет    Quick Charge 2.0, 9 В и 1.5 А
+DCP        ок     DCP        1500000 нет    порт только зарядки, BC1.2 1.5 А
+SDP        ок     SDP        500000  нет    стандартный порт USB, предел 500 мА
+DETACHED   отказ  —          —       —      ошибка detection_timeout
+UNKNOWN    отказ  —          —       —      ошибка unknown_adapter_pattern</pre>
+<p class="meta">Родной блок планшета до аутентификации QC3.5 определяется как HVDCP3 — это ожидаемое поведение, а не дефект: версия 3.5 подтверждается отдельной аутентификацией.</p>
+
+<h2>Производительность (базовая линия)</h2>
+<table>
+  <tr><th>Сценарий</th><th>Время</th></tr>
+  <tr><td>Полный цикл сессии (открытие → детекция → политика), HVDCP3</td><td>~0.9 мкс</td></tr>
+  <tr><td>Разбор результата детекции</td><td>305 пс</td></tr>
+  <tr><td>Чтение регистра на моке (512 операций)</td><td>3.15 мкс, 163 млн оп/с</td></tr>
+  <tr><td>Чтение по TCP к симулятору (64 операции)</td><td>8.38 мс, 7 640 оп/с</td></tr>
+</table>
+<p class="meta">Полная таблица и методика сравнения: <code>docs/PERFORMANCE.md</code>.</p>
+
+<h2>Чего пока нет</h2>
+<table>
+  <tr><th>Пункт</th><th>Состояние</th><th>Причина</th></tr>
+  <tr><td>Сборка драйвера режима ядра</td><td class="no">остановлено</td><td>Цель сборки верна (ARM64), но <code>bindgen</code> под libclang 23 разбирает заголовки WDF неполно. Нужен LLVM 17.x — см. <code>docs/HANDOVER.md</code>, раздел 6</td></tr>
+  <tr><td>Чтение регистра через шину SPMI</td><td class="wait">типизированный отказ</td><td>Раскладка ответа шины не подтверждена реверсом; догадка за факт не выдаётся</td></tr>
+  <tr><td>Charge pump LN8000 (полные 33 Вт)</td><td class="wait">следующий этап</td><td>Нужен отдельный драйвер I2C (адрес 0x51), протокол есть в исходниках Android</td></tr>
+</table>
+
+<h2>Как воспроизвести</h2>
+<pre>git clone &lt;репозиторий&gt;
+cd nabu-fastcharge
+
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo run -p cli -- --journal artifacts/journal-demo.jsonl demo
+cargo run -p cli -- verify
+
+# стенд без железа
+cargo run -p cli -- sim --adapter hvdcp3 --listen 127.0.0.1:9700
+cargo run -p cli -- detect --transport tcp --addr 127.0.0.1:9700
+
+# драйвер (нужны WDK и LLVM)
+cd crates/kmdf &amp;&amp; cargo wdk build</pre>
+
+<h2>Документы</h2>
+<ul>
+  <li><a href="../README.md">README.md</a> — быстрый старт и состав</li>
+  <li><a href="ARCHITECTURE.md">docs/ARCHITECTURE.md</a> — слои, решения, поток сессии</li>
+  <li><a href="REGISTERS.md">docs/REGISTERS.md</a> — карта регистров и образцы детекции</li>
+  <li><a href="PERFORMANCE.md">docs/PERFORMANCE.md</a> — базовая производительность</li>
+  <li><a href="HANDOVER.md">docs/HANDOVER.md</a> — сборка, откат, типовые сбои</li>
+  <li><a href="ACCEPTANCE.md">docs/ACCEPTANCE.md</a> — критерии приёмки с доказательствами</li>
+  <li><a href="../CHANGELOG.md">CHANGELOG.md</a> — история изменений</li>
+</ul>
+
+<p class="note">Все эксперименты обратимы: драйвер не меняет прошивку и не пишет в постоянную память, а его выгрузка возвращает штатное поведение Windows.</p>
+
+</body>
+</html>
