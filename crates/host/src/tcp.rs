@@ -11,7 +11,7 @@
 //!
 //! Строки завершаются `\n`. Адреса и значения — в шестнадцатеричном виде без префикса.
 
-use core::{ChargerTransport, TransportError, TransportErrorKind};
+use charger_core::{ChargerTransport, TransportError, TransportErrorKind};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;

@@ -13,7 +13,7 @@
 //! лимит входного тока: 3000000 мкА (код 0x1D)
 //! ```
 
-use core::{ChargerConfig, ChargerError};
+use charger_core::{ChargerConfig, ChargerError};
 use host::prelude::*;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

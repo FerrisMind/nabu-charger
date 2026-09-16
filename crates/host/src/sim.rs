@@ -21,8 +21,8 @@
 //! # }
 //! ```
 
-use core::testkit::{Fault, ScriptedMockTransport};
-use core::{AdapterType, ChargerTransport, regs};
+use charger_core::testkit::{Fault, ScriptedMockTransport};
+use charger_core::{AdapterType, ChargerTransport, regs};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::mpsc::{Receiver, Sender, channel};

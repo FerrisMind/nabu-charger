@@ -1,11 +1,11 @@
 //! Мок-транспорт с журналом транзакций.
 //!
-//! Отличается от [`core::testkit::ScriptedMockTransport`] тем, что
+//! Отличается от [`charger_core::testkit::ScriptedMockTransport`] тем, что
 //! живёт в `std` и ведёт полный список обращений: удобно для интеграционных
 //! тестов и для демонстраций из командной строки.
 
-use core::testkit::{Fault, ScriptedMockTransport};
-use core::{AdapterType, ChargerTransport, TransportError, TransportErrorKind, regs};
+use charger_core::testkit::{Fault, ScriptedMockTransport};
+use charger_core::{AdapterType, ChargerTransport, TransportError, TransportErrorKind, regs};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 

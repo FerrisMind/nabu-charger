@@ -10,8 +10,8 @@
     clippy::indexing_slicing
 )]
 
-use core::testkit::Fault;
-use core::{
+use charger_core::testkit::Fault;
+use charger_core::{
     AdapterType, Charger, ChargerConfig, ChargerError, Clock, Monitor, NullJournal,
     TransportErrorKind,
 };
@@ -89,7 +89,7 @@ fn session_over_tcp_against_simulator() {
     // QC3.5 поднимается до HVDCP3P5 только после аутентификации: без неё
     // аппаратура сообщает образец HVDCP3, и драйвер честно говорит HVDCP3.
     let config = ChargerConfig {
-        qc35: core::Qc35Support::Supported {
+        qc35: charger_core::Qc35Support::Supported {
             authenticated: true,
         },
         ..ChargerConfig::for_nabu()
@@ -150,8 +150,8 @@ fn power_removal_is_reported_as_detached() {
     run_until_ready(&mut charger, &clock, RunOptions::default(), |_| Ok(())).expect("детекция");
 
     // Пропажа питания выражается снятым битом готовности в APSD_STATUS.
-    handle.set_reg(core::regs::APSD_STATUS, 0);
-    handle.set_reg(core::regs::APSD_RESULT_STATUS, 0);
+    handle.set_reg(charger_core::regs::APSD_STATUS, 0);
+    handle.set_reg(charger_core::regs::APSD_RESULT_STATUS, 0);
     let detached = wait_for(
         || matches!(charger.monitor(), Ok(Monitor::Detached)),
         Duration::from_secs(2),
@@ -165,7 +165,7 @@ fn transport_faults_are_retried_and_surface_as_typed_errors() {
     let clock = SystemClock::start();
     let mut mock = MockTransport::hvdcp3();
     mock.push_fault(Fault::ReadError {
-        addr: core::regs::APSD_STATUS,
+        addr: charger_core::regs::APSD_STATUS,
         kind: TransportErrorKind::Timeout,
         times: 1,
     });
@@ -177,7 +177,7 @@ fn transport_faults_are_retried_and_surface_as_typed_errors() {
     // Второй сбой исчерпывает бюджет повторов и превращается в типизированную ошибку.
     let mut strict = MockTransport::hvdcp3();
     strict.push_fault(Fault::ReadError {
-        addr: core::regs::APSD_STATUS,
+        addr: charger_core::regs::APSD_STATUS,
         kind: TransportErrorKind::Disconnected,
         times: 4,
     });
@@ -202,7 +202,7 @@ fn failed_reset_blocks_opening() {
     let mut mock = MockTransport::hvdcp3();
     mock.fail_next_resets(1);
     mock.push_fault(Fault::ReadError {
-        addr: core::regs::APSD_STATUS,
+        addr: charger_core::regs::APSD_STATUS,
         kind: TransportErrorKind::Io,
         times: 2,
     });

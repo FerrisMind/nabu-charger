@@ -11,7 +11,7 @@ keywords = ["driver", "charger", "pmic", "tracing"]
 categories = ["hardware-support", "development-tools::testing"]
 
 [dependencies]
-core = { workspace = true }
+charger_core = { package = "charger-core", path = "../core", version = "0.1.0" }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["fmt", "json", "env-filter"] }
 serde = { version = "1.0.219", features = ["derive"] }

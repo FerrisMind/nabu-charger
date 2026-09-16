@@ -11,7 +11,7 @@ keywords = ["driver", "pmic", "charger", "spmi", "no-std"]
 categories = ["hardware-support", "no-std", "embedded"]
 
 [lib]
-name = "core"
+name = "charger_core"
 doctest = false
 
 [features]

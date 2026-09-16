@@ -9,7 +9,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, missing_docs)]
 
-use core::{AdapterType, ChargerTransport, regs};
+use charger_core::{AdapterType, ChargerTransport, regs};
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use host::mock::MockTransport;
 use host::sim::Simulator;

@@ -7,7 +7,7 @@
 //!  "adapter":"HVDCP3","raw_status":3,"raw_result":72,"waited_ms":1500}
 //! ```
 
-use core::journal::{Event, EventKind, Journal, Level};
+use charger_core::journal::{Event, EventKind, Journal, Level};
 use serde_json::{Map, Value, json};
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};

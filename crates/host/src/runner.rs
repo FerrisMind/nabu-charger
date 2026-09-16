@@ -1,6 +1,6 @@
 //! Блокирующий цикл сессии: превращает неблокирующие шаги ядра в сценарий.
 
-use core::{
+use charger_core::{
     AdapterType, ChargePlan, Charger, ChargerError, ChargerTransport, Clock, Detection, Journal,
     State, Stats,
 };
@@ -96,7 +96,7 @@ where
     J: Journal,
 {
     match charger.monitor()? {
-        core::Monitor::Unchanged(_) | core::Monitor::Detached => Ok(None),
-        core::Monitor::Changed(adapter) => Ok(Some(charger.apply(adapter)?)),
+        charger_core::Monitor::Unchanged(_) | charger_core::Monitor::Detached => Ok(None),
+        charger_core::Monitor::Changed(adapter) => Ok(Some(charger.apply(adapter)?)),
     }
 }

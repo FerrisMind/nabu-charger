@@ -1,6 +1,6 @@
 //! Монотонные часы процесса.
 
-use core::Clock;
+use charger_core::Clock;
 use std::time::Instant;
 
 /// Часы на основе [`Instant`]: монотонные, без перескоков системного времени.

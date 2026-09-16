@@ -45,7 +45,7 @@ pub mod prelude {
     pub use crate::runner::{RunOptions, SessionOutcome, run_until_ready};
     pub use crate::sim::{Simulator, SimulatorHandle};
     pub use crate::tcp::TcpTransport;
-    pub use core::{
+    pub use charger_core::{
         AdapterType, ChargePlan, Charger, ChargerConfig, ChargerError, ChargerTransport, Clock,
         Detection, Journal, Monitor, NullJournal, State, Stats,
     };

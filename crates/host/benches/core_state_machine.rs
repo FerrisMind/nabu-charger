@@ -8,8 +8,8 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, missing_docs)]
 
-use core::testkit::VecJournal;
-use core::{AdapterType, Charger, ChargerConfig, ManualClock, NullJournal, Qc35Support};
+use charger_core::testkit::VecJournal;
+use charger_core::{AdapterType, Charger, ChargerConfig, ManualClock, NullJournal, Qc35Support};
 use criterion::{Criterion, criterion_group, criterion_main};
 use host::mock::MockTransport;
 use host::prelude::RunOptions;
@@ -89,7 +89,7 @@ fn bench_full_session(c: &mut Criterion) {
 fn bench_decode(c: &mut Criterion) {
     c.bench_function("decode/apsd_result", |b| {
         b.iter(|| {
-            let status = core::regs::APSD_DTC_STATUS_DONE | core::regs::QC_CHARGER;
+            let status = charger_core::regs::APSD_DTC_STATUS_DONE | charger_core::regs::QC_CHARGER;
             let result = AdapterType::Hvdcp3.apsd_pattern();
             if let Ok(adapter) = AdapterType::decode(status, result, Qc35Support::default()) {
                 black_box(adapter);
