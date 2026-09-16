@@ -16,7 +16,8 @@ USB-A (Quick Charge), ни от USB-C (Power Delivery). Причина не в �
 | Крейт | Что это | Проверка |
 |---|---|---|
 | [`crates/core`](crates/core) | ядро логики SMB: детекция APSD, политика тока, состояния, таймауты, журнал. Без `std`, без `unsafe` | 37 unit-тестов + doctests |
-| [`crates/ln8000`](crates/ln8000) | ядро драйвера charge pump LN8000 (I²C 0x51): регистры, режимы, защиты, АЦП. Без `std`, без `unsafe` | 29 unit-тестов + doctests |
+| [`crates/ln8000`](crates/ln8000) | ядро драйвера charge pump LN8000 (I²C 0x51): регистры, режимы, защиты, АЦП, телеметрия сеансов, тепловая защита. Без `std`, без `unsafe` | 42 unit-теста + doctests |
+| [`crates/ln8000-kmdf`](crates/ln8000-kmdf) | KMDF-драйвер LN8000 на узле ACPI `PEIC` поверх I²C (SPB/Resource Hub) + скрипты установки и диагностики | собран под ARM64 |
 | [`crates/host`](crates/host) | хост-слой: транспорты (мок, TCP), журнал JSONL, `tracing`, симулятор устройства, бенчмарки | 9 интеграционных тестов |
 | [`crates/cli`](crates/cli) | утилита `nabu-charger`: `demo`, `detect`, `sim`, `verify` | 4 теста CLI |
 | [`crates/kmdf`](crates/kmdf) | драйвер режима ядра (KMDF) для ARM64 через шину SPMI | собран: `kmdf.sys` ARM64, подписан, `infverif` пройден |
@@ -119,11 +120,21 @@ UNKNOWN    отказ  —          —       —      ошибка unknown_adap
 ```powershell
 rustup target add aarch64-pc-windows-msvc
 cargo install cargo-wdk --locked
-$env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"   # нужен LLVM 17.x
-cd crates/kmdf
-cargo wdk build --target-arch arm64 --profile release
-# результат: target/aarch64-pc-windows-msvc/release/kmdf_package/
+$env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"   # нужен LLVM 17.0.6
+
+# драйвер SMB-детекции (детекция блока и лимит тока)
+cd crates/kmdf        ; cargo wdk build --target-arch arm64 --profile release
+
+# драйвер charge pump LN8000 (узел PEIC, I2C 0x51)
+cd crates/ln8000-kmdf ; cargo wdk build --target-arch arm64 --profile release
 ```
+
+Готовые пакеты: `artifacts/driver-arm64/` (SMB) и
+`artifacts/driver-ln8000-arm64/` (LN8000).
+
+Установка и диагностика LN8000 — [docs/DEPLOY-LN8000.md](docs/DEPLOY-LN8000.md):
+`install-driver.ps1`, `nabu-ln8000.ps1 status|sessions|read|write|journal`,
+`uninstall-driver.ps1`.
 
 ## Лицензия
 

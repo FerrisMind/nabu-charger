@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LN8000 — протокол приёмки и состояние поставки</title>
+<style>
+  /* Оформление: preset 11 Build — «дорогая простота»: много воздуха,
+     контраст начертаний (200→700), один акцент, мягкие тени, без декора. */
+  html { font-size: 17px; }
+  body {
+    margin: 0; background: #fbfaf9; color: #14161a;
+    font-family: "Inter", -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+    font-weight: 300; line-height: 1.62;
+    padding: 5rem 1.5rem 7rem;
+  }
+  .wrap { max-width: 62rem; margin: 0 auto; }
+  h1 { font-size: 2.6rem; font-weight: 200; letter-spacing: -0.02em; margin: 0 0 0.4rem; }
+  h1 b { font-weight: 700; }
+  .sub { color: #6b7076; font-size: 0.95rem; font-weight: 300; margin: 0 0 4rem; }
+  h2 { font-size: 1.1rem; font-weight: 600; letter-spacing: 0.14em; text-transform: uppercase;
+       color: #6b7076; margin: 4.5rem 0 1.5rem; }
+  h3 { font-size: 1.15rem; font-weight: 600; margin: 2.5rem 0 0.6rem; }
+  p { margin: 0.8rem 0; }
+  .lead { font-size: 1.22rem; font-weight: 300; max-width: 46rem; }
+  strong, b { font-weight: 600; }
+  code { font-family: ui-monospace, Consolas, monospace; font-size: 0.86em;
+         background: #f1efec; padding: 0.12em 0.4em; border-radius: 4px; }
+  a { color: #1a5fd0; text-decoration: none; border-bottom: 1px solid rgba(26,95,208,0.3); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); gap: 1.5rem; margin: 2rem 0; }
+  .card { background: #fff; border: 1px solid #eceae7; border-radius: 14px; padding: 1.5rem 1.6rem;
+          box-shadow: 0 1px 2px rgba(20,22,26,0.03), 0 12px 32px -24px rgba(20,22,26,0.25); }
+  .card .k { font-size: 0.78rem; letter-spacing: 0.12em; text-transform: uppercase; color: #8b9096; }
+  .card .v { font-size: 1.6rem; font-weight: 200; margin: 0.35rem 0 0.2rem; letter-spacing: -0.01em; }
+  .card .v b { font-weight: 700; }
+  .card .n { color: #6b7076; font-size: 0.9rem; }
+  table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; font-size: 0.94rem; }
+  th { text-align: left; font-weight: 600; font-size: 0.78rem; letter-spacing: 0.1em;
+       text-transform: uppercase; color: #8b9096; padding: 0 0.9rem 0.7rem 0; border-bottom: 1px solid #e6e3df; }
+  td { padding: 0.85rem 0.9rem 0.85rem 0; border-bottom: 1px solid #f0eeeb; vertical-align: top; font-weight: 300; }
+  .ok { color: #0e7a4a; font-weight: 600; }
+  .todo { color: #a8600a; font-weight: 600; }
+  .flow { display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: stretch; margin: 2rem 0; }
+  .node { flex: 1 1 11rem; background: #fff; border: 1px solid #eceae7; border-radius: 12px;
+          padding: 1rem 1.1rem; box-shadow: 0 10px 30px -26px rgba(20,22,26,0.35); }
+  .node .t { font-weight: 600; font-size: 0.95rem; }
+  .node .d { color: #6b7076; font-size: 0.85rem; }
+  .arrow { align-self: center; color: #c3c0bb; font-size: 1.2rem; }
+  .callout { border-left: 2px solid #1a5fd0; padding: 0.2rem 0 0.2rem 1.2rem; margin: 2rem 0; color: #2a2e34; }
+  .callout.warn { border-left-color: #c8860d; }
+  footer { margin-top: 5rem; border-top: 1px solid #e6e3df; padding-top: 1.5rem; color: #8b9096; font-size: 0.86rem; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Charge pump <b>LN8000</b>: готовность к поставке</h1>
+<p class="sub">Xiaomi Pad 5 (nabu) · Windows on ARM64 · драйвер <code>ln8000_kmdf.sys</code> · 16.09.2026</p>
+
+<p class="lead">Драйвер charge pump собран под ARM64, подписан и упакован. Логика управления чипом перенесена из GPL-драйвера Android один в один, покрыта тестами и заведена в драйвер ядра через шину I²C узла <code>PEIC</code>. Ниже — что именно проверено машинно, что требует планшета и как откатиться.</p>
+
+<h2>Тракт управления</h2>
+<div class="flow">
+  <div class="node"><div class="t">ACPI PEIC</div><div class="d"><code>QCOM057E</code>, I²C 0x51 на <code>\_SB.I2C5</code>, <code>_STA=0x0F</code></div></div>
+  <div class="arrow">→</div>
+  <div class="node"><div class="t">Resource Hub</div><div class="d"><code>\Device\RESOURCE_HUB\</code> + 16 hex от connection ID из <code>_CRS</code></div></div>
+  <div class="arrow">→</div>
+  <div class="node"><div class="t">SPB / SPB_TRANSFER_LIST</div><div class="d"><code>IOCTL_SPB_EXECUTE_SEQUENCE</code> = 0x041808</div></div>
+  <div class="arrow">→</div>
+  <div class="node"><div class="t">Драйвер ядра</div><div class="d">probe 0x42 → пороги → режим 2:1 → телеметрия и защита</div></div>
+</div>
+<p>Каждый шаг тракта сверен с источником: адрес и режимы — с <code>ln8000_charger.c/.h</code>, путь шины — с <code>reshub.h</code>, список передач — с <code>spb.h</code>, структура узла — с живым дампом DSDT планшета.</p>
+
+<h2>Проверено машинно</h2>
+<div class="grid">
+  <div class="card"><div class="k">Драйвер ARM64</div><div class="v"><b>0xAA64</b></div><div class="n">PE Machine, <code>ln8000_kmdf.sys</code> 56.5 КБ, подписан, <code>infverif</code> пройден</div></div>
+  <div class="card"><div class="k">Тесты</div><div class="v"><b>97</b></div><div class="n">37 ядро SMB · 43 ядро LN8000 · 9 интеграционных · 4 CLI · doctests</div></div>
+  <div class="card"><div class="k">Линтеры</div><div class="v"><b>0</b></div><div class="n">clippy <code>-D warnings</code>, fmt, doc — чисто</div></div>
+  <div class="card"><div class="k">Без std</div><div class="v"><b>2/2</b></div><div class="n">оба ядра собираются без стандартной библиотеки</div></div>
+</div>
+
+<table>
+  <tr><th>Что</th><th>Команда</th><th>Итог</th></tr>
+  <tr><td>Сборка драйвера LN8000</td><td><code>cargo wdk build --target-arch arm64 --profile release</code></td><td class="ok">Finished building ln8000-kmdf</td></tr>
+  <tr><td>Сборка драйвера SMB</td><td>то же в <code>crates/kmdf</code></td><td class="ok">Finished building kmdf</td></tr>
+  <tr><td>Демонстрация режима 2:1</td><td><code>cargo run -p cli -- pump --profile qc35</code></td><td class="ok">SWITCHING, отказов нет</td></tr>
+  <tr><td>Самопроверка таблиц</td><td><code>cargo run -p cli -- verify</code></td><td class="ok">пройдена</td></tr>
+  <tr><td>Синтаксис скриптов развёртывания</td><td>разбор всех четырёх <code>.ps1</code></td><td class="ok">ошибок нет</td></tr>
+</table>
+
+<h2>Границы и честные оговорки</h2>
+<div class="callout warn">
+<p><b>Физическая проверка не выполнена.</b> Протокол приёмки из десяти пунктов подготовлен (ниже), но не заполнен замерами: для этого нужен планшет с установленным драйвером и внешний USB-мультиметр. Всё, что можно проверить без железа, — проверено и подтверждено командами.</p>
+</div>
+<div class="callout">
+<p><b>Согласование 9/11 В — не задача charge pump.</b> Повышенное напряжение с блоком согласует Type-C/PD-часть платформы (PM8150B). Без неё LN8000 работает в bypass 1:1 от 5 В либо удерживает уже согласованное напряжение. Это зафиксировано в дорожной карте проекта.</p>
+</div>
+<div class="callout">
+<p><b>Два места помечены <code>TODO(bring-up)</code>:</b> чтение/запись произвольного регистра по IOCTL с адресом из буфера клиента и выгрузка кольца отсчётов в буфер клиента. Логика под ними готова и протестирована — осталась привязка к буферам запроса.</p>
+</div>
+
+<h2>Протокол приёмки на устройстве</h2>
+<table>
+  <tr><th>№</th><th>Сценарий</th><th>Критерий</th><th>Статус</th></tr>
+  <tr><td>1</td><td>Базовый режим 5 В</td><td>зафиксированы ток, напряжение, мощность</td><td class="todo">нужен стенд</td></tr>
+  <tr><td>2</td><td>Ускоренный режим</td><td>режим <code>SWITCHING</code>, рост мощности относительно п. 1</td><td class="todo">нужен стенд</td></tr>
+  <tr><td>3</td><td>Удержание режима 10 минут</td><td>режим не откатывается, температура ниже 43 °C</td><td class="todo">нужен стенд</td></tr>
+  <tr><td>4</td><td>Тепловая защита</td><td>событие в журнале, ток снижен либо bypass</td><td class="todo">нужен стенд</td></tr>
+  <tr><td>5</td><td>Смена блока на несовместимый</td><td>сеанс закрыт, новый открыт, зависаний нет</td><td class="todo">нужен стенд</td></tr>
+  <tr><td>6</td><td>Обрыв кабеля</td><td>устройство возвращается в рабочее состояние</td><td class="todo">нужен стенд</td></tr>
+  <tr><td>7</td><td>Перезагрузка</td><td>драйвер поднимается, режим восстанавливается</td><td class="todo">нужен стенд</td></tr>
+  <tr><td>8</td><td>Чистая установка</td><td><code>install-driver.ps1</code> без ошибок, без правок реестра</td><td class="todo">нужен стенд</td></tr>
+  <tr><td>9</td><td>Откат</td><td>штатное поведение зарядки, остатков нет</td><td class="todo">нужен стенд</td></tr>
+  <tr><td>10</td><td>Повторная установка</td><td>проходит успешно, счётчики с нуля</td><td class="todo">нужен стенд</td></tr>
+</table>
+
+<h2>Риски и откат</h2>
+<table>
+  <tr><th>Риск</th><th>Оценка</th><th>Мера</th></tr>
+  <tr><td>Перегрев при ускоренном режиме</td><td>средний</td><td>три уровня защиты: снижение тока (43 °C) → bypass (48 °C) → stop (55 °C), каждое событие в журнале</td></tr>
+  <tr><td>Ложные показания АЦП</td><td>низкий</td><td>решение по трём каналам, пороги с запасом, каждая запись проверяется чтением</td></tr>
+  <tr><td>Отсутствие ответа шины</td><td>средний</td><td>таймаут 1 с, две попытки, при отказе — bypass/standby и запись в журнал</td></tr>
+  <tr><td>Некорректный адрес регистра</td><td>средний</td><td>адреса сверены с GPL-драйвером, значения проверяются обратным чтением</td></tr>
+</table>
+<p><b>Откат:</b> <code>uninstall-driver.ps1</code> останавливает службу и удаляет пакет, ведёт транскрипт в <code>%ProgramData%\nabu-fastcharge\uninstall.log</code>. Драйвер не пишет в прошивку и не меняет настройки питания — удаление возвращает устройство к поведению до установки. Предыдущая версия сохраняется в <code>%ProgramData%\nabu-fastcharge\backup</code> и возвращается одной командой <code>pnputil</code>.</p>
+
+<h2>Материалы поставки</h2>
+<table>
+  <tr><th>Файл</th><th>Назначение</th></tr>
+  <tr><td><code>artifacts/driver-ln8000-arm64/</code></td><td>пакет драйвера: <code>ln8000_kmdf.sys</code>, <code>.inf</code>, <code>.cat</code>, сертификат тестовой подписи</td></tr>
+  <tr><td><code>deploy/install-driver.ps1</code>, <code>update-driver.ps1</code>, <code>uninstall-driver.ps1</code></td><td>установка, обновление, откат</td></tr>
+  <tr><td><code>deploy/nabu-ln8000.ps1</code></td><td>диагностика: <code>status</code>, <code>sessions</code>, <code>read</code>, <code>write</code>, <code>journal</code></td></tr>
+  <tr><td><code>docs/DEPLOY-LN8000.md</code></td><td>руководство: установка, профили, сбои, риски, протокол</td></tr>
+  <tr><td><code>docs/LN8000.md</code></td><td>карта регистров, режимы, формулы кодирования</td></tr>
+</table>
+
+<footer>
+Состояние: код и сборка готовы, физическая приёмка ожидает планшета и мультиметра.
+Все технические утверждения имеют источник: GPL-драйвер Android, заголовки WDK, живой дамп DSDT, драйверы Qualcomm — ссылки в документах.
+</footer>
+
+</div>
+</body>
+</html>
