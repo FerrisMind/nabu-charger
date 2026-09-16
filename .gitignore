@@ -1,13 +1,13 @@
 # --- Rust / Cargo ---
-/target/
+# Любой target/: корневой workspace и crates/kmdf (отдельный [workspace]).
+target/
 **/*.rs.bk
 *.orig
 
-# --- Локальные артефакты сборки и прогонов verify/bench/demo ---
-/artifacts/
-/crates/**/artifacts/
+# --- Локальные артефакты verify / bench / demo ---
+artifacts/
 
-# --- Windows / KMDF / MSVC ---
+# --- Windows / KMDF / MSVC (сборочные артефакты) ---
 *.pdb
 *.ilk
 *.exp
@@ -15,9 +15,11 @@
 *.lib
 *.sys
 !driver/*.sys
-*.inf
 *.cat
 *.cer
+
+# INF — исходники драйвера; не игнорируем.
+# Подписанные пакеты кладите в /artifacts/ или /driver/.
 
 # --- IDE ---
 .vscode/
@@ -37,3 +39,4 @@ Desktop.ini
 
 # --- Прочее ---
 *.log
+*.tmp
