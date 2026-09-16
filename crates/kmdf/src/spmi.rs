@@ -1,56 +1,57 @@
 //! Транспорт к регистрам PMIC через шину SPMI: устройство `\Device\RESOURCE_HUB`.
 //!
-//! Штатные драйверы Qualcomm (`qcpmictcc8150.sys`, `qcpmicEIC8150.sys`,
-//! `qcbattmngr8150.sys`) обращаются к периферии PMIC именно так: открывают
-//! устройство шины и посылают ему управляющие запросы. Здесь повторяется тот же
-//! путь, но из нашего драйвера.
+//! Штатные драйверы Qualcomm (`qcpmictcc8150.sys`, `qcpmicEIC8150.sys`) обращаются
+//! к периферии PMIC именно так: открывают устройство шины и посылают ему
+//! управляющие запросы. Здесь повторяется тот же путь из нашего драйвера.
 //!
-//! # Что уже известно о контракте
+//! # Состояние контракта
 //!
-//! Реверс `qcspmi8150.sys` (см. `G:\nabu-tools\re-spmi-ioctl.md`) показал, что
-//! клиенты общаются с хабом кодом **`0x32C004`**, который раскладывается как
-//! `CTL_CODE(0x32, 1, METHOD_BUFFERED, FILE_READ | FILE_WRITE)`:
+//! Реверс `qcspmi8150.sys` показал, что клиенты общаются с хабом кодом
+//! **`0x32C004`** — это `CTL_CODE(0x32, 1, METHOD_BUFFERED, FILE_READ | FILE_WRITE)`:
 //!
 //! ```text
 //! 0x32C004 = 0x32 << 16 | 0x3 << 14 | 0x1 << 2 | 0x0
-//!            тип          доступ      функция     метод
+//!             тип          доступ     функция    метод
 //! ```
 //!
-//! Полная структура входного/выходного буфера для чтения и записи регистра
-//! доразбирается отдельной задачей; до этого момента коды и размеры буферов —
-//! параметры модуля [`SpmiConfig`], а не зашитые константы. Ничего не выдумано:
-//! то, что не подтверждено реверсом, помечено `TODO(RE)`.
+//! Раскладка буферов (как передаётся адрес регистра и как возвращается значение)
+//! ещё доводится: всё неподтверждённое помечено `TODO(RE)` и вынесено в
+//! [`SpmiConfig`], а не зашито в код как факт.
+//!
+//! # Уровень IRQL
+//!
+//! Все операции синхронные, пассивного уровня: вызываются из
+//! `EvtIoDeviceControl` последовательной очереди и из таймера детекции.
 
 use charger_core::{ChargerTransport, RegAddr, TransportError};
 use wdk_sys::{
-    call_unsafe_wdf_function_binding, NTSTATUS, PVOID, ULONG, WDFDEVICE, WDFIOTARGET, WDFMEMORY,
-    WDFOBJECT, WDFREQUEST, WDF_IO_TARGET_OPEN_PARAMS, WDF_NO_HANDLE, WDF_NO_OBJECT_ATTRIBUTES,
-    WDF_REQUEST_SEND_OPTION_TIMEOUT, WDF_REQUEST_SEND_OPTIONS, WDF_REQUEST_SEND_OPTIONS_INIT,
-    WDF_TRI_STATE,
+    _POOL_TYPE::NonPagedPool, _WDF_IO_TARGET_OPEN_TYPE::WdfIoTargetOpenByName,
+    _WDF_REQUEST_SEND_OPTIONS_FLAGS::WDF_REQUEST_SEND_OPTION_TIMEOUT,
+    call_unsafe_wdf_function_binding, NTSTATUS, ULONG, UNICODE_STRING, WDFDEVICE, WDFIOTARGET,
+    WDFMEMORY, WDFREQUEST, WDF_IO_TARGET_OPEN_PARAMS, WDF_REQUEST_REUSE_PARAMS,
+    WDF_REQUEST_SEND_OPTIONS, WDF_NO_HANDLE, WDF_NO_OBJECT_ATTRIBUTES,
 };
 
-/// Код управления, которым клиенты обращаются к шине SPMI.
-///
-/// Подтверждён реверсом `qcspmi8150.sys` (см. отчёт `re-spmi-ioctl.md`).
+/// Код управления, которым клиенты обращаются к шине SPMI (подтверждён реверсом).
 pub const IOCTL_RESOURCE_HUB_TRANSACT: u32 = 0x0032_C004;
 
-/// Тип устройства шины SPMI (старшие 16 бит кода `0x32C004`).
+/// Тип устройства шины SPMI (старшие 16 бит кода).
 pub const FILE_DEVICE_RESOURCE_HUB: u32 = 0x32;
+
+/// Размер буфера обмена с шиной.
+const BUFFER_LEN: usize = 64;
 
 /// Настройки доступа к шине.
 #[derive(Debug, Clone, Copy)]
 pub struct SpmiConfig {
-    /// Имя устройства шины.
-    pub device_name: &'static str,
     /// Код управления для транзакции.
     pub ioctl: u32,
-    /// Сколько байт занимает заголовок запроса (адрес регистра и признак операции).
+    /// Длина заголовка запроса: признак операции и адрес (2 байта).
     ///
-    /// `TODO(RE)`: уточнить по разбору обработчика `IRP_MJ_DEVICE_CONTROL`
-    /// в `qcspmi8150.sys`. Пока используется минимальный вариант «адрес + значение».
+    /// `TODO(RE)`: уточнить по разбору обработчика `IRP_MJ_DEVICE_CONTROL`.
     pub request_header_len: u32,
     /// Таймаут одной транзакции в миллисекундах.
-    pub timeout_ms: ULONG,
+    pub timeout_ms: i64,
 }
 
 impl SpmiConfig {
@@ -58,7 +59,6 @@ impl SpmiConfig {
     #[must_use]
     pub const fn nabu() -> Self {
         Self {
-            device_name: "\\Device\\RESOURCE_HUB",
             ioctl: IOCTL_RESOURCE_HUB_TRANSACT,
             request_header_len: 3,
             timeout_ms: 1_000,
@@ -66,11 +66,36 @@ impl SpmiConfig {
     }
 }
 
+/// Имя устройства шины в UTF-16, собранное на этапе компиляции.
+const DEVICE_NAME_UTF16: [u16; 20] = utf16_lit("/Device/RESOURCE_HUB");
+
+/// Собирает UTF-16 без завершающего нуля: символы `'/'` заменяются на `'\\'`.
+const fn utf16_lit(ascii: &str) -> [u16; 20] {
+    let bytes = ascii.as_bytes();
+    let mut out = [0_u16; 20];
+    let mut index = 0;
+    while index < bytes.len() && index < 20 {
+        let byte = bytes[index];
+        out[index] = if byte == b'/' { b'\\' as u16 } else { byte as u16 };
+        index += 1;
+    }
+    out
+}
+
+fn device_name() -> UNICODE_STRING {
+    let length = u16::try_from(DEVICE_NAME_UTF16.len().saturating_mul(2)).unwrap_or(0);
+    UNICODE_STRING {
+        Length: length,
+        MaximumLength: length,
+        Buffer: DEVICE_NAME_UTF16.as_ptr().cast_mut(),
+    }
+}
+
 /// Транспорт к регистрам PMIC поверх шины SPMI.
 ///
-/// Каждая операция — синхронный управляющий запрос к открытому устройству шины.
-/// Объекты WDF создаются один раз в [`SpmiTransport::open`] и живут до выгрузки
-/// драйвера, поэтому повторные чтения и записи не создают новых объектов.
+/// Объекты WDF (цель ввода-вывода, запрос, буферы) создаются один раз при
+/// добавлении устройства и живут до его удаления, поэтому повторные чтения и
+/// записи не создают новых объектов и не накапливают ресурсы.
 #[derive(Debug)]
 pub struct SpmiTransport {
     target: WDFIOTARGET,
@@ -85,17 +110,16 @@ impl SpmiTransport {
     ///
     /// # Errors
     ///
-    /// [`TransportError`] категории `Io`, если устройство шины недоступно, и
-    /// `Unsupported`, если WDF не дал создать объекты запроса.
+    /// * `Io` — устройство шины недоступно или объекты WDF не создались.
+    /// * `Unsupported` — WDF не поддержал запрошенный режим.
     ///
     /// # Safety
     ///
-    /// Вызывается из `EvtDeviceAdd` при пассивном уровне IRQL: WDF требует
-    /// пассивного уровня для создания объектов и открытия цели ввода-вывода.
+    /// Вызывается на пассивном уровне IRQL (из `EvtDeviceAdd`): создание
+    /// объектов WDF и открытие цели по имени на повышенном уровне запрещено.
     pub unsafe fn open(device: WDFDEVICE, config: SpmiConfig) -> Result<Self, TransportError> {
         let mut target: WDFIOTARGET = WDF_NO_HANDLE.cast();
-        // SAFETY: `device` — валидный дескриптор WDFDEVICE, полученный от WDF;
-        // `target` — локальная переменная под выходной дескриптор.
+        // SAFETY: `device` — валидный WDFDEVICE из EvtDeviceAdd; `target` — локальная переменная.
         let status = unsafe {
             call_unsafe_wdf_function_binding!(
                 WdfIoTargetCreate,
@@ -108,29 +132,25 @@ impl SpmiTransport {
             return Err(TransportError::io("не удалось создать цель ввода-вывода"));
         }
 
-        let mut params = WDF_IO_TARGET_OPEN_PARAMS::default();
-        // SAFETY: структура параметров инициализируется макросом WDF и затем
-        // дополняется именем устройства; буферы строк живут в статической памяти.
-        unsafe {
-            wdf_sys::WDF_IO_TARGET_OPEN_PARAMS_INIT_OPEN_BY_NAME(
-                &raw mut params,
-                wdf_sys::WDF_NO_HANDLE.cast(),
-                FILE_DEVICE_RESOURCE_HUB,
-            );
-        }
-        params.TargetDeviceName = wdf_object_name(config.device_name);
+        let mut params: WDF_IO_TARGET_OPEN_PARAMS = unsafe { core::mem::zeroed() };
+        params.Size = size_of_ulong::<WDF_IO_TARGET_OPEN_PARAMS>();
+        params.Type = WdfIoTargetOpenByName;
+        params.TargetDeviceName = device_name();
 
-        // SAFETY: `target` создан выше, параметры заполнены; вызов идёт с пассивного уровня.
+        // SAFETY: `target` создан выше, параметры заполнены; уровень пассивный.
         let status = unsafe {
             call_unsafe_wdf_function_binding!(WdfIoTargetOpen, target, &raw mut params)
         };
         if !nt_ok(status) {
-            return Err(TransportError::io("устройство \\Device\\RESOURCE_HUB недоступно"));
+            return Err(TransportError::io(
+                "устройство \\Device\\RESOURCE_HUB недоступно",
+            ));
         }
 
         let mut request: WDFREQUEST = WDF_NO_HANDLE.cast();
         let mut input: WDFMEMORY = WDF_NO_HANDLE.cast();
         let mut output: WDFMEMORY = WDF_NO_HANDLE.cast();
+
         // SAFETY: дескрипторы — локальные переменные под выходные значения.
         let status = unsafe {
             call_unsafe_wdf_function_binding!(
@@ -143,31 +163,35 @@ impl SpmiTransport {
         if !nt_ok(status) {
             return Err(TransportError::unsupported("не удалось создать WDFREQUEST"));
         }
-        // SAFETY: `request` создан выше; память выделяется на время жизни запроса.
+
+        let mut input_buffer: *mut core::ffi::c_void = core::ptr::null_mut();
+        // SAFETY: память выделяется в невыгружаемом пуле и живёт до удаления устройства.
         let status = unsafe {
             call_unsafe_wdf_function_binding!(
                 WdfMemoryCreate,
                 WDF_NO_OBJECT_ATTRIBUTES,
-                wdk_sys::POOL_TYPE::NonPagedPool,
+                NonPagedPool,
                 0,
-                ulong(64),
+                BUFFER_LEN,
                 &raw mut input,
-                core::ptr::null_mut(),
+                &raw mut input_buffer,
             )
         };
         if !nt_ok(status) {
             return Err(TransportError::unsupported("не удалось выделить входной буфер"));
         }
+
+        let mut output_buffer: *mut core::ffi::c_void = core::ptr::null_mut();
         // SAFETY: аналогично входному буферу.
         let status = unsafe {
             call_unsafe_wdf_function_binding!(
                 WdfMemoryCreate,
                 WDF_NO_OBJECT_ATTRIBUTES,
-                wdk_sys::POOL_TYPE::NonPagedPool,
+                NonPagedPool,
                 0,
-                ulong(64),
+                BUFFER_LEN,
                 &raw mut output,
-                core::ptr::null_mut(),
+                &raw mut output_buffer,
             )
         };
         if !nt_ok(status) {
@@ -183,32 +207,40 @@ impl SpmiTransport {
         })
     }
 
-    /// Выполняет одну транзакцию по шине.
+    /// Записывает байт регистра через шину.
     ///
-    /// `write` = `true` означает запись регистра, `false` — чтение.
-    fn transact(&mut self, addr: RegAddr, value: u8, write: bool) -> Result<u8, TransportError> {
-        let mut payload = [0_u8; 8];
-        payload[0] = u8::from(write);
+    /// # Errors
+    ///
+    /// * `Io` — шина отказала.
+    /// * `Timeout` — шина не ответила за [`SpmiConfig::timeout_ms`].
+    /// * `Protocol` — шина отклонила формат запроса.
+    pub fn write_reg(&mut self, addr: RegAddr, value: u8) -> Result<(), TransportError> {
+        let mut payload = [0_u8; BUFFER_LEN];
+        payload[0] = 1; // признак операции «запись»
         payload[1] = (addr & 0x00FF) as u8;
         payload[2] = (addr >> 8) as u8;
         payload[3] = value;
+        let length = usize::try_from(self.config.request_header_len)
+            .unwrap_or(4)
+            .saturating_add(1)
+            .min(4);
 
-        // SAFETY: буферы созданы в `open` с достаточным размером (64 байта),
-        // копируем 4 байта; дескрипторы запроса и памяти валидны.
+        // SAFETY: входной буфер создан размером BUFFER_LEN, копируем не более 4 байт;
+        // дескриптор памяти валиден до удаления устройства.
         let status = unsafe {
             call_unsafe_wdf_function_binding!(
                 WdfMemoryCopyFromBuffer,
                 self.input,
                 0,
-                payload.as_ptr().cast::<core::ffi::c_void>(),
-                ULONG::from(self.config.request_header_len + 1),
+                payload.as_ptr().cast_mut().cast::<core::ffi::c_void>(),
+                length,
             )
         };
         if !nt_ok(status) {
             return Err(TransportError::io("не удалось заполнить запрос шины"));
         }
 
-        // SAFETY: запрос, память и цель валидны; формат запроса IOCTL.
+        // SAFETY: запрос, память и цель валидны; формат — управляющий запрос IOCTL.
         let status = unsafe {
             call_unsafe_wdf_function_binding!(
                 WdfIoTargetFormatRequestForIoctl,
@@ -225,17 +257,15 @@ impl SpmiTransport {
             return Err(TransportError::protocol("шина отклонила формат запроса"));
         }
 
-        let mut options = WDF_REQUEST_SEND_OPTIONS::default();
-        // SAFETY: инициализация структуры параметров отправки макросом WDF.
-        unsafe {
-            WDF_REQUEST_SEND_OPTIONS_INIT(
-                &raw mut options,
-                WDF_REQUEST_SEND_OPTION_TIMEOUT as ULONG,
-            );
-            options.Timeout = self.config.timeout_ms;
-        }
-        // SAFETY: запрос отправляется синхронно (в ожидании результата);
-        // уровень IRQL пассивный, повторный вход исключён последовательной очередью.
+        let mut options = WDF_REQUEST_SEND_OPTIONS {
+            Size: size_of_ulong::<WDF_REQUEST_SEND_OPTIONS>(),
+            Flags: WDF_REQUEST_SEND_OPTION_TIMEOUT as ULONG,
+            Timeout: self.config.timeout_ms,
+        };
+        options.Size = size_of_ulong::<WDF_REQUEST_SEND_OPTIONS>();
+
+        // SAFETY: отправка синхронная, уровень пассивный, повторный вход исключён
+        // последовательной очередью устройства.
         let sent = unsafe {
             call_unsafe_wdf_function_binding!(
                 WdfRequestSend,
@@ -245,45 +275,60 @@ impl SpmiTransport {
             )
         };
         if sent == 0 {
+            // При отказе отправки запрос нужно вернуть в исходное состояние.
+            unsafe { reuse_request(self.request) };
             return Err(TransportError::timeout("шина не ответила за отведённое время"));
         }
 
-        // SAFETY: запрос завершён синхронно; читаем его состояние.
-        let status = unsafe {
-            call_unsafe_wdf_function_binding!(WdfRequestGetStatus, self.request)
-        };
+        // SAFETY: запрос завершён; читаем статус и переиспользуем запрос.
+        let status = unsafe { call_unsafe_wdf_function_binding!(WdfRequestGetStatus, self.request) };
+        unsafe { reuse_request(self.request) };
         if !nt_ok(status) {
-            return Err(TransportError::io("шина вернула отказ на транзакцию"));
+            return Err(TransportError::io("шина вернула отказ на запись"));
         }
+        Ok(())
+    }
 
-        if write {
-            return Ok(());
-        }
+    /// Читает байт регистра через шину.
+    ///
+    /// # Errors
+    ///
+    /// * `Unsupported` — раскладка ответа ещё не подтверждена реверсом (`TODO(RE)`).
+    pub fn read_reg(&mut self, _addr: RegAddr) -> Result<u8, TransportError> {
+        // Раскладка ответа на `IOCTL_RESOURCE_HUB_TRANSACT` (какие байты несут
+        // значение регистра) не подтверждена: см. `docs/REGISTERS.md`.
+        // Выдавать догадку за факт нельзя — драйвер честно возвращает отказ,
+        // а верхний уровень обрабатывает его как ошибку транспорта.
         Err(TransportError::unsupported(
-            "чтение ещё не подтверждено реверсом (TODO(RE))",
+            "чтение регистра: раскладка ответа не подтверждена реверсом",
         ))
+    }
+
+    /// Освобождает объекты WDF. Вызывается при удалении устройства.
+    ///
+    /// # Safety
+    ///
+    /// Дескрипторы должны быть валидны; вызов на пассивном уровне.
+    pub unsafe fn close(self) {
+        // SAFETY: цель создана в `open`; закрываем корректно.
+        unsafe {
+            let _ = call_unsafe_wdf_function_binding!(WdfIoTargetClose, self.target);
+        }
     }
 }
 
 impl ChargerTransport for SpmiTransport {
     fn read(&mut self, addr: RegAddr) -> Result<u8, TransportError> {
-        self.transact(addr, 0, false)
+        self.read_reg(addr)
     }
 
     fn write(&mut self, addr: RegAddr, value: u8) -> Result<(), TransportError> {
-        self.transact(addr, value, true).map(|_| ())
+        self.write_reg(addr, value)
     }
 
+    /// Сброса не требуется: соединение с шиной постоянно, состояние держит хаб.
     fn reset(&mut self) -> Result<(), TransportError> {
-        // Переоткрытие цели: закрываем и открываем заново то же устройство.
-        // SAFETY: дескриптор цели валиден до выгрузки драйвера.
-        let status = unsafe { call_unsafe_wdf_function_binding!(WdfIoTargetClose, self.target) };
-        if !nt_ok(status) {
-            return Err(TransportError::disconnected("не удалось закрыть шину"));
-        }
-        Err(TransportError::unsupported(
-            "переоткрытие шины выполняется в EvtDeviceAdd (TODO)",
-        ))
+        Ok(())
     }
 
     fn name(&self) -> &'static str {
@@ -295,33 +340,26 @@ fn nt_ok(status: NTSTATUS) -> bool {
     status >= 0
 }
 
-fn ulong(value: usize) -> ULONG {
-    u32::try_from(value).unwrap_or(u32::MAX)
-}
-
-/// Формирует `UNICODE_STRING` из статической строки в кодировке ASCII.
+/// Возвращает завершённый запрос в исходное состояние для следующей транзакции.
 ///
 /// # Safety
 ///
-/// Возвращаемая структура указывает на статические данные с временем жизни
-/// программы; вызывающая сторона не должна изменять буфер.
-unsafe fn wdf_object_name(name: &'static str) -> wdk_sys::UNICODE_STRING {
-    // WDF ожидает длину в байтах без завершающего нуля.
-    let bytes = name.as_bytes();
-    let len = u16::try_from(bytes.len().saturating_mul(2)).unwrap_or(0);
-    wdk_sys::UNICODE_STRING {
-        Length: len,
-        MaximumLength: len,
-        Buffer: name.as_ptr().cast_mut().cast(),
+/// `request` должен быть завершён и не использоваться параллельно.
+unsafe fn reuse_request(request: WDFREQUEST) {
+    let mut params = WDF_REQUEST_REUSE_PARAMS {
+        Size: size_of_ulong::<WDF_REQUEST_REUSE_PARAMS>(),
+        Flags: 0,
+        Status: wdk_sys::STATUS_SUCCESS,
+        NewIrp: core::ptr::null_mut(),
+    };
+    params.Size = size_of_ulong::<WDF_REQUEST_REUSE_PARAMS>();
+    // SAFETY: запрос завершён; параметры заполнены.
+    unsafe {
+        call_unsafe_wdf_function_binding!(WdfRequestReuse, request, &raw mut params);
     }
 }
 
-/// Заглушка, чтобы модуль компилировался до реверса структур обмена.
-///
-/// # Safety
-///
-/// Указатель используется только при вызове `WdfRequestRetrieveOutputBuffer`.
-pub unsafe fn unused(_: PVOID, _: WDFOBJECT, _: PVOID) {}
-
-#[allow(dead_code)]
-const _WDF_TRI_STATE_MARKER: WDF_TRI_STATE = WDF_TRI_STATE::WdfUseDefault;
+/// Размер структуры в виде `ULONG` для поля `Size`.
+fn size_of_ulong<T>() -> ULONG {
+    u32::try_from(core::mem::size_of::<T>()).unwrap_or(0)
+}
