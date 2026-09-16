@@ -1,0 +1,27 @@
+[package]
+name = "ln8000"
+description = "Ядро драйвера charge pump LN8000 (Xiaomi Pad 5, I2C 0x51): регистры, режимы, защиты, статус"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+keywords = ["driver", "charger", "ln8000", "i2c", "no-std"]
+categories = ["hardware-support", "no-std", "embedded"]
+
+[lib]
+name = "ln8000"
+path = "src/lib.rs"
+
+[features]
+# `testkit` входит в стандартную сборку: примеры в документации должны
+# собираться и исполняться в `cargo test`.
+default = ["std", "testkit"]
+std = []
+testkit = []
+
+[lints]
+workspace = true
+
+[dependencies]

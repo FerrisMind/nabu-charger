@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/host", "crates/cli"]
+members = ["crates/core", "crates/host", "crates/cli", "crates/ln8000"]
 # Драйвер режима ядра подключается отдельно: ему нужен WDK и cargo-wdk,
 # которых нет в обычном окружении CI. См. crates/kmdf/README.md
 exclude = ["crates/kmdf"]
@@ -16,6 +16,7 @@ publish = false
 [workspace.dependencies]
 core = { package = "charger-core", path = "crates/core", version = "0.1.0" }
 host = { path = "crates/host", version = "0.1.0" }
+ln8000 = { path = "crates/ln8000", version = "0.1.0" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
