@@ -1,0 +1,76 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  verify:
+    name: сборка, линтеры, тесты, документация
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Установить toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.97.0"
+          components: rustfmt, clippy
+
+      - name: Кэш cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Форматирование
+        run: cargo fmt --all --check
+
+      - name: Линтеры (включая педантичные правила, предупреждения как ошибки)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Сборка релиза
+        run: cargo build --workspace --release
+
+      - name: Тесты
+        run: cargo test --workspace
+
+      - name: Документация (без внешних зависимостей)
+        run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
+      - name: Проверка ядра без std
+        run: cargo build -p charger-core --no-default-features
+
+  kernel-driver:
+    name: драйвер режима ядра (ARM64, WDK)
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Установить toolchain и цель ARM64
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.97.0"
+          targets: aarch64-pc-windows-msvc
+
+      - name: Установить cargo-wdk
+        run: cargo install cargo-wdk --locked
+
+      # ВНИМАНИЕ: сборка ядровой части требует WDK, LLVM/clang и совпадения
+      # версий libclang с wdk-sys. Шаг не валит сборку (continue-on-error),
+      # пока связка не подтверждена на сборочной машине: см. docs/HANDOVER.md.
+      - name: Собрать драйвер под ARM64
+        working-directory: crates/kmdf
+        run: cargo wdk build
