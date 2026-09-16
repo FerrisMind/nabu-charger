@@ -446,7 +446,7 @@ fn run_pump(profile: PumpProfile) -> Result<(), String> {
     bus.set_reg(AdcChannel::Iin.register(), 0x64); // пара (0x64, 0x00) → 489 мА
     bus.set_reg(AdcChannel::Vin.register(), 0xC8); // пара (0xC8, 0x00) → 3.2 В
     bus.set_reg(AdcChannel::Vbat.register(), 0x9C); // пара (0x9C, 0x02) → 4.34 В
-    bus.set_reg(AdcChannel::Vbat.register() + 1, 0x02);
+    bus.set_reg(AdcChannel::Vbat.register().saturating_add(1), 0x02);
 
     let mut pump = Pump::open(bus, config).map_err(|err| format!("открытие не удалось: {err}"))?;
     println!("шина          : {}", pump.bus_name());
