@@ -53,7 +53,9 @@
 pub mod driver;
 pub mod encoding;
 pub mod error;
+pub mod guard;
 pub mod regs;
+pub mod session;
 pub mod status;
 pub mod transport;
 
@@ -66,5 +68,8 @@ pub use encoding::{
     encode_iin_limit, encode_ntc_alarm, encode_vac_ovp, encode_vbat_float,
 };
 pub use error::{BusError, BusErrorKind, PumpError};
+pub use guard::{GuardAction, GuardLimits, evaluate, step_down};
+pub use regs::RegAddr;
+pub use session::{ChargeSession, Telemetry, TelemetrySample};
 pub use status::{AdcChannel, Status};
 pub use transport::RegisterBus;

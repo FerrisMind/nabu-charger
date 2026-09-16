@@ -432,6 +432,35 @@ impl<T: RegisterBus> Pump<T> {
         Ok(())
     }
 
+    /// Читает регистр напрямую (диагностика).
+    ///
+    /// Используется служебным интерфейсом драйвера, когда нужно посмотреть
+    /// регистр, для которого нет отдельного метода.
+    ///
+    /// # Errors
+    ///
+    /// * [`PumpError::NotOpen`] — сессия закрыта.
+    /// * [`PumpError::Bus`] — сбой шины.
+    pub fn read_register(&mut self, addr: u8) -> Result<u8, PumpError> {
+        if self.state == PumpState::Closed {
+            return Err(PumpError::NotOpen);
+        }
+        self.read(addr)
+    }
+
+    /// Записывает регистр напрямую (диагностика), с проверкой чтением.
+    ///
+    /// # Errors
+    ///
+    /// * [`PumpError::NotOpen`] — сессия закрыта.
+    /// * [`PumpError::OutOfRange`] — прочитанное значение не совпало с записанным.
+    pub fn write_register(&mut self, addr: u8, value: u8) -> Result<(), PumpError> {
+        if self.state == PumpState::Closed {
+            return Err(PumpError::NotOpen);
+        }
+        self.write_verified(addr, value, "diagnostic")
+    }
+
     /// Закрывает сессию: устройство переводится в standby.
     ///
     /// Ошибки в закрытии поглощаются: выгрузка драйвера не должна зависеть от
@@ -716,6 +745,19 @@ mod tests {
         // Конфигурацию нужно применить заново.
         pump.configure().unwrap();
         assert_eq!(pump.enable_switching().unwrap(), OpMode::Switching);
+    }
+
+    #[test]
+    fn diagnostic_register_access_round_trips() {
+        let bus = MockPumpBus::new();
+        let mut pump = Pump::open(bus, PumpConfig::default()).unwrap();
+        pump.write_register(regs::GLITCH_CTRL, 0x0C).unwrap();
+        assert_eq!(pump.read_register(regs::GLITCH_CTRL).unwrap(), 0x0C);
+        pump.close();
+        assert_eq!(
+            pump.read_register(regs::GLITCH_CTRL).unwrap_err().code(),
+            "not_open"
+        );
     }
 
     #[test]
