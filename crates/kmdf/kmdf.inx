@@ -1,0 +1,66 @@
+; =====================================================================
+; nabu-charger — драйвер зарядки Xiaomi Pad 5 (nabu)
+;
+; Модуль: kmdf.inx → kmdf.inf (шаблон, из него cargo-wdk собирает INF)
+; Целевая платформа: Windows on ARM64 (aarch64-pc-windows-msvc)
+; =====================================================================
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %ProviderString%
+PnpLockDown = 1
+DriverVer   = 09/16/2026,0.1.0.0
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskId1%,,,""
+
+[SourceDisksFiles]
+kmdf.sys = 1,,
+
+; ================= Установка устройства =================
+; Секция [ClassInstall32] здесь НЕ нужна: класс System объявлен Microsoft,
+; и infverif запрещает переопределять его (ERROR 1285).
+
+[Manufacturer]
+%StdMfg% = NabuCharger,NT$ARCH$.10.0...16299
+
+[NabuCharger.NT$ARCH$.10.0...16299]
+%NabuCharger.DeviceDesc% = NabuCharger_Device, root\nabu_charger
+
+[NabuCharger_Device.NT$ARCH$]
+CopyFiles = Drivers_Dir
+
+[Drivers_Dir]
+kmdf.sys
+
+; ================= Установка службы =================
+
+[NabuCharger_Device.NT$ARCH$.Services]
+AddService = kmdf, %SPSVCINST_ASSOCSERVICE%, NabuCharger_Service_Inst
+
+[NabuCharger_Service_Inst]
+DisplayName    = %NabuCharger.SVCDESC%
+ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
+StartType      = 3               ; SERVICE_DEMAND_START
+ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %13%\kmdf.sys
+
+; ================= Удаление устройства (rollback) =================
+
+[NabuCharger_Device.NT$ARCH$.HW]
+; Настройки устройства не требуются: параметры берутся из ядра логики.
+
+; ================= Строки =================
+
+[Strings]
+SPSVCINST_ASSOCSERVICE = 0x00000002
+ProviderString         = "nabu-fastcharge"
+StdMfg                 = "(Стандартные системные устройства)"
+DiskId1                = "nabu-charger, установочный диск #1"
+NabuCharger.DeviceDesc = "nabu-charger — контроллер зарядки Xiaomi Pad 5"
+NabuCharger.SVCDESC    = "nabu-charger — служба контроллера зарядки"
