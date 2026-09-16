@@ -438,14 +438,15 @@ fn run_pump(profile: PumpProfile) -> Result<(), String> {
 
     let mut bus = MockPumpBus::new();
     // Мок моделирует чип: запись в SYS_CTRL меняет SYS_STS.
-    // Коды АЦП 10-битные и читаются парой от регистра канала, поэтому старшие
-    // байты оставлены нулевыми: так каждое значение декодируется осмысленно.
-    bus.set_reg(AdcChannel::Iin.register(), 0x64); // 100 → 489 мА
-    bus.set_reg(AdcChannel::Vac.register(), 0x40); // 64 → 1.10 В
-    bus.set_reg(AdcChannel::Vin.register(), 0xC8); // 200 → 3.2 В
-    bus.set_reg(AdcChannel::Vout.register(), 0x7D); // 125 → 0.625 В
-    bus.set_reg(AdcChannel::Vbat.register(), 0x9C); // 156 → 1.78 В
-    bus.set_reg(AdcChannel::DieTemp.register(), 0x64); // 100 → 18.5 °C
+    //
+    // Показываем три канала, которые драйвер использует для алармов
+    // (IIN, VIN, VBAT): в моке их пары байт не пересекаются. Остальные каналы
+    // делят байты с соседями — это свойство аппаратуры, поэтому в демо они не
+    // выводятся, чтобы не показывать бессмысленные числа.
+    bus.set_reg(AdcChannel::Iin.register(), 0x64); // пара (0x64, 0x00) → 489 мА
+    bus.set_reg(AdcChannel::Vin.register(), 0xC8); // пара (0xC8, 0x00) → 3.2 В
+    bus.set_reg(AdcChannel::Vbat.register(), 0x9C); // пара (0x9C, 0x02) → 4.34 В
+    bus.set_reg(AdcChannel::Vbat.register() + 1, 0x02);
 
     let mut pump = Pump::open(bus, config).map_err(|err| format!("открытие не удалось: {err}"))?;
     println!("шина          : {}", pump.bus_name());
@@ -485,8 +486,8 @@ fn run_pump(profile: PumpProfile) -> Result<(), String> {
         }
     );
 
-    println!("\nпоказания АЦП (мок):");
-    for channel in AdcChannel::ALL {
+    println!("\nпоказания АЦП (мок), каналы алармов:");
+    for channel in [AdcChannel::Iin, AdcChannel::Vin, AdcChannel::Vbat] {
         let value = pump.read_adc(channel).map_err(|err| err.to_string())?;
         println!(
             "  {:<9} ADC{:<2} {:>9} {}",
@@ -500,7 +501,7 @@ fn run_pump(profile: PumpProfile) -> Result<(), String> {
     let (writes, reads) = pump.counters();
     println!("\nопераций      : записей {writes}, чтений {reads}");
     pump.standby().map_err(|err| err.to_string())?;
-    println!("после standby : {}", pump.state().label());
+    println!("после standby : {}", pump.op_mode().label());
     Ok(())
 }
 
