@@ -1,0 +1,30 @@
+[package]
+name = "charger-core"
+description = "Транспорт-независимое ядро драйвера зарядки Xiaomi Pad 5 (nabu): детекция адаптера по APSD и политика входного тока"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+keywords = ["driver", "pmic", "charger", "spmi", "no-std"]
+categories = ["hardware-support", "no-std", "embedded"]
+
+[lib]
+name = "core"
+doctest = false
+
+[features]
+# `testkit` входит в стандартную сборку, чтобы примеры из документации собирались
+# и исполнялись в `cargo test`. Драйвер режима ядра подключает крейт с
+# `default-features = false` и мок не тянет.
+default = ["std", "testkit"]
+# `std` используется тестами и хост-инструментами; ядро собирается и без него.
+std = []
+# `testkit` добавляет эталонный мок-транспорт и журнал в память.
+testkit = []
+
+[lints]
+workspace = true
+
+[dependencies]

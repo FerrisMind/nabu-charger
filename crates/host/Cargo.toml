@@ -1,0 +1,42 @@
+[package]
+name = "host"
+description = "Хост-слой драйвера зарядки nabu: транспорты (мок, TCP), журнал JSONL и tracing, симулятор устройства"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+keywords = ["driver", "charger", "pmic", "tracing"]
+categories = ["hardware-support", "development-tools::testing"]
+
+[dependencies]
+core = { workspace = true }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["fmt", "json", "env-filter"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+
+[dev-dependencies]
+criterion = { version = "0.7.0", features = ["html_reports"] }
+tempfile = "3.20.0"
+
+[features]
+default = []
+# Реальный транспорт по последовательному порту (требует системных библиотек).
+serial = ["dep:serialport"]
+
+[dependencies.serialport]
+version = "4.7.2"
+optional = true
+
+[[bench]]
+name = "core_state_machine"
+harness = false
+
+[[bench]]
+name = "transport_throughput"
+harness = false
+
+[lints]
+workspace = true
