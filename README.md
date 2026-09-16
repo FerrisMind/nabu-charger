@@ -15,7 +15,8 @@ USB-A (Quick Charge), ни от USB-C (Power Delivery). Причина не в �
 
 | Крейт | Что это | Проверка |
 |---|---|---|
-| [`crates/core`](crates/core) | ядро логики: детекция APSD, политика тока, состояния, таймауты, журнал. Без `std`, без `unsafe` | 37 unit-тестов + doctests |
+| [`crates/core`](crates/core) | ядро логики SMB: детекция APSD, политика тока, состояния, таймауты, журнал. Без `std`, без `unsafe` | 37 unit-тестов + doctests |
+| [`crates/ln8000`](crates/ln8000) | ядро драйвера charge pump LN8000 (I²C 0x51): регистры, режимы, защиты, АЦП. Без `std`, без `unsafe` | 29 unit-тестов + doctests |
 | [`crates/host`](crates/host) | хост-слой: транспорты (мок, TCP), журнал JSONL, `tracing`, симулятор устройства, бенчмарки | 9 интеграционных тестов |
 | [`crates/cli`](crates/cli) | утилита `nabu-charger`: `demo`, `detect`, `sim`, `verify` | 4 теста CLI |
 | [`crates/kmdf`](crates/kmdf) | драйвер режима ядра (KMDF) для ARM64 через шину SPMI | собран: `kmdf.sys` ARM64, подписан, `infverif` пройден |
@@ -31,12 +32,34 @@ cargo test --workspace
 # 2. Демонстрация: все типы адаптеров на мок-транспорте + журнал
 cargo run -p cli -- --journal artifacts/journal-demo.jsonl demo
 
-# 3. Самопроверка таблиц и математики драйвера
+# 3. Charge pump LN8000 на мок-шине I²C (настройка → режим 2:1 → статус → АЦП)
+cargo run -p cli -- pump --profile qc35
+
+# 4. Самопроверка таблиц и математики драйвера
 cargo run -p cli -- verify
 
-# 4. Стенд без железа: симулятор устройства + реальный TCP-транспорт
+# 5. Стенд без железа: симулятор устройства + реальный TCP-транспорт
 cargo run -p cli -- sim --adapter hvdcp3 --listen 127.0.0.1:9700
 cargo run -p cli -- detect --transport tcp --addr 127.0.0.1:9700
+```
+
+Ожидаемый вывод `pump` (проверено, см. `artifacts/verify-pump.txt`):
+
+```text
+шина          : mock
+состояние     : probed
+после настройки: configured
+режим         : SWITCHING (код 3)
+SYS_STS       : 0x04 (петля тока: нет, петля напряжения: нет)
+отказы        : нет
+
+показания АЦП (мок), каналы алармов:
+  iin       ADC1     489000 uA
+  vin       ADC3    3200000 uV
+  vbat      ADC6    4340000 uV
+
+операций      : записей 27, чтений 67
+после standby : STANDBY
 ```
 
 Ожидаемый вывод `demo` (проверено, см. `artifacts/verify-demo.txt`):
@@ -83,8 +106,13 @@ UNKNOWN    отказ  —          —       —      ошибка unknown_adap
 * **Read-путь** транспорта SPMI пока возвращает типизированный отказ: раскладка
   ответа шины не подтверждена реверсом до конца (см. `TODO(RE)` в
   `crates/kmdf/src/spmi.rs`). Догадка не выдаётся за факт.
-* **Charge pump (LN8000)** этим драйвером не управляется: для полных 33 Вт нужен
-  отдельный драйвер I2C (адрес 0x51), это следующий этап.
+* **Charge pump (LN8000)** — ядро готово и проверено (`crates/ln8000`: 29 тестов),
+  но драйвера поверх шины I²C под Windows пока нет: нужен KMDF-модуль на SpbCx
+  для узла ACPI `PEIC` (адрес 0x51). Регистры и последовательности уже описаны —
+  см. [docs/LN8000.md](docs/LN8000.md).
+* **Согласование напряжения (PD)** остаётся за Type-C-частью платформы: без неё
+  charge pump может держать уже согласованное напряжение или работать в bypass
+  от 5 В, но не выдаст полные 33 Вт.
 
 ## Сборка драйвера
 

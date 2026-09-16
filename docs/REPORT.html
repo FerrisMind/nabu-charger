@@ -46,7 +46,8 @@
 <h2>Что сделано</h2>
 <table>
   <tr><th>Часть</th><th>Содержимое</th><th>Проверка</th></tr>
-  <tr><td><code>crates/core</code></td><td>Ядро логики: разбор APSD, политика тока, состояния, таймауты, повторы, журнал. Без <code>std</code>, без <code>unsafe</code></td><td class="ok">37 unit-тестов</td></tr>
+  <tr><td><code>crates/core</code></td><td>Ядро логики SMB: разбор APSD, политика тока, состояния, таймауты, повторы, журнал. Без <code>std</code>, без <code>unsafe</code></td><td class="ok">37 unit-тестов</td></tr>
+  <tr><td><code>crates/ln8000</code></td><td>Ядро драйвера charge pump LN8000: регистры, режимы, защиты, 10-битный АЦП</td><td class="ok">29 unit-тестов</td></tr>
   <tr><td><code>crates/host</code></td><td>Транспорты (мок, мок с журналом, TCP), журнал JSON Lines, мост в <code>tracing</code>, симулятор устройства, бенчмарки</td><td class="ok">9 интеграционных тестов</td></tr>
   <tr><td><code>crates/cli</code></td><td>Утилита <code>nabu-charger</code>: <code>demo</code>, <code>detect</code>, <code>sim</code>, <code>verify</code></td><td class="ok">4 теста</td></tr>
   <tr><td><code>crates/kmdf</code></td><td>Драйвер режима ядра: устройство, очередь IOCTL, транспорт к шине SPMI <code>\Device\RESOURCE_HUB</code></td><td class="ok">собран под ARM64</td></tr>
@@ -58,11 +59,12 @@
   <tr><td>Форматирование</td><td><code>cargo fmt --all --check</code></td><td class="ok">код возврата 0</td></tr>
   <tr><td>Линтеры (педантичные, предупреждения = ошибки)</td><td><code>cargo clippy --workspace --all-targets -- -D warnings</code></td><td class="ok">код возврата 0</td></tr>
   <tr><td>Релизная сборка</td><td><code>cargo build --workspace --release</code></td><td class="ok">успех</td></tr>
-  <tr><td>Тесты</td><td><code>cargo test --workspace</code></td><td class="ok">52 теста пройдено</td></tr>
+  <tr><td>Тесты</td><td><code>cargo test --workspace</code></td><td class="ok">83 теста пройдено</td></tr>
   <tr><td>Документация</td><td><code>cargo doc --workspace --no-deps</code></td><td class="ok">без предупреждений</td></tr>
   <tr><td>Ядро без стандартной библиотеки</td><td><code>cargo build -p charger-core --no-default-features</code></td><td class="ok">успех</td></tr>
   <tr><td>Демонстрация</td><td><code>cargo run -p cli -- demo</code></td><td class="ok">7 сценариев, включая 2 ожидаемых отказа</td></tr>
   <tr><td>Самопроверка</td><td><code>cargo run -p cli -- verify</code></td><td class="ok">пройдена</td></tr>
+  <tr><td>Charge pump LN8000</td><td><code>cargo run -p cli -- pump --profile qc35</code></td><td class="ok">режим SWITCHING, отказов нет</td></tr>
   <tr><td>Сборка драйвера ARM64</td><td><code>cargo wdk build --target-arch arm64 --profile release</code></td><td class="ok">kmdf.sys, подписан, infverif пройден, PE = 0xAA64</td></tr>
 </table>
 
@@ -92,7 +94,7 @@ UNKNOWN    отказ  —          —       —      ошибка unknown_adap
   <tr><th>Пункт</th><th>Состояние</th><th>Причина</th></tr>
   <tr><td>Таймер детекции в ядре</td><td class="wait">не подключён</td><td>IOCTL <code>DETECT_START</code>/<code>APPLY_POLICY</code> возвращают <code>STATUS_NOT_IMPLEMENTED</code>; логика под ними готова и проверена на моках</td></tr>
   <tr><td>Чтение регистра через шину SPMI</td><td class="wait">типизированный отказ</td><td>Раскладка ответа шины не подтверждена реверсом; догадка за факт не выдаётся</td></tr>
-  <tr><td>Charge pump LN8000 (полные 33 Вт)</td><td class="wait">следующий этап</td><td>Нужен отдельный драйвер I2C (адрес 0x51), протокол есть в исходниках Android</td></tr>
+  <tr><td>Charge pump LN8000 (полные 33 Вт)</td><td class="wait">ядро готово</td><td>Логика перенесена из <code>ln8000_charger.c</code> и проверена 29 тестами; остался KMDF-модуль SpbCx для узла ACPI <code>PEIC</code> (I²C 0x51)</td></tr>
 </table>
 
 <h3>Собранный драйвер</h3>
@@ -110,6 +112,7 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo run -p cli -- --journal artifacts/journal-demo.jsonl demo
+cargo run -p cli -- pump --profile qc35
 cargo run -p cli -- verify
 
 # стенд без железа
@@ -123,7 +126,8 @@ cd crates/kmdf &amp;&amp; cargo wdk build --target-arch arm64 --profile release<
 <ul>
   <li><a href="../README.md">README.md</a> — быстрый старт и состав</li>
   <li><a href="ARCHITECTURE.md">docs/ARCHITECTURE.md</a> — слои, решения, поток сессии</li>
-  <li><a href="REGISTERS.md">docs/REGISTERS.md</a> — карта регистров и образцы детекции</li>
+  <li><a href="LN8000.md">docs/LN8000.md</a> — карта регистров и режимы charge pump LN8000</li>
+  <li><a href="REGISTERS.md">docs/REGISTERS.md</a> — карта регистров SMB и образцы детекции</li>
   <li><a href="PERFORMANCE.md">docs/PERFORMANCE.md</a> — базовая производительность</li>
   <li><a href="HANDOVER.md">docs/HANDOVER.md</a> — сборка, откат, типовые сбои</li>
   <li><a href="ACCEPTANCE.md">docs/ACCEPTANCE.md</a> — критерии приёмки с доказательствами</li>
