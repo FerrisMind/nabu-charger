@@ -4,7 +4,7 @@
 # x86_64 и драйвер не загрузился бы на планшете.
 [build]
 target = "aarch64-pc-windows-msvc"
-
-[target.aarch64-pc-windows-msvc]
-# Режим ядра: никакой стандартной библиотеки, только `wdk`/`wdk-sys`.
-rustflags = ["-C", "panic=abort"]
+# Ядро линкуется со статическим CRT: это требование WDK, и `wdk-build`
+# отказывается собирать драйвер без него (`Error: StaticCrtNotEnabled`).
+# `panic=abort` — обязательный режим для кода ядра.
+rustflags = ["-C", "target-feature=+crt-static", "-C", "panic=abort"]
