@@ -1,0 +1,10 @@
+# Драйвер режима ядра собирается ТОЛЬКО под ARM64: целевое устройство —
+# планшет Xiaomi Pad 5 (nabu, Snapdragon 860) под Windows on ARM64.
+# Хост-машина здесь amd64, поэтому без этого файла cargo по умолчанию собрал бы
+# x86_64 и драйвер не загрузился бы на планшете.
+[build]
+target = "aarch64-pc-windows-msvc"
+
+[target.aarch64-pc-windows-msvc]
+# Режим ядра: никакой стандартной библиотеки, только `wdk`/`wdk-sys`.
+rustflags = ["-C", "panic=abort"]
