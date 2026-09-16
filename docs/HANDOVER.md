@@ -31,7 +31,7 @@ cd crates/kmdf; cargo wdk build              # драйвер, aarch64
 | Цель rustup | `aarch64-pc-windows-msvc` | драйвер |
 | Visual Studio | 2022 с C++ | линковка |
 | WDK | 10.0.26100.0 | KMDF-заголовки и библиотеки |
-| LLVM / clang | **17.x (рекомендуется)** | `bindgen` в `wdk-sys` |
+| LLVM / clang | **17.0.6** | `bindgen` в `wdk-sys`; на 23.x разбор заголовков WDF ломается |
 | `cargo-wdk` | последний с `cargo install cargo-wdk --locked` | сборка KMDF |
 
 ```powershell
@@ -67,21 +67,31 @@ cargo run -p cli -- detect --transport tcp --addr 127.0.0.1:9700
 
 ```powershell
 cd crates/kmdf
-$env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"
-cargo wdk build
+$env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"   # LLVM 17.0.6
+cargo wdk build --target-arch arm64 --profile release
 ```
 
-Готовый `.sys` и `.inf` кладутся в `target/aarch64-pc-windows-msvc/debug/`
-(или `release` при `cargo wdk build --release`).
-
-Установка на планшет (PowerShell от администратора **на планшете**):
+Проверено: сборка заканчивается сообщением `Finished building kmdf`, пакет
+ложится в `target/aarch64-pc-windows-msvc/release/kmdf_package/` и содержит
+`kmdf.sys`, `kmdf.inf`, `kmdf.cat` и сертификат тестовой подписи. Разрядность
+можно проверить по заголовку PE:
 
 ```powershell
-# драйвер подписан тестовым сертификатом, на планшете уже включён test signing
-pnputil /add-driver .\nabu_charger.inf /install
+$sys = "crates/kmdf/target/aarch64-pc-windows-msvc/release/kmdf.sys"
+$b = [IO.File]::ReadAllBytes($sys); $pe = [BitConverter]::ToInt32($b, 0x3C)
+"Machine = 0x{0:X4}" -f [BitConverter]::ToUInt16($b, $pe + 4)   # 0xAA64 = ARM64
 ```
 
-Проверка: `pnputil /enum-drivers | findstr /i nabu`.
+Готовый пакет также скопирован в `artifacts/driver-arm64/`.
+
+Установка на планшет (PowerShell от администратора **на планшете**, тестовая
+подпись уже включена):
+
+```powershell
+pnputil /add-driver .\kmdf.inf /install
+# для root-устройства: создать узел, затем установить драйвер
+# (devcon install kmdf.inf root\nabu_charger или через диспетчер устройств)
+```
 
 ## 5. Версионирование и откат
 
@@ -118,7 +128,12 @@ Windows. Именно поэтому все эксперименты с реес
 | Симптом | Причина | Что делать |
 |---|---|---|
 | `failed to select a version for the requirement wdk-sys` | крейты `wdk*` версионируются несинхронно | использовать связку из официального семпла: `wdk 0.4.1` + `wdk-sys 0.5.1` + `wdk-build 0.5.1` |
-| `wdk-sys (lib) ... attempt to compute 1_usize - 56_usize, which would overflow` | `bindgen` не разобрал заголовки WDF: несовместимая версия libclang (у нас LLVM 23) | установить LLVM 17.x и указать `LIBCLANG_PATH` на его `bin`; проверить повторной сборкой |
+| `wdk-sys (lib) ... attempt to compute 1_usize - 56_usize, which would overflow` | `bindgen` не разобрал заголовки WDF: несовместимая версия libclang | **решено:** установить LLVM 17.0.6 и указать `LIBCLANG_PATH` на его `bin`; затем удалить `crates/kmdf/target` и пересобрать |
+| `Error: StaticCrtNotEnabled` | ядро линкуется со статическим CRT | в `crates/kmdf/.cargo/config.toml` должны быть флаги `-C target-feature=+crt-static -C panic=abort` |
+| `Missing .inx file in source path` | `cargo-wdk` требует шаблон INF | файл `crates/kmdf/kmdf.inx` обязателен, имя совпадает с именем пакета |
+| `ERROR(1285): Cannot specify [ClassInstall32] section for Microsoft-defined class` | для классов Microsoft секция класса запрещена | не объявлять `[ClassInstall32]` при `Class = System` |
+| `Failed to rename ... kmdf.dll to kmdf.sys` | `cargo wdk build` без указания архитектуры ищет сборку в `target/debug` | всегда передавать `--target-arch arm64` (тогда артефакты берутся из `target/aarch64-pc-windows-msvc/...`) |
+| `Failed to find function info for WdfGetTicks` | не все WDF-функции есть в таблице `cargo-wdk` | для времени в ядре использовать `wdk_sys::ntddk::KeQueryInterruptTimePrecise` (100-нс тики) |
 | `not a valid rust project/workspace` от `cargo wdk` | каталог не найден или манифест не парсится | запускать из `crates/kmdf`; убедиться, что в `Cargo.toml` есть `[workspace]` |
 | Драйвер собрался, но не грузится | не включён test signing или драйвер собран под x86_64 | `bcdedit /set testsigning on` на планшете и перезагрузка; проверить, что сборка шла под `aarch64-pc-windows-msvc` |
 | `read` возвращает `unsupported` | это ожидаемо: раскладка ответа шины SPMI ещё не подтверждена реверсом | см. `docs/REGISTERS.md`, раздел «Что осталось выяснить» |
@@ -141,7 +156,9 @@ Windows. Именно поэтому все эксперименты с реес
 
 ## 8. Что дальше по плану
 
-1. Довести read-путь шины SPMI (подтвердить раскладку ответа).
-2. Проверить драйвер на планшете: детекция блока и рост тока.
-3. Драйвер charge pump LN8000 (I2C 0x51) для полных 33 Вт.
-4. Термика и JEITA: ограничение тока по температуре.
+1. Подключить таймер детекции к очереди: IOCTL `DETECT_START` → таймер →
+   `detect_step` → `apply`. Логика готова, нужна проводка.
+2. Довести read-путь шины SPMI (подтвердить раскладку ответа).
+3. Установить `kmdf.sys` на планшет и проверить детекцию блока и рост тока.
+4. Драйвер charge pump LN8000 (I2C 0x51) для полных 33 Вт.
+5. Термика и JEITA: ограничение тока по температуре.

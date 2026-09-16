@@ -27,12 +27,16 @@
   регистров на моке и по TCP.
 * Драйвер режима ядра `kmdf` (KMDF, ARM64): устройство, последовательная очередь
   управляющих запросов, транспорт к шине SPMI `\Device\RESOURCE_HUB`, контракт
-  IOCTL для пользовательского режима.
+  IOCTL для пользовательского режима. **Собирается и подписывается под ARM64**:
+  `cargo wdk build --target-arch arm64 --profile release` → `kmdf.sys` (48.5 КБ),
+  `kmdf.inf`, `kmdf.cat`; `infverif` — «INF is valid»; PE Machine = `0xAA64`.
 * Конфигурация CI: `fmt`, `clippy -D warnings`, релизная сборка, тесты,
   документация, сборка без `std`.
 
 ### Известные ограничения
 
 * Read-путь транспорта SPMI ждёт подтверждения раскладки ответа шины (реверс).
-* Сборка `kmdf` требует совместимой связки WDK + libclang; см. `docs/HANDOVER.md`.
+* Таймер детекции в драйвере ещё не подключён к очереди: IOCTL
+  `DETECT_START`/`APPLY_POLICY`/`GET_JOURNAL` возвращают `STATUS_NOT_IMPLEMENTED`.
+* Для сборки `kmdf` требуется LLVM **17.0.6** (не 23.x) — см. `docs/HANDOVER.md`.
 * Управление charge pump LN8000 (полные 33 Вт) не входит в эту версию.

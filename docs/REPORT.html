@@ -49,7 +49,7 @@
   <tr><td><code>crates/core</code></td><td>Ядро логики: разбор APSD, политика тока, состояния, таймауты, повторы, журнал. Без <code>std</code>, без <code>unsafe</code></td><td class="ok">37 unit-тестов</td></tr>
   <tr><td><code>crates/host</code></td><td>Транспорты (мок, мок с журналом, TCP), журнал JSON Lines, мост в <code>tracing</code>, симулятор устройства, бенчмарки</td><td class="ok">9 интеграционных тестов</td></tr>
   <tr><td><code>crates/cli</code></td><td>Утилита <code>nabu-charger</code>: <code>demo</code>, <code>detect</code>, <code>sim</code>, <code>verify</code></td><td class="ok">4 теста</td></tr>
-  <tr><td><code>crates/kmdf</code></td><td>Драйвер режима ядра: устройство, очередь IOCTL, транспорт к шине SPMI <code>\Device\RESOURCE_HUB</code></td><td class="wait">сборка WDK, см. ниже</td></tr>
+  <tr><td><code>crates/kmdf</code></td><td>Драйвер режима ядра: устройство, очередь IOCTL, транспорт к шине SPMI <code>\Device\RESOURCE_HUB</code></td><td class="ok">собран под ARM64</td></tr>
 </table>
 
 <h2>Доказательства</h2>
@@ -63,6 +63,7 @@
   <tr><td>Ядро без стандартной библиотеки</td><td><code>cargo build -p charger-core --no-default-features</code></td><td class="ok">успех</td></tr>
   <tr><td>Демонстрация</td><td><code>cargo run -p cli -- demo</code></td><td class="ok">7 сценариев, включая 2 ожидаемых отказа</td></tr>
   <tr><td>Самопроверка</td><td><code>cargo run -p cli -- verify</code></td><td class="ok">пройдена</td></tr>
+  <tr><td>Сборка драйвера ARM64</td><td><code>cargo wdk build --target-arch arm64 --profile release</code></td><td class="ok">kmdf.sys, подписан, infverif пройден, PE = 0xAA64</td></tr>
 </table>
 
 <h3>Сценарии демонстрации</h3>
@@ -89,10 +90,17 @@ UNKNOWN    отказ  —          —       —      ошибка unknown_adap
 <h2>Чего пока нет</h2>
 <table>
   <tr><th>Пункт</th><th>Состояние</th><th>Причина</th></tr>
-  <tr><td>Сборка драйвера режима ядра</td><td class="no">остановлено</td><td>Цель сборки верна (ARM64), но <code>bindgen</code> под libclang 23 разбирает заголовки WDF неполно. Нужен LLVM 17.x — см. <code>docs/HANDOVER.md</code>, раздел 6</td></tr>
+  <tr><td>Таймер детекции в ядре</td><td class="wait">не подключён</td><td>IOCTL <code>DETECT_START</code>/<code>APPLY_POLICY</code> возвращают <code>STATUS_NOT_IMPLEMENTED</code>; логика под ними готова и проверена на моках</td></tr>
   <tr><td>Чтение регистра через шину SPMI</td><td class="wait">типизированный отказ</td><td>Раскладка ответа шины не подтверждена реверсом; догадка за факт не выдаётся</td></tr>
   <tr><td>Charge pump LN8000 (полные 33 Вт)</td><td class="wait">следующий этап</td><td>Нужен отдельный драйвер I2C (адрес 0x51), протокол есть в исходниках Android</td></tr>
 </table>
+
+<h3>Собранный драйвер</h3>
+<pre>artifacts/driver-arm64/
+  kmdf.sys   48.5 КБ   (PE Machine = 0xAA64 → ARM64, подписан тестовым сертификатом)
+  kmdf.inf    2.4 КБ   (infverif: INF is valid)
+  kmdf.cat    7.9 КБ
+  WDRLocalTestCert.cer</pre>
 
 <h2>Как воспроизвести</h2>
 <pre>git clone &lt;репозиторий&gt;
@@ -108,8 +116,8 @@ cargo run -p cli -- verify
 cargo run -p cli -- sim --adapter hvdcp3 --listen 127.0.0.1:9700
 cargo run -p cli -- detect --transport tcp --addr 127.0.0.1:9700
 
-# драйвер (нужны WDK и LLVM)
-cd crates/kmdf &amp;&amp; cargo wdk build</pre>
+# драйвер (нужны WDK и LLVM 17.x)
+cd crates/kmdf &amp;&amp; cargo wdk build --target-arch arm64 --profile release</pre>
 
 <h2>Документы</h2>
 <ul>

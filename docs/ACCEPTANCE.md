@@ -24,6 +24,7 @@ Rust 1.97.0 (`rust-toolchain.toml` фиксирует канал), WDK 10.0.2610
 | 10 | Зафиксирована измеримая базовая производительность | <span>выполнено</span> | `docs/PERFORMANCE.md` + `artifacts/bench-*.txt`: полный цикл сессии ≈0.9 мкс, мок 163 млн оп/с, TCP 7 640 оп/с |
 | 11 | CI прогоняет сборку, тесты, линтеры, документацию | <span>выполнено</span> | `.github/workflows/ci.yml`: `fmt --check`, `clippy -D warnings`, `build --release`, `test`, `doc`, сборка без `std`; отдельная задача для драйвера ARM64 |
 | 12 | Есть инструкция по передаче и откату | <span>выполнено</span> | `docs/HANDOVER.md`: архитектуры, требования, сборка, семвер, откат, таблица типовых сбоев, разбор журнала |
+| 13 | Сборка драйвера режима ядра под ARM64 | <span>выполнено</span> | `cargo wdk build --target-arch arm64 --profile release` — `Finished building kmdf`; в `artifacts/driver-arm64/`: `kmdf.sys` (48.5 КБ), `kmdf.inf`, `kmdf.cat`, сертификат тестовой подписи; `infverif` — «INF is valid»; проверка PE: Machine = `0xAA64` (ARM64) |
 
 ## Что проверено отдельно
 
@@ -43,14 +44,36 @@ Rust 1.97.0 (`rust-toolchain.toml` фиксирует канал), WDK 10.0.2610
 
 | Пункт | Состояние | Причина и разбор |
 |---|---|---|
-| Сборка драйвера режима ядра (`cargo wdk build`) | остановлено на `wdk-sys` | связка зависимостей подобрана верно (`wdk 0.4.1` + `wdk-sys/wdk-build 0.5.1`), цель — `aarch64-pc-windows-msvc`, но `bindgen` под libclang 23 разбирает заголовки WDF неполно и код не компилируется. Требуется LLVM 17.x. Разбор и команды: `docs/HANDOVER.md`, раздел 6 |
 | Read-путь шины SPMI | возвращает типизированный отказ | раскладка ответа `IOCTL_RESOURCE_HUB_TRANSACT` не подтверждена реверсом до конца. Догадка за факт не выдаётся |
+| Таймер детекции и выдача журнала клиенту | написаны, но не подключены к очереди | код драйвера собирается и подписывается, но живого прогона на планшете ещё не было: IOCTL `DETECT_START`/`APPLY_POLICY`/`GET_JOURNAL` возвращают `STATUS_NOT_IMPLEMENTED` |
 | Управление charge pump LN8000 | вне этой версии | нужен отдельный драйвер I2C (0x51); протокол есть в исходниках Android |
+
+## Как получен драйвер ARM64 (доказательство)
+
+```text
+cargo wdk build --target-arch arm64 --profile release
+INFO  Building package kmdf
+INFO  Running stampinf
+INFO  Running inf2cat
+INFO  Signing kmdf.sys using signtool
+INFO  Signing kmdf.cat using signtool
+INFO  Running infverif
+INFO  Finished building kmdf
+
+artifacts/driver-arm64/
+  kmdf.sys   48.5 КБ   (PE Machine = 0xAA64 → ARM64)
+  kmdf.inf    2.4 КБ
+  kmdf.cat    7.9 КБ
+  WDRLocalTestCert.cer
+```
 
 ## Итог
 
 Ядро драйвера готово и проверено: 52 теста, чистые линтеры, документация,
 бенчмарки, журнал и инструкция по передаче. Логика, которая включает зарядку
-(чтение APSD и лимит тока), реализована и воспроизводима на моках. Ядровая
-обвязка написана и упирается в версию LLVM — это единственный внешний блокер,
-и он снимается установкой LLVM 17.x.
+(чтение APSD и лимит тока), реализована и воспроизводима на моках.
+
+**Драйвер режима ядра собирается под ARM64**: `kmdf.sys` собран, подписан тестовым
+сертификатом, INF прошёл `infverif`, разрядность подтверждена по заголовку PE
+(`0xAA64`). Следующий шаг — подключить таймер детекции к очереди и проверить
+детекцию на планшете.

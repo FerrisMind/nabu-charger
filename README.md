@@ -18,7 +18,7 @@ USB-A (Quick Charge), ни от USB-C (Power Delivery). Причина не в �
 | [`crates/core`](crates/core) | ядро логики: детекция APSD, политика тока, состояния, таймауты, журнал. Без `std`, без `unsafe` | 37 unit-тестов + doctests |
 | [`crates/host`](crates/host) | хост-слой: транспорты (мок, TCP), журнал JSONL, `tracing`, симулятор устройства, бенчмарки | 9 интеграционных тестов |
 | [`crates/cli`](crates/cli) | утилита `nabu-charger`: `demo`, `detect`, `sim`, `verify` | 4 теста CLI |
-| [`crates/kmdf`](crates/kmdf) | драйвер режима ядра (KMDF) для ARM64 через шину SPMI | сборка WDK, см. `docs/HANDOVER.md` |
+| [`crates/kmdf`](crates/kmdf) | драйвер режима ядра (KMDF) для ARM64 через шину SPMI | собран: `kmdf.sys` ARM64, подписан, `infverif` пройден |
 
 ## Быстрый старт
 
@@ -73,16 +73,29 @@ UNKNOWN    отказ  —          —       —      ошибка unknown_adap
 
 ## Ограничения и честные оговорки
 
-* **Драйвер режима ядра** (`crates/kmdf`) написан, но требует сборки
-  `cargo wdk build` с WDK и LLVM/clang, а также проверки на планшете. Сборка на
-  этой машине доходит до генерации биндингов под `aarch64-pc-windows-msvc` и
-  останавливается на несовместимости libclang 23 с `wdk-sys 0.5.1` — разбор в
-  [docs/HANDOVER.md](docs/HANDOVER.md).
+* **Драйвер режима ядра** (`crates/kmdf`) собирается под ARM64
+  (`cargo wdk build --target-arch arm64`): `kmdf.sys` подписан, INF прошёл
+  `infverif`, разрядность подтверждена по PE (`0xAA64`). Пакет лежит в
+  `artifacts/driver-arm64/`. Требуется LLVM **17.x** для `bindgen`.
+* **Таймер детекции** в драйвере ещё не подключён к очереди: IOCTL
+  `DETECT_START`/`APPLY_POLICY`/`GET_JOURNAL` возвращают `STATUS_NOT_IMPLEMENTED`.
+  Логика под ними готова и проверена на моках — осталась проводка в ядре.
 * **Read-путь** транспорта SPMI пока возвращает типизированный отказ: раскладка
-  ответа шины не подтверждена реверсом до конца (см. `todo` в
+  ответа шины не подтверждена реверсом до конца (см. `TODO(RE)` в
   `crates/kmdf/src/spmi.rs`). Догадка не выдаётся за факт.
 * **Charge pump (LN8000)** этим драйвером не управляется: для полных 33 Вт нужен
   отдельный драйвер I2C (адрес 0x51), это следующий этап.
+
+## Сборка драйвера
+
+```powershell
+rustup target add aarch64-pc-windows-msvc
+cargo install cargo-wdk --locked
+$env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"   # нужен LLVM 17.x
+cd crates/kmdf
+cargo wdk build --target-arch arm64 --profile release
+# результат: target/aarch64-pc-windows-msvc/release/kmdf_package/
+```
 
 ## Лицензия
 
