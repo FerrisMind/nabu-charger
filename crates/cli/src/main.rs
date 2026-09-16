@@ -161,8 +161,23 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:9700")]
         listen: String,
     },
+    /// Проверка charge pump LN8000 на мок-шине I²C.
+    Pump {
+        /// Профиль настроек
+        #[arg(long, value_enum, default_value_t = PumpProfile::Qc35)]
+        profile: PumpProfile,
+    },
     /// Самопроверка таблиц, математики и ошибочных путей.
     Verify,
+}
+
+/// Профиль настроек charge pump.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum PumpProfile {
+    /// Класс B для Quick Charge 3.5 (13 В, 2.8 А).
+    Qc35,
+    /// Осторожный режим: 6.5 В, 1 А.
+    Conservative,
 }
 
 fn main() -> ExitCode {
@@ -184,6 +199,7 @@ fn main() -> ExitCode {
             cli.journal.as_ref(),
         ),
         Command::Sim { adapter, listen } => run_sim(*adapter, listen),
+        Command::Pump { profile } => run_pump(*profile),
         Command::Verify => run_verify(),
     };
 
@@ -409,6 +425,83 @@ fn run_sim(adapter: AdapterKind, listen: &str) -> Result<(), String> {
     loop {
         std::thread::sleep(Duration::from_secs(1));
     }
+}
+
+fn run_pump(profile: PumpProfile) -> Result<(), String> {
+    use ln8000::testkit::MockPumpBus;
+    use ln8000::{AdcChannel, OpMode, Pump, PumpConfig};
+
+    let config = match profile {
+        PumpProfile::Qc35 => PumpConfig::for_qc35_class_b(),
+        PumpProfile::Conservative => PumpConfig::conservative(),
+    };
+
+    let mut bus = MockPumpBus::new();
+    // Мок моделирует чип: запись в SYS_CTRL меняет SYS_STS.
+    // Коды АЦП 10-битные и читаются парой от регистра канала, поэтому старшие
+    // байты оставлены нулевыми: так каждое значение декодируется осмысленно.
+    bus.set_reg(AdcChannel::Iin.register(), 0x64); // 100 → 489 мА
+    bus.set_reg(AdcChannel::Vac.register(), 0x40); // 64 → 1.10 В
+    bus.set_reg(AdcChannel::Vin.register(), 0xC8); // 200 → 3.2 В
+    bus.set_reg(AdcChannel::Vout.register(), 0x7D); // 125 → 0.625 В
+    bus.set_reg(AdcChannel::Vbat.register(), 0x9C); // 156 → 1.78 В
+    bus.set_reg(AdcChannel::DieTemp.register(), 0x64); // 100 → 18.5 °C
+
+    let mut pump = Pump::open(bus, config).map_err(|err| format!("открытие не удалось: {err}"))?;
+    println!("шина          : {}", pump.bus_name());
+    println!("состояние     : {}", pump.state().label());
+
+    pump.configure()
+        .map_err(|err| format!("настройка не удалась: {err}"))?;
+    println!("после настройки: {}", pump.state().label());
+
+    let mode = pump
+        .enable_switching()
+        .map_err(|err| format!("режим 2:1 не включился: {err}"))?;
+    println!("режим         : {} (код {})", mode.label(), mode.code());
+    assert_eq!(mode, OpMode::Switching);
+
+    let status = pump.status().map_err(|err| err.to_string())?;
+    println!(
+        "SYS_STS       : 0x{:02X} (петля тока: {}, петля напряжения: {})",
+        status.sys_sts,
+        if status.iin_loop_active() {
+            "да"
+        } else {
+            "нет"
+        },
+        if status.vfloat_loop_active() {
+            "да"
+        } else {
+            "нет"
+        }
+    );
+    println!(
+        "отказы        : {}",
+        if status.has_critical_fault() {
+            status.fault_summary()
+        } else {
+            "нет"
+        }
+    );
+
+    println!("\nпоказания АЦП (мок):");
+    for channel in AdcChannel::ALL {
+        let value = pump.read_adc(channel).map_err(|err| err.to_string())?;
+        println!(
+            "  {:<9} ADC{:<2} {:>9} {}",
+            channel.label(),
+            channel.adc_index(),
+            value,
+            channel.unit()
+        );
+    }
+
+    let (writes, reads) = pump.counters();
+    println!("\nопераций      : записей {writes}, чтений {reads}");
+    pump.standby().map_err(|err| err.to_string())?;
+    println!("после standby : {}", pump.state().label());
+    Ok(())
 }
 
 fn run_verify() -> Result<(), String> {
