@@ -1,0 +1,76 @@
+; =====================================================================
+; ln8000-kmdf — драйвер charge pump LN8000 (Xiaomi Pad 5, nabu)
+;
+; Модуль: ln8000_kmdf.inx → ln8000_kmdf.inf
+; Целевой узел: ACPI\QCOM057E (PEIC, I²C 0x51 на \_SB.I2C5)
+; Платформа: Windows on ARM64 (aarch64-pc-windows-msvc)
+;
+; Узел PEIC уже описан в DSDT планшета (_HID = QCOM057E, _STA = 0x0F),
+; поэтому ACPI-правки не нужны: драйвер встаёт на существующий _HID.
+; =====================================================================
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = Battery
+ClassGuid   = {72631e54-78a4-11d0-bcf7-00aa00b7b32a}
+Provider    = %ProviderString%
+PnpLockDown = 1
+DriverVer   = 09/16/2026,0.2.0.0
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskId1%,,,""
+
+[SourceDisksFiles]
+ln8000_kmdf.sys = 1,,
+
+; ================= Установка устройства =================
+
+[Manufacturer]
+%StdMfg% = Ln8000,NT$ARCH$.10.0...16299
+
+[Ln8000.NT$ARCH$.10.0...16299]
+%Ln8000.DeviceDesc% = Ln8000_Device, ACPI\QCOM057E
+%Ln8000.DeviceDesc% = Ln8000_Device, ACPI\QCOM057E_PEIC
+
+[Ln8000_Device.NT$ARCH$]
+CopyFiles = Drivers_Dir
+
+[Drivers_Dir]
+ln8000_kmdf.sys
+
+; ================= Установка службы =================
+
+[Ln8000_Device.NT$ARCH$.Services]
+AddService = ln8000_kmdf, %SPSVCINST_ASSOCSERVICE%, Ln8000_Service_Inst
+
+[Ln8000_Service_Inst]
+DisplayName    = %Ln8000.SVCDESC%
+ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
+StartType      = 3               ; SERVICE_DEMAND_START
+ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %13%\ln8000_kmdf.sys
+
+; ================= Параметры (профили) =================
+; Значения по умолчанию; при необходимости переопределяются в реестре
+; (см. docs/DEPLOY-LN8000.md, раздел «Профили»).
+
+[Ln8000_Device.NT$ARCH$.HW]
+HKR, Parameters, IinLimitUa,      %REG_DWORD%, 2000000
+HKR, Parameters, VbatFloatUv,     %REG_DWORD%, 4440000
+HKR, Parameters, VacOvpUv,        %REG_DWORD%, 9500000
+HKR, Parameters, ThermalLimitUv,  %REG_DWORD%, 1000000
+HKR, Parameters, TelemetryMs,     %REG_DWORD%, 1000
+
+; ================= Строки =================
+
+[Strings]
+SPSVCINST_ASSOCSERVICE = 0x00000002
+REG_DWORD              = 0x00010001
+ProviderString         = "nabu-fastcharge"
+StdMfg                 = "(Стандартные системные устройства)"
+DiskId1                = "ln8000-kmdf, установочный диск #1"
+Ln8000.DeviceDesc      = "Charge pump LN8000 (PEIC) — Xiaomi Pad 5"
+Ln8000.SVCDESC         = "ln8000_kmdf — драйвер charge pump LN8000"

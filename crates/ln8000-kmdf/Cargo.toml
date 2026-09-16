@@ -1,0 +1,43 @@
+[package]
+name = "ln8000-kmdf"
+description = "KMDF-драйвер charge pump LN8000 для Xiaomi Pad 5: узел PEIC (QCOM057E) поверх I²C через SpbCx"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Крейт исключён из воркспейса: сборка требует WDK, LLVM/clang (bindgen)
+# и cargo-wdk. Обычный CI воркспейса собирает только хост-часть.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[package.metadata.wdk.driver-model]
+driver-type = "KMDF"
+kmdf-version-major = 1
+target-kmdf-version-minor = 33
+
+[dependencies]
+ln8000 = { path = "../ln8000", default-features = false }
+wdk = "0.4.1"
+wdk-alloc = "0.4.1"
+wdk-panic = "0.4.1"
+wdk-sys = { version = "0.5.1", features = ["spb"] }
+paste = "1.0.15"
+
+[build-dependencies]
+wdk-build = "0.5.1"
+
+[features]
+default = []
+nightly = ["wdk/nightly", "wdk-sys/nightly"]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true

@@ -1,0 +1,9 @@
+# Драйвер charge pump LN8000 собирается ТОЛЬКО под ARM64: целевое устройство —
+# планшет Xiaomi Pad 5 (nabu, Snapdragon 860) под Windows on ARM64.
+# Хост-машина здесь amd64, поэтому без этого файла cargo собрал бы x86_64 и
+# драйвер не загрузился бы на планшете.
+[build]
+target = "aarch64-pc-windows-msvc"
+# Ядро линкуется со статическим CRT (требование WDK, wdk-build без него падает
+# с `Error: StaticCrtNotEnabled`); `panic=abort` — обязательный режим для ядра.
+rustflags = ["-C", "target-feature=+crt-static", "-C", "panic=abort"]
