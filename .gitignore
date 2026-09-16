@@ -1,0 +1,39 @@
+# --- Rust / Cargo ---
+/target/
+**/*.rs.bk
+*.orig
+
+# --- Локальные артефакты сборки и прогонов verify/bench/demo ---
+/artifacts/
+/crates/**/artifacts/
+
+# --- Windows / KMDF / MSVC ---
+*.pdb
+*.ilk
+*.exp
+*.obj
+*.lib
+*.sys
+!driver/*.sys
+*.inf
+*.cat
+*.cer
+
+# --- IDE ---
+.vscode/
+.idea/
+*.swp
+*~
+
+# --- ОС ---
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# --- Секреты и локальная конфигурация ---
+.env
+.env.*
+!.env.example
+
+# --- Прочее ---
+*.log

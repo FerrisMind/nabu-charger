@@ -1,0 +1,11 @@
+[toolchain]
+channel = "1.97.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
+# Два таргета, и оба нужны:
+#  * x86_64-pc-windows-msvc — хост-инструменты (CLI, тесты, бенчмарки) гоняются
+#    на этой машине под Ryzen (amd64) и проверяются здесь же;
+#  * aarch64-pc-windows-msvc — целевое устройство: планшет Xiaomi Pad 5 (nabu,
+#    Snapdragon 860) под Windows on ARM64. Именно под него собирается драйвер
+#    режима ядра (см. crates/kmdf/.cargo/config.toml).
+targets = ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"]
