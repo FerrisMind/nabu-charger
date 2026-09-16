@@ -68,9 +68,11 @@ jobs:
       - name: Установить cargo-wdk
         run: cargo install cargo-wdk --locked
 
-      # ВНИМАНИЕ: сборка ядровой части требует WDK, LLVM/clang и совпадения
-      # версий libclang с wdk-sys. Шаг не валит сборку (continue-on-error),
-      # пока связка не подтверждена на сборочной машине: см. docs/HANDOVER.md.
+      # Сборка ядровой части требует WDK и LLVM 17.x (на 23.x bindgen ломает разбор
+      # заголовков WDF). Шаг не валит сборку, пока базовая среда GitHub-раннера
+      # не приведена к нужной версии LLVM: см. docs/HANDOVER.md.
       - name: Собрать драйвер под ARM64
         working-directory: crates/kmdf
-        run: cargo wdk build
+        env:
+          LIBCLANG_PATH: C:\Program Files\LLVM\bin
+        run: cargo wdk build --target-arch arm64 --profile release
