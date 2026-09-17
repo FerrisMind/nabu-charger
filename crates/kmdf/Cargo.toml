@@ -22,6 +22,9 @@ target-kmdf-version-minor = 33
 
 [dependencies]
 charger_core = { package = "charger-core", path = "../core", default-features = false }
+# Публичный ABI SPB и путь Resource Hub: одна реализация на оба драйвера,
+# покрыта тестами на хосте.
+spb = { path = "../spb" }
 wdk = "0.4.1"
 wdk-alloc = "0.4.1"
 wdk-panic = "0.4.1"

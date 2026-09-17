@@ -293,6 +293,7 @@ dependencies = [
  "anyhow",
  "charger-core",
  "paste",
+ "spb",
  "wdk",
  "wdk-alloc",
  "wdk-build",
@@ -565,6 +566,10 @@ name = "smallvec"
 version = "1.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba467056f1b547ed52077911161fc86985becbc60e8e1857c8a144dab0def891"
+
+[[package]]
+name = "spb"
+version = "0.2.0"
 
 [[package]]
 name = "strsim"
