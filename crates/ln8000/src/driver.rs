@@ -637,21 +637,34 @@ impl<T: RegisterBus> Pump<T> {
     pub fn set_charging(&mut self, on: bool) -> Result<OpMode, PumpError> {
         // Шаг эталона: перед стартом заряда обратная защита выключается.
         self.update(regs::SYS_CTRL, 1 << 2, 0, "disable_reverse_current")?;
-        let target = if on {
-            OpMode::Switching
-        } else {
-            OpMode::Standby
-        };
-        self.set_op_mode(target)?;
-        // Возвращаем то, что чип реально сообщил, а не то, что просили.
-        let status = self.settle_and_read_status()?;
-        self.op_mode = status.op_mode;
-        self.state = match status.op_mode {
-            OpMode::Switching => PumpState::Switching,
-            OpMode::Standby => PumpState::Configured,
-            _ => self.state,
-        };
-        Ok(status.op_mode)
+        if !on {
+            self.set_op_mode(OpMode::Standby)?;
+            let status = self.settle_and_read_status()?;
+            self.op_mode = status.op_mode;
+            self.state = PumpState::Configured;
+            return Ok(status.op_mode);
+        }
+        // Запуск заряда: сначала двухкаскадный режим 2:1, при отказе — сквозной 1:1.
+        // Сквозной режим нужен для источника около пяти вольт: двухкаскадному
+        // требуется не менее примерно 8,2 В, и там он недостижим. Эталон включает
+        // сквозной режим тем же полем SYS_CTRL, поэтому отказ 2:1 — не повод
+        // оставлять чип без рабочего режима.
+        match self.enable_switching_or_bypass() {
+            Ok(mode) => {
+                self.op_mode = mode;
+                self.state = match mode {
+                    OpMode::Switching => PumpState::Switching,
+                    _ => PumpState::Configured,
+                };
+                Ok(mode)
+            }
+            Err(err) => {
+                // Ни один режим не подтверждён: уводим чип в standby, иначе он
+                // останется в неопределённом состоянии.
+                let _ = self.set_op_mode(OpMode::Standby);
+                Err(err)
+            }
+        }
     }
 
     /// Переводит устройство в standby.
