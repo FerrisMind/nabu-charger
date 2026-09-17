@@ -34,6 +34,10 @@ use crate::status::{AdcChannel, Status};
 use crate::transport::RegisterBus;
 
 /// Настройки драйвера.
+///
+/// Флаги защит намеренно повторяют имена из Device Tree: это независимые
+/// аппаратные переключатели насоса, а не «булев суп» из логики приложения.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PumpConfig {
     /// Целевое напряжение заряда, мкВ (по умолчанию 4.44 В).
@@ -54,6 +58,26 @@ pub struct PumpConfig {
     pub verify_writes: bool,
     /// Сколько раз повторять операцию при сбое шины.
     pub max_bus_retries: u8,
+    // --- флаги защит (имена повторяют Device Tree планшета) ---
+    //
+    // В Android-схеме регулированием и температурой занимается главный зарядник
+    // (SMB), а LN8000 работает каскадом 2:1, поэтому DTS *отключает* защиты
+    // самого насоса. Мы не зашиваем выбор в код: какой вариант нужен под Windows
+    // (где главный стек может не заряжать вообще), решается профилем.
+    /// Отключить регуляцию напряжения заряда (`vbat-reg-disable`).
+    pub vbat_reg_disabled: bool,
+    /// Отключить защиту по току входа (`iin-ocp-disable`).
+    pub iin_ocp_disabled: bool,
+    /// Отключить регуляцию входного тока (`iin-reg-disable`).
+    pub iin_reg_disabled: bool,
+    /// Отключить защиту кристалла по температуре (`tdie-prot-disable`).
+    pub tdie_prot_disabled: bool,
+    /// Отключить регуляцию по температуре кристалла (`tdie-reg-disable`).
+    pub tdie_reg_disabled: bool,
+    /// Отключить мониторинг температуры шины (`tbus-mon-disable`).
+    pub tbus_mon_disabled: bool,
+    /// Отключить мониторинг температуры батареи (`tbat-mon-disable`).
+    pub tbat_mon_disabled: bool,
 }
 
 impl Default for PumpConfig {
@@ -71,11 +95,137 @@ impl Default for PumpConfig {
             auto_recovery: false,
             verify_writes: true,
             max_bus_retries: 2,
+            vbat_reg_disabled: false,
+            iin_ocp_disabled: false,
+            iin_reg_disabled: false,
+            tdie_prot_disabled: false,
+            tdie_reg_disabled: false,
+            tbus_mon_disabled: false,
+            tbat_mon_disabled: false,
         }
     }
 }
 
 impl PumpConfig {
+    /// Профиль по Device Tree планшета: защиты насоса отключены.
+    ///
+    /// Флаги взяты из `nabu-sm8150.dtsi` (`tdie-prot-disable`,
+    /// `iin-ocp-disable`, `iin-reg-disable`, `tdie-reg-disable`,
+    /// `vbat-reg-disable`, `tbus-mon-disable`, `tbat-mon-disable`).
+    /// Именно этот набор Xiaomi считает правильным для nabu: регулирование
+    /// держит главный зарядник, а насос работает каскадом.
+    #[must_use]
+    pub fn for_nabu_dts() -> Self {
+        Self {
+            vbat_reg_disabled: true,
+            iin_ocp_disabled: true,
+            iin_reg_disabled: true,
+            tdie_prot_disabled: true,
+            tdie_reg_disabled: true,
+            tbus_mon_disabled: true,
+            tbat_mon_disabled: true,
+            ..Self::default()
+        }
+    }
+
+    /// Применяет параметр из реестра к профилю.
+    ///
+    /// Имена совпадают с параметрами INF (`HKR, Parameters, ...`), поэтому тот,
+    /// кто ставит драйвер, может менять пороги **без пересборки**.
+    ///
+    /// Возвращает `true`, если параметр известен и принят. `false` означает, что
+    /// имя неизвестно или значение вне допустимых границ — профиль не меняется,
+    /// то есть неверное значение не может тихо испортить настройки.
+    ///
+    /// Параметр `TelemetryMs` сюда не входит: период таймера — дело драйвера.
+    #[must_use]
+    pub fn apply_parameter(&mut self, name: &str, value: u32) -> bool {
+        match name {
+            // Границы входного тока проверяются тем же кодированием, что идёт
+            // в чип: вне диапазона оно вернёт ошибку, и значение не принимается.
+            "IinLimitUa" => {
+                if encode_iin_limit(value).is_err() {
+                    return false;
+                }
+                self.iin_limit_ua = value;
+                true
+            }
+            // Границы из эталонного заголовка: `LN8000_VBAT_FLOAT_MIN/MAX`.
+            "VbatFloatUv" => {
+                if !(3_725_000..=5_000_000).contains(&value) {
+                    return false;
+                }
+                self.vbat_float_uv = value;
+                true
+            }
+            // `LN8000_VAC_OVP_6P5V` … `_13V`.
+            "VacOvpUv" => {
+                if !(6_500_000..=13_000_000).contains(&value) {
+                    return false;
+                }
+                self.vac_ovp_uv = value;
+                true
+            }
+            // Порог аларма NTC — 10 бит.
+            "NtcAlarmCfg" => {
+                if value > 0x03FF {
+                    return false;
+                }
+                self.ntc_alarm_cfg = u16::try_from(value).unwrap_or(self.ntc_alarm_cfg);
+                true
+            }
+            "WatchdogEnabled" => {
+                self.watchdog_enabled = value != 0;
+                true
+            }
+            // Сколько раз повторять операцию при сбое шины.
+            "BusRetryCount" => {
+                if value > 8 {
+                    return false;
+                }
+                self.max_bus_retries = u8::try_from(value).unwrap_or(self.max_bus_retries);
+                true
+            }
+            // 0 — как в Device Tree планшета (защиты насоса выключены),
+            // 1 — с включёнными петлями. Выбор задаётся при установке.
+            "ProtectionProfile" => {
+                let template = match value {
+                    0 => Self::for_nabu_dts(),
+                    1 => Self::protective(),
+                    _ => return false,
+                };
+                self.vbat_reg_disabled = template.vbat_reg_disabled;
+                self.iin_ocp_disabled = template.iin_ocp_disabled;
+                self.iin_reg_disabled = template.iin_reg_disabled;
+                self.tdie_prot_disabled = template.tdie_prot_disabled;
+                self.tdie_reg_disabled = template.tdie_reg_disabled;
+                self.tbus_mon_disabled = template.tbus_mon_disabled;
+                self.tbat_mon_disabled = template.tbat_mon_disabled;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Профиль с включёнными защитами насоса.
+    ///
+    /// Вариант для случая, когда главный стек под Windows батарею не заряжает и
+    /// регулирование должно делать сам насос. Отличается от [`Self::default()`]
+    /// только явным перечислением: удобно как альтернатива для прогона на железе.
+    #[must_use]
+    pub fn protective() -> Self {
+        Self {
+            vbat_reg_disabled: false,
+            iin_ocp_disabled: false,
+            iin_reg_disabled: false,
+            tdie_prot_disabled: false,
+            tdie_reg_disabled: false,
+            tbus_mon_disabled: false,
+            tbat_mon_disabled: false,
+            ..Self::default()
+        }
+    }
+
     /// Профиль для работы через charge pump от блока Quick Charge 3.5 класса B.
     ///
     /// Пороги соответствуют `BUS_OVP_FOR_QC`, `BUS_OCP_FOR_QC3P5_CLASS_B`
@@ -85,7 +235,8 @@ impl PumpConfig {
         Self {
             vac_ovp_uv: 13_000_000,
             iin_limit_ua: 3_500_000 - 700_000,
-            ..Self::default()
+            // Базовая конфигурация для nabu — как в Device Tree планшета.
+            ..Self::for_nabu_dts()
         }
     }
 
@@ -176,6 +327,17 @@ impl<T: RegisterBus> Pump<T> {
         self.op_mode
     }
 
+    /// Доступ к шине только для чтения: диагностика и тесты.
+    #[must_use]
+    pub const fn bus(&self) -> &T {
+        &self.bus
+    }
+
+    /// Изменяемый доступ к шине: подготовка состояний в диагностике и тестах.
+    pub fn bus_mut(&mut self) -> &mut T {
+        &mut self.bus
+    }
+
     /// Имя шины.
     #[must_use]
     pub fn bus_name(&self) -> &'static str {
@@ -243,24 +405,23 @@ impl<T: RegisterBus> Pump<T> {
             "ntc_shutdown_cfg",
         )?;
 
-        // 6. автовосстановление
+        // 6. автовосстановление и мониторы температур шины и батареи (биты 1:0).
         let recovery = if self.config.auto_recovery {
             0xF0
         } else {
             0x00
         };
-        self.update(regs::RECOVERY_CTRL, 0xF0, recovery, "auto_recovery")?;
+        let monitors = u8::from(!self.config.tbus_mon_disabled) << 1
+            | u8::from(!self.config.tbat_mon_disabled);
+        self.update(
+            regs::RECOVERY_CTRL,
+            0xF0 | 0b11,
+            recovery | monitors,
+            "recovery_and_monitors",
+        )?;
 
-        // 7. защиты и петли регулирования
-        self.update(regs::FAULT_CTRL, 1 << 5, 0, "enable_vbat_ovp")?;
-        self.update(regs::FAULT_CTRL, 1 << 6, 0, "enable_iin_ocp")?;
-        self.update(regs::REGULATION_CTRL, 1 << 5, 0, "enable_vfloat_loop")?;
-        self.update(regs::REGULATION_CTRL, 1 << 7, 1 << 7, "vfloat_loop_int")?;
-        self.update(regs::REGULATION_CTRL, 1 << 4, 0, "enable_iin_loop")?;
-        self.update(regs::REGULATION_CTRL, 1 << 6, 1 << 6, "iin_loop_int")?;
-        self.update(regs::REGULATION_CTRL, 1 << 2, 1 << 2, "tdie_prot")?;
-        self.update(regs::REGULATION_CTRL, 1 << 1, 1 << 1, "tdie_regulation")?;
-        self.update(regs::SYS_CTRL, 1 << 2, 0, "disable_reverse_current")?;
+        // 7. защиты и петли регулирования — по флагам профиля.
+        self.configure_protections()?;
 
         // 8. перевести в standby
         self.set_op_mode(OpMode::Standby)?;
@@ -312,6 +473,66 @@ impl<T: RegisterBus> Pump<T> {
         Ok(())
     }
 
+    /// Записывает биты защит и петель регулирования по флагам профиля.
+    ///
+    /// В Device Tree планшета часть защит самого насоса отключена
+    /// (`tdie-prot-disable`, `iin-ocp-disable`, `iin-reg-disable`,
+    /// `tdie-reg-disable`, `vbat-reg-disable`): в Android-схеме регулированием
+    /// занимается главный зарядник SMB, а насос работает каскадом 2:1. Здесь это
+    /// следует за профилем, а не зашито в код.
+    ///
+    /// # Errors
+    ///
+    /// * [`PumpError::NotOpen`] — сессия закрыта.
+    /// * [`PumpError::Bus`] — сбой шины.
+    fn configure_protections(&mut self) -> Result<(), PumpError> {
+        let cfg = self.config;
+        self.update(regs::FAULT_CTRL, 1 << 5, 0, "enable_vbat_ovp")?;
+        self.update(
+            regs::FAULT_CTRL,
+            1 << 6,
+            u8::from(cfg.iin_ocp_disabled) << 6,
+            "iin_ocp",
+        )?;
+        self.update(
+            regs::REGULATION_CTRL,
+            1 << 5,
+            u8::from(cfg.vbat_reg_disabled) << 5,
+            "vfloat_loop",
+        )?;
+        self.update(
+            regs::REGULATION_CTRL,
+            1 << 7,
+            u8::from(!cfg.vbat_reg_disabled) << 7,
+            "vfloat_loop_int",
+        )?;
+        self.update(
+            regs::REGULATION_CTRL,
+            1 << 4,
+            u8::from(cfg.iin_reg_disabled) << 4,
+            "iin_loop",
+        )?;
+        self.update(
+            regs::REGULATION_CTRL,
+            1 << 6,
+            u8::from(!cfg.iin_reg_disabled) << 6,
+            "iin_loop_int",
+        )?;
+        self.update(
+            regs::REGULATION_CTRL,
+            1 << 2,
+            u8::from(!cfg.tdie_prot_disabled) << 2,
+            "tdie_prot",
+        )?;
+        self.update(
+            regs::REGULATION_CTRL,
+            1 << 1,
+            u8::from(!cfg.tdie_reg_disabled) << 1,
+            "tdie_regulation",
+        )?;
+        self.update(regs::SYS_CTRL, 1 << 2, 0, "disable_reverse_current")
+    }
+
     /// Включает режим 2:1 (switching) и проверяет, что устройство его приняло.
     ///
     /// # Errors
@@ -338,7 +559,43 @@ impl<T: RegisterBus> Pump<T> {
     /// Пробрасывает ошибки шины.
     pub fn enable_bypass(&mut self) -> Result<OpMode, PumpError> {
         self.set_op_mode(OpMode::Bypass)?;
-        Ok(self.status()?.op_mode)
+        let status = self.status()?;
+        // Проверяем так же, как для режима 2:1: молчаливый отказ чипа нельзя
+        // принимать за успех — иначе драйвер решит, что резервный режим включён,
+        // когда на самом деле заряд не идёт.
+        if status.op_mode != OpMode::Bypass {
+            return Err(PumpError::ModeNotReached {
+                wanted: OpMode::Bypass.code(),
+                raw_status: status.sys_sts,
+            });
+        }
+        self.state = PumpState::Switching;
+        Ok(status.op_mode)
+    }
+
+    /// Включает режим 2:1, а при неудаче — безопасный bypass.
+    ///
+    /// Возвращает фактически достигнутый режим: `Switching`, если чип подтвердил
+    /// ускоренный режим, или `Bypass`, если пришлось отступить. Так драйвер
+    /// не остаётся без рабочего режима из-за одного отказа чипа или шины.
+    ///
+    /// Если не подтверждается ни то, ни другое — возвращается ошибка первой
+    /// попытки (она говорит именно про режим); тогда вызывающий обязан увести чип
+    /// в `standby`, иначе он останется в неопределённом состоянии.
+    ///
+    /// # Errors
+    ///
+    /// * [`PumpError::ModeNotReached`] — чип не подтвердил ни 2:1, ни bypass.
+    /// * [`PumpError::NotOpen`] — сессия закрыта.
+    /// * [`PumpError::Bus`] — сбой шины.
+    pub fn enable_switching_or_bypass(&mut self) -> Result<OpMode, PumpError> {
+        match self.enable_switching() {
+            Ok(mode) => Ok(mode),
+            Err(switching_error) => match self.enable_bypass() {
+                Ok(mode) => Ok(mode),
+                Err(_) => Err(switching_error),
+            },
+        }
     }
 
     /// Переводит устройство в standby.
@@ -348,6 +605,27 @@ impl<T: RegisterBus> Pump<T> {
     /// Пробрасывает ошибки шины.
     pub fn standby(&mut self) -> Result<(), PumpError> {
         self.set_op_mode(OpMode::Standby)
+    }
+
+    /// Обслуживает («кормит») сторожевой таймер чипа.
+    ///
+    /// Сторож — это защита, а не помеха: если драйвер перестанет отвечать, чип
+    /// сам прекратит заряд через выбранный период (5/10/20/40 с). Поэтому тот,
+    /// кто включил сторож через `PumpConfig::watchdog_enabled`, обязан вызывать
+    /// эту функцию чаще периода — драйвер делает это из таймера телеметрии.
+    ///
+    /// Периодные биты не затрагиваются: перезапись идёт по маске одного бита 7.
+    /// Если сторож выключен, вызов безопасен и не включает его.
+    ///
+    /// # Errors
+    ///
+    /// * [`PumpError::NotOpen`] — чип не открыт.
+    /// * [`PumpError::Bus`] — сбой шины.
+    pub fn service_watchdog(&mut self) -> Result<(), PumpError> {
+        if !self.config.watchdog_enabled {
+            return Ok(());
+        }
+        self.update(regs::TIMER_CTRL, 1 << 7, 1 << 7, "watchdog_service")
     }
 
     /// Обновляет лимит входного тока.
@@ -409,9 +687,35 @@ impl<T: RegisterBus> Pump<T> {
     /// # Errors
     ///
     /// [`PumpError::Bus`] — сбой шины.
+    /// Читает значение канала АЦП.
+    ///
+    /// На время чтения двух байт отсчёта обновление АЦП останавливается, а затем
+    /// возобновляется — иначе байты могут прийти из разных преобразований, и
+    /// температура окажется мусорной. Так же поступает эталонный драйвер
+    /// (`ln8000_get_adc_data`): ставит бит паузы, читает пару, снимает бит.
+    ///
+    /// Пауза снимается и при ошибке чтения: иначе АЦП остался бы стоять.
+    ///
+    /// # Errors
+    ///
+    /// * [`PumpError::NotOpen`] — чип не открыт.
+    /// * [`PumpError::Bus`] — шина не ответила.
     pub fn read_adc(&mut self, channel: AdcChannel) -> Result<i32, PumpError> {
-        let raw = self.read_pair(channel.register())?;
-        Ok(channel.decode(raw))
+        self.update(
+            regs::TIMER_CTRL,
+            regs::TIMER_CTRL_PAUSE_ADC,
+            regs::TIMER_CTRL_PAUSE_ADC,
+            "adc_pause",
+        )?;
+        let outcome = self.read_pair(channel.register());
+        // Снимаем паузу в любом случае и только потом разбираем результат.
+        let _ = self.update(
+            regs::TIMER_CTRL,
+            regs::TIMER_CTRL_PAUSE_ADC,
+            0,
+            "adc_resume",
+        );
+        Ok(channel.decode(outcome?))
     }
 
     /// Выполняет программный сброс устройства.
@@ -730,6 +1034,239 @@ mod tests {
         assert_eq!(pump.read_adc(AdcChannel::Vbat).unwrap(), 2_495_000);
         // Код 200 → 200 × 4.89 мА = 978 мА
         assert_eq!(pump.read_adc(AdcChannel::Iin).unwrap(), 978_000);
+    }
+
+    #[test]
+    fn adc_read_pauses_and_resumes_conversion_update() {
+        let bus = MockPumpBus::new();
+        let mut pump = Pump::open(bus, PumpConfig::default()).unwrap();
+        // Посторонний бит в TIMER_CTRL не должен пострадать от правки.
+        pump.bus.set_reg(regs::TIMER_CTRL, 0b1000_0000);
+        pump.bus.set_reg(AdcChannel::Vbat.register(), 0x2B);
+        pump.bus.set_reg(AdcChannel::Vbat.register() + 1, 0x01);
+
+        assert_eq!(pump.read_adc(AdcChannel::Vbat).unwrap(), 2_495_000);
+
+        let timer = pump.bus.reg(regs::TIMER_CTRL);
+        assert_eq!(
+            timer & regs::TIMER_CTRL_PAUSE_ADC,
+            0,
+            "после чтения пауза обновления АЦП должна быть снята"
+        );
+        assert_eq!(
+            timer & 0b1000_0000,
+            0b1000_0000,
+            "посторонний бит в TIMER_CTRL должен сохраниться"
+        );
+    }
+
+    #[test]
+    fn switching_or_bypass_prefers_fast_mode() {
+        let bus = MockPumpBus::new();
+        let mut pump = Pump::open(bus, PumpConfig::default()).unwrap();
+        pump.configure().unwrap();
+        assert_eq!(
+            pump.enable_switching_or_bypass().unwrap(),
+            OpMode::Switching,
+            "если чип подтвердил 2:1, остаёмся в нём"
+        );
+    }
+
+    #[test]
+    fn switching_or_bypass_falls_back_when_chip_refuses_fast_mode() {
+        let bus = MockPumpBus::new();
+        let mut pump = Pump::open(bus, PumpConfig::default()).unwrap();
+        pump.configure().unwrap();
+        // Чип «не слышит» команду 2:1 и всегда отвечает, что он в bypass.
+        pump.bus.push_fault(crate::testkit::Fault::StuckSysSts {
+            value: regs::SYS_STS_BYPASS_ENABLED,
+        });
+        assert_eq!(
+            pump.enable_switching_or_bypass().unwrap(),
+            OpMode::Bypass,
+            "при отказе 2:1 обязан включиться bypass"
+        );
+        assert_eq!(
+            pump.bus.reg(regs::SYS_CTRL) & regs::SYS_CTRL_EN_1TO1,
+            regs::SYS_CTRL_EN_1TO1,
+            "в SYS_CTRL должен стоять бит 1:1"
+        );
+    }
+
+    #[test]
+    fn switching_or_bypass_reports_error_when_nothing_confirmed() {
+        let bus = MockPumpBus::new();
+        let mut pump = Pump::open(bus, PumpConfig::default()).unwrap();
+        pump.configure().unwrap();
+        pump.bus.push_fault(crate::testkit::Fault::StuckSysSts {
+            value: regs::SYS_STS_STANDBY,
+        });
+        let err = pump.enable_switching_or_bypass().unwrap_err();
+        assert!(
+            matches!(err, PumpError::ModeNotReached { .. }),
+            "ожидалась ошибка режима, получено: {err:?}"
+        );
+        // После такого отказа драйвер уводит чип в standby: проверим, что это возможно.
+        assert!(pump.standby().is_ok(), "standby должен подтверждаться");
+    }
+
+    #[test]
+    fn watchdog_service_keeps_timer_bits() {
+        let bus = MockPumpBus::new();
+        let mut pump = Pump::open(
+            bus,
+            PumpConfig {
+                watchdog_enabled: true,
+                watchdog_period: WatchdogPeriod::Sec10,
+                ..PumpConfig::default()
+            },
+        )
+        .unwrap();
+        pump.configure().unwrap();
+
+        let after_configure = pump.bus.reg(regs::TIMER_CTRL);
+        assert_eq!(
+            after_configure & (1 << 7),
+            1 << 7,
+            "сторож должен быть включён"
+        );
+        assert_eq!(
+            after_configure & (0b11 << 5),
+            WatchdogPeriod::Sec10.code() << 5,
+            "период должен быть записан в биты 5–6"
+        );
+
+        // Чип сам сбрасывает бит после срабатывания; обслуживание возвращает его
+        // и не трогает период.
+        pump.bus.set_reg(regs::TIMER_CTRL, 0);
+        pump.service_watchdog().unwrap();
+        let after_service = pump.bus.reg(regs::TIMER_CTRL);
+        assert_eq!(
+            after_service & (1 << 7),
+            1 << 7,
+            "обслуживание включает сторож"
+        );
+        assert_eq!(
+            after_service & (0b11 << 5),
+            0,
+            "чужие биты обслуживание не пишет"
+        );
+    }
+
+    #[test]
+    fn watchdog_service_is_noop_when_disabled() {
+        let bus = MockPumpBus::new();
+        let mut pump = Pump::open(bus, PumpConfig::default()).unwrap();
+        pump.configure().unwrap();
+        let before = pump.bus.reg(regs::TIMER_CTRL);
+        assert_eq!(before & (1 << 7), 0, "по умолчанию сторож выключен");
+        pump.service_watchdog().unwrap();
+        assert_eq!(
+            pump.bus.reg(regs::TIMER_CTRL),
+            before,
+            "выключенный сторож не должен включаться сам"
+        );
+    }
+
+    #[test]
+    fn registry_parameters_change_profile_and_reject_junk() {
+        let mut config = PumpConfig::for_qc35_class_b();
+
+        assert!(config.apply_parameter("IinLimitUa", 1_500_000));
+        assert_eq!(config.iin_limit_ua, 1_500_000);
+        assert!(config.apply_parameter("VbatFloatUv", 4_400_000));
+        assert_eq!(config.vbat_float_uv, 4_400_000);
+        assert!(config.apply_parameter("VacOvpUv", 11_000_000));
+        assert_eq!(config.vac_ovp_uv, 11_000_000);
+        assert!(config.apply_parameter("NtcAlarmCfg", 226));
+        assert_eq!(config.ntc_alarm_cfg, 226);
+        assert!(config.apply_parameter("WatchdogEnabled", 1));
+        assert!(config.watchdog_enabled);
+
+        // Значения вне границ и неизвестные имена отвергаются и ничего не портят.
+        let before = config;
+        assert!(!config.apply_parameter("IinLimitUa", 10));
+        assert!(!config.apply_parameter("VbatFloatUv", 9_000_000));
+        assert!(!config.apply_parameter("VacOvpUv", 3_000_000));
+        assert!(!config.apply_parameter("NtcAlarmCfg", 0x0400));
+        assert!(!config.apply_parameter("СовсемДругойПараметр", 1));
+        assert_eq!(config, before, "неверные значения не должны менять профиль");
+    }
+
+    #[test]
+    fn protection_profile_parameter_switches_protections() {
+        let mut config = PumpConfig::for_nabu_dts();
+        assert!(config.tdie_prot_disabled, "база — конфигурация планшета");
+
+        assert!(config.apply_parameter("ProtectionProfile", 1));
+        assert!(!config.tdie_prot_disabled, "профиль 1 включает защиты");
+        assert!(!config.iin_ocp_disabled);
+
+        assert!(config.apply_parameter("ProtectionProfile", 0));
+        assert!(
+            config.tdie_prot_disabled,
+            "профиль 0 возвращает конфигурацию DTS"
+        );
+
+        assert!(
+            !config.apply_parameter("ProtectionProfile", 7),
+            "неизвестный профиль отвергается"
+        );
+    }
+
+    #[test]
+    fn nabu_dts_profile_disables_pump_protections() {
+        let bus = MockPumpBus::new();
+        let mut pump = Pump::open(bus, PumpConfig::for_nabu_dts()).unwrap();
+        pump.configure().unwrap();
+
+        // Регуляция и температурные петли отключены — так требует DTS планшета.
+        let regulation = pump.bus.reg(regs::REGULATION_CTRL);
+        assert_eq!(regulation & (1 << 7), 0, "петля vfloat выключена");
+        assert_eq!(regulation & (1 << 6), 0, "петля iin выключена");
+        assert_eq!(regulation & (1 << 5), 1 << 5, "регуляция vfloat отключена");
+        assert_eq!(regulation & (1 << 4), 1 << 4, "регуляция iin отключена");
+        assert_eq!(regulation & (1 << 2), 0, "защита кристалла отключена");
+        assert_eq!(regulation & (1 << 1), 0, "регуляция кристалла отключена");
+        assert_eq!(
+            regulation & (0b11 << 2),
+            regs::NTC_SHUTDOWN_CFG << 2,
+            "конфигурация NTC не пострадала"
+        );
+
+        // Аппаратные защиты напряжения остаются включёнными.
+        let fault = pump.bus.reg(regs::FAULT_CTRL);
+        assert_eq!(fault & (1 << 6), 1 << 6, "iin ocp отключён по DTS");
+        assert_eq!(fault & (1 << 5), 0, "vbat ovp включён");
+        assert_eq!(fault & (1 << 4), 0, "vac ov включён");
+
+        // Мониторы температур шины и батареи — тоже отключены по DTS.
+        let recovery = pump.bus.reg(regs::RECOVERY_CTRL);
+        assert_eq!(recovery & 0b11, 0, "мониторы шины и батареи отключены");
+    }
+
+    #[test]
+    fn protective_profile_enables_pump_protections() {
+        let bus = MockPumpBus::new();
+        let mut pump = Pump::open(bus, PumpConfig::protective()).unwrap();
+        pump.configure().unwrap();
+
+        let regulation = pump.bus.reg(regs::REGULATION_CTRL);
+        assert_eq!(regulation & (1 << 7), 1 << 7, "петля vfloat включена");
+        assert_eq!(regulation & (1 << 6), 1 << 6, "петля iin включена");
+        assert_eq!(regulation & (1 << 5), 0, "регуляция vfloat включена");
+        assert_eq!(regulation & (1 << 4), 0, "регуляция iin включена");
+        assert_eq!(regulation & (1 << 2), 1 << 2, "защита кристалла включена");
+        assert_eq!(
+            regulation & (1 << 1),
+            1 << 1,
+            "регуляция кристалла включена"
+        );
+
+        let fault = pump.bus.reg(regs::FAULT_CTRL);
+        assert_eq!(fault & (1 << 6), 0, "iin ocp включён");
+        let recovery = pump.bus.reg(regs::RECOVERY_CTRL);
+        assert_eq!(recovery & 0b11, 0b11, "мониторы температур включены");
     }
 
     #[test]

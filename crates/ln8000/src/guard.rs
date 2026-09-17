@@ -70,6 +70,73 @@ impl GuardLimits {
             vbat_reduce_uv: 4_350_000,
         }
     }
+
+    /// Проверяет, что пороги заданы в разумном порядке.
+    ///
+    /// Порядок принципиален: снижение тока обязано наступать раньше ухода в bypass,
+    /// а bypass — раньше останова. Нарушенный порядок означает защиту, которая либо
+    /// не сработает вовремя, либо сразу оборвёт заряд. То же для токов:
+    /// пол ≤ цель ≤ максимум.
+    #[must_use]
+    pub const fn is_consistent(&self) -> bool {
+        self.temp_reduce_dc < self.temp_bypass_dc
+            && self.temp_bypass_dc < self.temp_stop_dc
+            && self.iin_floor_ua <= self.iin_target_ua
+            && self.iin_target_ua <= self.iin_max_ua
+    }
+
+    /// Применяет параметр из реестра к порогам защиты.
+    ///
+    /// Значение вне диапазона **или нарушающее порядок порогов** отклоняется
+    /// целиком: набор остаётся прежним, а не превращается в частично обновлённый.
+    #[must_use]
+    pub fn apply_parameter(&mut self, name: &str, value: u32) -> bool {
+        let mut candidate = *self;
+        match name {
+            "TempReduceDc" => match i32::try_from(value) {
+                Ok(temp) if (200..=600).contains(&temp) => candidate.temp_reduce_dc = temp,
+                _ => return false,
+            },
+            "TempBypassDc" => match i32::try_from(value) {
+                Ok(temp) if (200..=650).contains(&temp) => candidate.temp_bypass_dc = temp,
+                _ => return false,
+            },
+            "TempStopDc" => match i32::try_from(value) {
+                Ok(temp) if (250..=700).contains(&temp) => candidate.temp_stop_dc = temp,
+                _ => return false,
+            },
+            "IinMaxUa" => {
+                if !(100_000..=6_850_000).contains(&value) {
+                    return false;
+                }
+                candidate.iin_max_ua = value;
+            }
+            "IinTargetUa" => {
+                if !(100_000..=6_850_000).contains(&value) {
+                    return false;
+                }
+                candidate.iin_target_ua = value;
+            }
+            "IinFloorUa" => {
+                if !(100_000..=6_850_000).contains(&value) {
+                    return false;
+                }
+                candidate.iin_floor_ua = value;
+            }
+            "VbatReduceUv" => {
+                if !(3_000_000..=4_500_000).contains(&value) {
+                    return false;
+                }
+                candidate.vbat_reduce_uv = value;
+            }
+            _ => return false,
+        }
+        if !candidate.is_consistent() {
+            return false;
+        }
+        *self = candidate;
+        true
+    }
 }
 
 /// Что делать с режимом зарядки.
@@ -172,6 +239,43 @@ pub fn step_down(current_ua: u32, limits: &GuardLimits) -> u32 {
 mod tests {
     use super::*;
     use crate::encoding::OpMode;
+
+    #[test]
+    fn limits_accept_registry_values() {
+        let mut limits = GuardLimits::standard();
+        assert!(limits.apply_parameter("TempReduceDc", 420));
+        assert_eq!(limits.temp_reduce_dc, 420);
+        assert!(limits.apply_parameter("TempStopDc", 560));
+        assert_eq!(limits.temp_stop_dc, 560);
+        assert!(limits.apply_parameter("IinTargetUa", 2_500_000));
+        assert_eq!(limits.iin_target_ua, 2_500_000);
+        assert!(limits.apply_parameter("IinFloorUa", 1_000_000));
+        assert!(limits.apply_parameter("VbatReduceUv", 4_300_000));
+        assert!(
+            limits.is_consistent(),
+            "набор должен остаться согласованным"
+        );
+    }
+
+    #[test]
+    fn limits_reject_broken_order_and_junk() {
+        let mut limits = GuardLimits::standard();
+        let before = limits;
+
+        // Снижение тока позже ухода в bypass — защита перестала бы работать по порядку.
+        assert!(!limits.apply_parameter("TempReduceDc", 490));
+        // Цель ниже полу — несогласованные токи.
+        assert!(!limits.apply_parameter("IinTargetUa", 100_000));
+        // Значения вне диапазонов и чужие имена.
+        assert!(!limits.apply_parameter("TempStopDc", 10_000));
+        assert!(!limits.apply_parameter("IinMaxUa", 10));
+        assert!(!limits.apply_parameter("ТакогоПорогаНет", 1));
+
+        assert_eq!(
+            limits, before,
+            "отклонённые значения не должны менять набор порогов частично"
+        );
+    }
 
     fn sample(iin_ua: u32, temp_dc: i32, vbat_uv: u32) -> TelemetrySample {
         TelemetrySample {
