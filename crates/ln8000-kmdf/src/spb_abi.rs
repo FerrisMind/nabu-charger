@@ -62,6 +62,18 @@ pub const IOCTL_SPB_UNLOCK_CONNECTION: u32 = 0x0004_1810;
 /// Направление `None`: завершающий элемент списка передач.
 pub const SPB_DIRECTION_NONE: u32 = 0;
 
+/// `CTL_CODE(FILE_DEVICE_CONTROLLER, 0x600, METHOD_BUFFERED, FILE_ANY_ACCESS)`.
+pub const IOCTL_SPB_LOCK_CONTROLLER: u32 = 0x0004_1800;
+
+/// `CTL_CODE(FILE_DEVICE_CONTROLLER, 0x601, METHOD_BUFFERED, FILE_ANY_ACCESS)`.
+pub const IOCTL_SPB_UNLOCK_CONTROLLER: u32 = 0x0004_1804;
+
+/// `CTL_CODE(FILE_DEVICE_CONTROLLER, 0x605, METHOD_BUFFERED, FILE_ANY_ACCESS)`.
+pub const IOCTL_SPB_FULL_DUPLEX: u32 = 0x0004_1814;
+
+/// `CTL_CODE(FILE_DEVICE_CONTROLLER, 0x606, METHOD_BUFFERED, FILE_ANY_ACCESS)`.
+pub const IOCTL_SPB_MULTI_SPI_TRANSFER: u32 = 0x0004_1818;
+
 /// Запрос подключения к периферии: эталонный клиент Qualcomm отправляет его
 /// узлу до доступа к регистрам (`0x32C004` из разбора `qcpmicEIC8150.sys`).
 pub const IOCTL_ATTACH: u32 = 0x0032_C004;
@@ -76,6 +88,14 @@ pub const SPB_DIRECTION_TO_DEVICE: u32 = 2;
 
 /// Формат буфера: простая буферная область.
 pub const SPB_FORMAT_SIMPLE: u32 = 1;
+
+/// Формат «список буферов»: буфер описан массивом элементов.
+#[allow(dead_code)]
+pub const SPB_FORMAT_LIST: u32 = 2;
+
+/// Формат MDL: буфер описан через MDL.
+#[allow(dead_code)]
+pub const SPB_FORMAT_MDL: u32 = 4;
 
 /// Элемент списка буферов.
 #[repr(C)]
@@ -124,7 +144,8 @@ pub struct SpbTransferList {
 }
 
 impl SpbTransferList {
-    /// Размер заголовка списка (без элементов).
+    /// `sizeof(SPB_TRANSFER_LIST)` — именно это значение обязано лежать в поле
+    /// `size` (заголовок вместе с ОДНОЙ записью), сколько бы передач ни было.
     #[must_use]
     pub const fn header_size() -> usize {
         core::mem::size_of::<Self>()
@@ -136,12 +157,28 @@ impl SpbTransferList {
         core::mem::size_of::<SpbTransferListEntry>()
     }
 
-    /// Полный размер области для `count` передач.
+    /// Полный размер области памяти под список для `count` передач:
+    /// `sizeof(SPB_TRANSFER_LIST) + sizeof(entry) * (count - 1)` — ровно так
+    /// определён `SPB_TRANSFER_LIST_AND_ENTRIES(count)` в WDK.
     #[must_use]
     pub const fn area_size(count: usize) -> usize {
-        Self::header_size().saturating_add(Self::entry_size().saturating_mul(count))
+        if count <= 1 {
+            return Self::header_size();
+        }
+        Self::header_size().saturating_add(Self::entry_size().saturating_mul(count - 1))
     }
 }
+
+/// Раскладка `SPB_TRANSFER_LIST` — проверяется компилятором, а не глазами.
+///
+/// `sizeof(SPB_TRANSFER_LIST)` = 48 (заголовок 16 + одна запись 32),
+/// `sizeof(SPB_TRANSFER_LIST_ENTRY)` = 32, область под `n` передач —
+/// 48/80/112. Любое расхождение ломает сборку.
+const _: () = assert!(SpbTransferList::header_size() == 48);
+const _: () = assert!(SpbTransferList::entry_size() == 32);
+const _: () = assert!(SpbTransferList::area_size(1) == 48);
+const _: () = assert!(SpbTransferList::area_size(2) == 80);
+const _: () = assert!(SpbTransferList::area_size(3) == 112);
 
 /// Инициализирует запись списка передач «простой буфер».
 pub fn entry_init(
