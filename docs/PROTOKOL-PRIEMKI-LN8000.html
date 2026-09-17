@@ -73,7 +73,7 @@
 
 <h2>Проверено машинно</h2>
 <div class="grid">
-  <div class="card"><div class="k">Драйвер ARM64</div><div class="v"><b>0xAA64</b></div><div class="n">PE Machine, <code>ln8000_kmdf.sys</code> 56.5 КБ, подписан, <code>infverif</code> пройден</div></div>
+  <div class="card"><div class="k">Драйвер ARM64</div><div class="v"><b>0xAA64</b></div><div class="n">PE Machine, <code>ln8000_kmdf.sys</code> 60 КБ, подписан, <code>infverif</code> пройден</div></div>
   <div class="card"><div class="k">Тесты</div><div class="v"><b>97</b></div><div class="n">37 ядро SMB · 43 ядро LN8000 · 9 интеграционных · 4 CLI · doctests</div></div>
   <div class="card"><div class="k">Линтеры</div><div class="v"><b>0</b></div><div class="n">clippy <code>-D warnings</code>, fmt, doc — чисто</div></div>
   <div class="card"><div class="k">Без std</div><div class="v"><b>2/2</b></div><div class="n">оба ядра собираются без стандартной библиотеки</div></div>
@@ -96,10 +96,11 @@
 <p><b>Согласование 9/11 В — не задача charge pump.</b> Повышенное напряжение с блоком согласует Type-C/PD-часть платформы (PM8150B). Без неё LN8000 работает в bypass 1:1 от 5 В либо удерживает уже согласованное напряжение. Это зафиксировано в дорожной карте проекта.</p>
 </div>
 <div class="callout">
-<p><b>Два места помечены <code>TODO(bring-up)</code>:</b> чтение/запись произвольного регистра по IOCTL с адресом из буфера клиента и выгрузка кольца отсчётов в буфер клиента. Логика под ними готова и протестирована — осталась привязка к буферам запроса.</p>
+<p><b>Все семь управляющих кодов реализованы.</b> Состояние, чтение и запись регистра, лимиты, режим, сеансы и выгрузка отсчётов — без заглушек. Применённый ток и режим возвращаются такими, какими их подтвердил чип, а не такими, какими их запросил клиент.</p>
 </div>
 
 <h2>Протокол приёмки на устройстве</h2>
+<p>Прогон автоматизирован: на планшете достаточно выполнить <code>run-acceptance.ps1</code> — он проведёт по пунктам, снимает телеметрию драйвера, соберёт показания мультиметра и сам сформирует протокол в HTML, Markdown и JSON с приложенным журналом. Режим <code>-DryRun</code> проверяет конвейер без железа и помечает отчёт как непроверочный.</p>
 <table>
   <tr><th>№</th><th>Сценарий</th><th>Критерий</th><th>Статус</th></tr>
   <tr><td>1</td><td>Базовый режим 5 В</td><td>зафиксированы ток, напряжение, мощность</td><td class="todo">нужен стенд</td></tr>
@@ -127,9 +128,10 @@
 <h2>Материалы поставки</h2>
 <table>
   <tr><th>Файл</th><th>Назначение</th></tr>
-  <tr><td><code>artifacts/driver-ln8000-arm64/</code></td><td>пакет драйвера: <code>ln8000_kmdf.sys</code>, <code>.inf</code>, <code>.cat</code>, сертификат тестовой подписи</td></tr>
+  <tr><td><code>artifacts/driver-ln8000-arm64/</code></td><td>пакет драйвера: <code>ln8000_kmdf.sys</code> (SHA-256 <code>27db2f4468c5e834…</code>), <code>.inf</code>, <code>.cat</code>, сертификат тестовой подписи</td></tr>
   <tr><td><code>deploy/install-driver.ps1</code>, <code>update-driver.ps1</code>, <code>uninstall-driver.ps1</code></td><td>установка, обновление, откат</td></tr>
   <tr><td><code>deploy/nabu-ln8000.ps1</code></td><td>диагностика: <code>status</code>, <code>sessions</code>, <code>read</code>, <code>write</code>, <code>journal</code></td></tr>
+  <tr><td><code>deploy/run-acceptance.ps1</code></td><td>автоматический прогон протокола и сборка отчёта</td></tr>
   <tr><td><code>docs/DEPLOY-LN8000.md</code></td><td>руководство: установка, профили, сбои, риски, протокол</td></tr>
   <tr><td><code>docs/LN8000.md</code></td><td>карта регистров, режимы, формулы кодирования</td></tr>
 </table>

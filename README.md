@@ -134,7 +134,8 @@ cd crates/ln8000-kmdf ; cargo wdk build --target-arch arm64 --profile release
 
 Установка и диагностика LN8000 — [docs/DEPLOY-LN8000.md](docs/DEPLOY-LN8000.md):
 `install-driver.ps1`, `nabu-ln8000.ps1 status|sessions|read|write|journal`,
-`uninstall-driver.ps1`.
+`run-acceptance.ps1` (автоматический протокол приёмки), `uninstall-driver.ps1`.
+Все скрипты в UTF-8 с BOM.
 
 ## Лицензия
 
