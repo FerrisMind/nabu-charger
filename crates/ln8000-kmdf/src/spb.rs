@@ -22,11 +22,11 @@ use crate::spb_abi::{
 };
 use ln8000::{BusError, RegAddr, RegisterBus};
 use wdk_sys::{
-    call_unsafe_wdf_function_binding, GENERIC_READ, GENERIC_WRITE, NTSTATUS, ULONG, UNICODE_STRING,
+    call_unsafe_wdf_function_binding, NTSTATUS, ULONG, UNICODE_STRING,
     WDFDEVICE, WDFIOTARGET, WDFMEMORY, WDFREQUEST, WDF_IO_TARGET_OPEN_PARAMS,
     WDF_REQUEST_SEND_OPTIONS, WDF_NO_HANDLE, WDF_NO_OBJECT_ATTRIBUTES,
     _WDF_IO_TARGET_OPEN_TYPE::WdfIoTargetOpenByName,
-    _WDF_REQUEST_SEND_OPTIONS_FLAGS::WDF_REQUEST_SEND_OPTION_TIMEOUT,
+    _WDF_REQUEST_SEND_OPTIONS_FLAGS::{WDF_REQUEST_SEND_OPTION_SYNCHRONOUS, WDF_REQUEST_SEND_OPTION_TIMEOUT},
 };
 
 /// Префикс пути Resource Hub (`RESOURCE_HUB_DEVICE_NAME_PREFIX`).
@@ -38,6 +38,10 @@ pub const MAX_TRANSFERS: usize = 3;
 /// Таймаут транзакции в единицах 100 нс (одна секунда).
 const SPB_TIMEOUT_100NS: i64 = -10_000 * 1_000;
 
+/// Маска доступа при открытии узла Resource Hub: как у штатного драйвера
+/// (`FILE_GENERIC_READ|FILE_GENERIC_WRITE|SYNCHRONIZE` = 0x1F01FF).
+const HUB_DESIRED_ACCESS: u32 = 0x001F_01FF;
+
 /// Формат буфера `SimpleNonPaged`: разрешает буфер вне буферов запроса.
 const SPB_FORMAT_SIMPLE_NON_PAGED: u32 = 3;
 
@@ -45,8 +49,6 @@ const SPB_FORMAT_SIMPLE_NON_PAGED: u32 = 3;
 const VARIANT_OUTPUT_SIMPLE: u8 = 0;
 /// Вариант 2: те же данные, но формат `SimpleNonPaged`.
 const VARIANT_OUTPUT_NON_PAGED: u8 = 1;
-/// Вариант 3: в поле `Size` — полная длина списка, а не заголовок.
-const VARIANT_TOTAL_SIZE: u8 = 2;
 /// Вариант 5: список завершается элементом с направлением `None`.
 const VARIANT_TERMINATED: u8 = 3;
 /// Вариант 6: данные внутри выходного буфера, который передан в запрос.
@@ -113,40 +115,56 @@ impl SpbBus {
     /// # Safety
     ///
     /// Вызывается на пассивном уровне IRQL (из `EvtDevicePrepareHardware`).
-    pub unsafe fn open(device: WDFDEVICE, peripheral_id: u64) -> Result<Self, BusError> {
-        let mut target: WDFIOTARGET = WDF_NO_HANDLE.cast();
-        // SAFETY: `device` — валидный WDFDEVICE; дескриптор под выход.
-        let status = unsafe {
-            call_unsafe_wdf_function_binding!(
-                WdfIoTargetCreate,
-                device,
-                WDF_NO_OBJECT_ATTRIBUTES,
-                &raw mut target,
-            )
+    pub unsafe fn open(device: WDFDEVICE, peripheral_id: u64, use_hub: bool) -> Result<Self, BusError> {
+        // Цель — либо родитель устройства (стек контроллера шины), либо узел
+        // Resource Hub по идентификатору подключения.
+        //
+        // Проверено на планшете: последовательность в родителя проходит, но
+        // адреса устройства там нет; в узел адрес есть, но запрос отвергается.
+        // Единственное отличие нашего открытия узла от штатного драйвера —
+        // маска доступа, поэтому она вынесена отдельно.
+        let target: WDFIOTARGET = if use_hub {
+            let mut hub: WDFIOTARGET = WDF_NO_HANDLE.cast();
+            // SAFETY: устройство создано; дескриптор — локальная переменная.
+            let status = unsafe {
+                call_unsafe_wdf_function_binding!(
+                    WdfIoTargetCreate,
+                    device,
+                    WDF_NO_OBJECT_ATTRIBUTES,
+                    &raw mut hub,
+                )
+            };
+            if !nt_ok(status) {
+                return Err(BusError::io("не удалось создать цель ввода-вывода"));
+            }
+            let path = resource_hub_path(peripheral_id);
+            let mut params: WDF_IO_TARGET_OPEN_PARAMS = unsafe { core::mem::zeroed() };
+            params.Size = size_of_ulong::<WDF_IO_TARGET_OPEN_PARAMS>();
+            params.Type = WdfIoTargetOpenByName;
+            params.TargetDeviceName = path.as_unicode_string();
+            // Маска как у штатного драйвера узла: с ней узел выдаёт объект,
+            // который принимает последовательности.
+            params.DesiredAccess = HUB_DESIRED_ACCESS;
+            params.ShareAccess = 0;
+            params.CreateDisposition = wdk_sys::FILE_OPEN;
+            params.FileAttributes = wdk_sys::FILE_ATTRIBUTE_NORMAL;
+            // SAFETY: цель создана, параметры заполнены, уровень пассивный.
+            let status = unsafe {
+                call_unsafe_wdf_function_binding!(WdfIoTargetOpen, hub, &raw mut params)
+            };
+            if !nt_ok(status) {
+                return Err(BusError::io("узел Resource Hub недоступен"));
+            }
+            hub
+        } else {
+            // SAFETY: устройство создано; цель принадлежит WDF.
+            let parent: WDFIOTARGET =
+                unsafe { call_unsafe_wdf_function_binding!(WdfDeviceGetIoTarget, device) };
+            if parent.is_null() {
+                return Err(BusError::io("нет цели родителя устройства"));
+            }
+            parent
         };
-        if !nt_ok(status) {
-            return Err(BusError::io("не удалось создать цель ввода-вывода"));
-        }
-
-        let path = resource_hub_path(peripheral_id);
-        let mut params: WDF_IO_TARGET_OPEN_PARAMS = unsafe { core::mem::zeroed() };
-        params.Size = size_of_ulong::<WDF_IO_TARGET_OPEN_PARAMS>();
-        params.Type = WdfIoTargetOpenByName;
-        params.TargetDeviceName = path.as_unicode_string();
-        params.DesiredAccess = GENERIC_READ | GENERIC_WRITE;
-        params.ShareAccess = 0;
-        params.CreateDisposition = wdk_sys::FILE_OPEN;
-        params.FileAttributes = wdk_sys::FILE_ATTRIBUTE_NORMAL;
-
-        // SAFETY: цель создана, параметры заполнены, уровень пассивный.
-        let status = unsafe {
-            call_unsafe_wdf_function_binding!(WdfIoTargetOpen, target, &raw mut params)
-        };
-        if !nt_ok(status) {
-            return Err(BusError::io(
-                "узел PEIC недоступен через Resource Hub (проверьте _CRS)",
-            ));
-        }
 
         let mut request: WDFREQUEST = WDF_NO_HANDLE.cast();
         let mut input: WDFMEMORY = WDF_NO_HANDLE.cast();
@@ -373,7 +391,7 @@ impl SpbBus {
 
         let mut options: WDF_REQUEST_SEND_OPTIONS = unsafe { core::mem::zeroed() };
         options.Size = size_of_ulong::<WDF_REQUEST_SEND_OPTIONS>();
-        options.Flags = WDF_REQUEST_SEND_OPTION_TIMEOUT as ULONG;
+        options.Flags = (WDF_REQUEST_SEND_OPTION_SYNCHRONOUS | WDF_REQUEST_SEND_OPTION_TIMEOUT) as ULONG;
         options.Timeout = SPB_TIMEOUT_100NS;
 
         // SAFETY: отправка синхронная, уровень пассивный, повторный вход исключён
@@ -438,7 +456,7 @@ impl SpbBus {
         }
         let mut options: WDF_REQUEST_SEND_OPTIONS = unsafe { core::mem::zeroed() };
         options.Size = size_of_ulong::<WDF_REQUEST_SEND_OPTIONS>();
-        options.Flags = WDF_REQUEST_SEND_OPTION_TIMEOUT as ULONG;
+        options.Flags = (WDF_REQUEST_SEND_OPTION_SYNCHRONOUS | WDF_REQUEST_SEND_OPTION_TIMEOUT) as ULONG;
         options.Timeout = SPB_TIMEOUT_100NS;
         // SAFETY: синхронная отправка на пассивном уровне.
         let sent = unsafe {
@@ -487,6 +505,54 @@ impl SpbBus {
         entry
     }
 
+    /// Отправляет управляющий запрос SPB без буферов и возвращает статус.
+    ///
+    /// Нужно, чтобы понять, какие запросы узел вообще поддерживает: по одному
+    /// коду запроса на вызов. Статус пишется вызывающим в реестр.
+    pub fn probe_ioctl(&mut self, code: u32) -> i32 {
+        // SAFETY: цель и запрос валидны; запрос без буферов.
+        let status = unsafe {
+            call_unsafe_wdf_function_binding!(
+                WdfIoTargetFormatRequestForIoctl,
+                self.target,
+                self.request,
+                code,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+            )
+        };
+        if !nt_ok(status) {
+            self.last_status = status;
+            return status;
+        }
+        let mut options: WDF_REQUEST_SEND_OPTIONS = unsafe { core::mem::zeroed() };
+        options.Size = size_of_ulong::<WDF_REQUEST_SEND_OPTIONS>();
+        options.Flags =
+            (WDF_REQUEST_SEND_OPTION_SYNCHRONOUS | WDF_REQUEST_SEND_OPTION_TIMEOUT) as ULONG;
+        options.Timeout = SPB_TIMEOUT_100NS;
+        // SAFETY: синхронная отправка на пассивном уровне.
+        let sent = unsafe {
+            call_unsafe_wdf_function_binding!(
+                WdfRequestSend,
+                self.request,
+                self.target,
+                &raw mut options,
+            )
+        };
+        if sent == 0 {
+            self.last_status = -1;
+            unsafe { reuse_request(self.request) };
+            return -1;
+        }
+        // SAFETY: запрос завершён, читаем его статус.
+        let status = unsafe { call_unsafe_wdf_function_binding!(WdfRequestGetStatus, self.request) };
+        self.last_status = status;
+        unsafe { reuse_request(self.request) };
+        status
+    }
+
     /// Пытается занять соединение (`IOCTL_SPB_LOCK_CONNECTION`).
     ///
     /// Это проверка цели: если узел отвечает успехом, значит перед нами
@@ -512,7 +578,7 @@ impl SpbBus {
         }
         let mut options: WDF_REQUEST_SEND_OPTIONS = unsafe { core::mem::zeroed() };
         options.Size = size_of_ulong::<WDF_REQUEST_SEND_OPTIONS>();
-        options.Flags = WDF_REQUEST_SEND_OPTION_TIMEOUT as ULONG;
+        options.Flags = (WDF_REQUEST_SEND_OPTION_SYNCHRONOUS | WDF_REQUEST_SEND_OPTION_TIMEOUT) as ULONG;
         options.Timeout = SPB_TIMEOUT_100NS;
         // SAFETY: синхронная отправка на пассивном уровне.
         let sent = unsafe {
@@ -557,11 +623,10 @@ impl SpbBus {
             (false, true) => 3,
         };
         self.last_count = count;
-        let size_field = if self.variant == VARIANT_TOTAL_SIZE {
-            SpbTransferList::area_size(usize::try_from(count).unwrap_or(0))
-        } else {
-            SpbTransferList::header_size()
-        };
+        // Поле `Size` ВСЕГДА равно `sizeof(SPB_TRANSFER_LIST)` — заголовок
+        // вместе с одной записью, независимо от числа передач (см. `spb.h`:
+        // «List size - must be set to sizeof(SPB_TRANSFER_LIST)»).
+        let size_field = SpbTransferList::header_size();
         // SAFETY: запись заголовка списка.
         unsafe {
             (*list).size = u32::try_from(size_field).unwrap_or(0);
@@ -614,8 +679,7 @@ impl SpbBus {
                     let second = self
                         .area
                         .add(SpbTransferList::header_size())
-                        .cast::<SpbTransferListEntry>()
-                        .add(1);
+                        .cast::<SpbTransferListEntry>();
                     *second = Self::entry_with_format(
                         format,
                         SPB_DIRECTION_FROM_DEVICE,
@@ -749,6 +813,8 @@ pub struct HubPath {
 impl HubPath {
     /// Представление пути как `UNICODE_STRING` (без завершающего нуля).
     #[must_use]
+    /// Строка пути к узлу Resource Hub: оставлена для диагностики.
+    #[allow(dead_code)]
     pub fn as_unicode_string(&self) -> UNICODE_STRING {
         let length = u16::try_from(HUB_PATH_CHARS.saturating_mul(2)).unwrap_or(0);
         UNICODE_STRING {
