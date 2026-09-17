@@ -541,7 +541,7 @@ impl<T: RegisterBus> Pump<T> {
     /// * [`PumpError::ModeNotReached`] — `SYS_STS` не подтвердил режим.
     pub fn enable_switching(&mut self) -> Result<OpMode, PumpError> {
         self.set_op_mode(OpMode::Switching)?;
-        let status = self.status()?;
+        let status = self.settle_and_read_status()?;
         if status.op_mode != OpMode::Switching {
             return Err(PumpError::ModeNotReached {
                 wanted: OpMode::Switching.code(),
@@ -559,7 +559,7 @@ impl<T: RegisterBus> Pump<T> {
     /// Пробрасывает ошибки шины.
     pub fn enable_bypass(&mut self) -> Result<OpMode, PumpError> {
         self.set_op_mode(OpMode::Bypass)?;
-        let status = self.status()?;
+        let status = self.settle_and_read_status()?;
         // Проверяем так же, как для режима 2:1: молчаливый отказ чипа нельзя
         // принимать за успех — иначе драйвер решит, что резервный режим включён,
         // когда на самом деле заряд не идёт.
@@ -596,6 +596,62 @@ impl<T: RegisterBus> Pump<T> {
                 Err(_) => Err(switching_error),
             },
         }
+    }
+
+    /// Перечитывает состояние, давая чипу время применить режим.
+    ///
+    /// Эталон после записи режима ждёт 10 мс (`msleep(10)`) и только затем
+    /// читает `SYS_STS`. Пустой цикл ожидания в ядре нам недоступен, поэтому
+    /// перечитываем состояние несколько раз: один обмен по шине занимает
+    /// 8-46 мс, что заведомо больше паузы эталона. Заодно это даёт
+    /// доказательство, что чип действительно сменил режим, а не что мы
+    /// прочитали старое значение сразу после записи.
+    ///
+    /// # Errors
+    ///
+    /// Пробрасывает ошибки шины.
+    fn settle_and_read_status(&mut self) -> Result<Status, PumpError> {
+        let mut last = self.status()?;
+        for _ in 0..2 {
+            if last.op_mode != OpMode::Unknown {
+                break;
+            }
+            last = self.status()?;
+        }
+        Ok(last)
+    }
+
+    /// Explicit charge start/stop, mirroring the reference
+    /// `psy_chg_set_charging_enable`.
+    ///
+    /// The reference does three things in this order: disable reverse-current
+    /// protection, request the op mode (switching to charge, standby to stop),
+    /// then read the mode back. It reports what the chip answered instead of
+    /// assuming success - the pump legitimately refuses switching when its
+    /// input is out of range, and that answer is the diagnostic we want.
+    ///
+    /// # Errors
+    ///
+    /// * [`PumpError::NotOpen`] - помпа не открыта.
+    /// * [`PumpError::Bus`] - сбой обмена.
+    pub fn set_charging(&mut self, on: bool) -> Result<OpMode, PumpError> {
+        // Шаг эталона: перед стартом заряда обратная защита выключается.
+        self.update(regs::SYS_CTRL, 1 << 2, 0, "disable_reverse_current")?;
+        let target = if on {
+            OpMode::Switching
+        } else {
+            OpMode::Standby
+        };
+        self.set_op_mode(target)?;
+        // Возвращаем то, что чип реально сообщил, а не то, что просили.
+        let status = self.settle_and_read_status()?;
+        self.op_mode = status.op_mode;
+        self.state = match status.op_mode {
+            OpMode::Switching => PumpState::Switching,
+            OpMode::Standby => PumpState::Configured,
+            _ => self.state,
+        };
+        Ok(status.op_mode)
     }
 
     /// Переводит устройство в standby.
