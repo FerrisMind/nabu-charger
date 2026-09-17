@@ -1086,8 +1086,8 @@ mod tests {
         pump.bus.set_reg(AdcChannel::Vbat.register(), 0x2B);
         pump.bus.set_reg(AdcChannel::Vbat.register() + 1, 0x01);
         pump.bus.set_reg(AdcChannel::Iin.register(), 0xC8);
-        // Код 0x012B = 299 → 1 В + 299 × 5 мВ = 2.495 В
-        assert_eq!(pump.read_adc(AdcChannel::Vbat).unwrap(), 2_495_000);
+        // Код 0x012B = 299, шаг 5 мВ: 299 × 5 мВ = 1.495 В (смещения нет).
+        assert_eq!(pump.read_adc(AdcChannel::Vbat).unwrap(), 1_495_000);
         // Код 200 → 200 × 4.89 мА = 978 мА
         assert_eq!(pump.read_adc(AdcChannel::Iin).unwrap(), 978_000);
     }
@@ -1101,7 +1101,7 @@ mod tests {
         pump.bus.set_reg(AdcChannel::Vbat.register(), 0x2B);
         pump.bus.set_reg(AdcChannel::Vbat.register() + 1, 0x01);
 
-        assert_eq!(pump.read_adc(AdcChannel::Vbat).unwrap(), 2_495_000);
+        assert_eq!(pump.read_adc(AdcChannel::Vbat).unwrap(), 1_495_000);
 
         let timer = pump.bus.reg(regs::TIMER_CTRL);
         assert_eq!(

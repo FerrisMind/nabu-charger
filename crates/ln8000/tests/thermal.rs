@@ -22,16 +22,17 @@ use ln8000::{
 
 /// Записывает температуру кристалла в регистры АЦП так, как это сделал бы чип.
 ///
-/// Кодирование обратно формуле эталонного драйвера: `dC = raw * 4350 / 1000 - 250`.
+/// Температура задаётся кодом канала: dC = (935 - code) * 4350 / 1000,
 fn set_die_temp(pump: &mut Pump<MockPumpBus>, deci_celsius: i32) {
-    // Обратное преобразование к формуле эталона: (935 - raw) * 4350 / 1000,
+    // Обратное преобразование: code = 935 - (dC * 1000) / 4350.
     // то есть raw = 935 - (dC * 1000) / 4350. Значение ограничиваем диапазоном АЦП.
-    let raw = (935_i32 - (deci_celsius * 1000) / 4350).clamp(0, 65_535);
-    let raw = u16::try_from(raw).unwrap_or(0);
+    let code = (935_i32 - (deci_celsius * 1000) / 4350).clamp(0, 1_023);
     let register = AdcChannel::DieTemp.register();
     let bus = pump.bus_mut();
-    bus.set_reg(register, u8::try_from(raw & 0x00FF).unwrap_or(0));
-    bus.set_reg(register + 1, u8::try_from(raw >> 8).unwrap_or(0));
+    // Код канала упакован в общий поток бит: 6 бит кода лежат в младшем
+    // байте со сдвигом 2, старшие 4 бита - в младших битах следующего.
+    bus.set_reg(register, u8::try_from((code % 64) * 4).unwrap_or(0));
+    bus.set_reg(register + 1, u8::try_from((code / 64) & 0x0F).unwrap_or(0));
 }
 
 /// Собирает отсчёт телеметрии: температура читается с чипа, остальные каналы —

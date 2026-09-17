@@ -120,16 +120,33 @@ impl AdcChannel {
     #[must_use]
     #[allow(clippy::arithmetic_side_effects)]
     pub fn decode(self, raw: u16) -> i32 {
-        let code = i32::from(raw);
+        // Значение канала - 10-битный код, упакованный в общий поток бит
+        // всех каналов: 8 каналов по 10 бит = 80 бит = ровно 10 байт
+        // (0x09..0x12). Пару байт берём с адреса канала, но целиком её
+        // брать нельзя: код собирается только из бит своего канала.
+        // Нарезка повторяет `ln8000_convert_adc_code` эталонного драйвера.
+        let low = i32::from(raw & 0x00FF);
+        let high = i32::from((raw >> 8) & 0x00FF);
+        let code = match self {
+            // Биты 0..9 (IIN) и 40..49 (VBAT): байт канала плюс 2 бита старшего.
+            Self::Iin | Self::Vbat => (high & 0x03) * 256 + low,
+            // Биты 10..19 (VAC) и 50..59 (DIETEMP): 6 бит младшего и 4 старшего.
+            Self::Vac | Self::DieTemp => (high & 0x0F) * 64 + (low & 0xFC) / 4,
+            // Биты 20..29 (VIN) и 60..69 (TSBAT): 4 бита младшего и 6 старшего.
+            Self::Vin | Self::TsBat => (high & 0x3F) * 16 + (low & 0xF0) / 16,
+            // Биты 30..39 (VOUT) и 70..79 (TSBUS): 2 бита младшего и старший.
+            Self::Vout | Self::TsBus => (high & 0xFF) * 4 + (low & 0xC0) / 64,
+        };
         match self {
             Self::Vout => code * 5_000,
             Self::Vin => code * 16_000,
-            Self::Vbat => 1_000_000 + code * 5_000,
+            // У батареи смещения нет: код и есть напряжение шагами по 5 мВ.
+            Self::Vbat => code * 5_000,
             Self::Vac => (code + 5) * 16_000,
             Self::Iin => code * 4_890,
             // Как в эталоне: (935 - raw) * 4350 / 1000, с ограничением [-250; 1600].
             Self::DieTemp => {
-                let dc = (935_i32 - i32::from(code)) * 4_350 / 1_000;
+                let dc = (935 - code) * 4_350 / 1_000;
                 dc.clamp(-250, 1_600)
             }
             Self::TsBat | Self::TsBus => code * 2_933,
@@ -253,17 +270,18 @@ mod tests {
 
     #[test]
     fn adc_decoding_matches_constants() {
-        assert_eq!(AdcChannel::Vbat.decode(0), 1_000_000);
-        assert_eq!(AdcChannel::Vbat.decode(688), 4_440_000);
-        assert_eq!(AdcChannel::Iin.decode(100), 489_000);
-        assert_eq!(AdcChannel::Vin.decode(100), 1_600_000);
-        assert_eq!(AdcChannel::Vac.decode(0), 80_000);
+        assert_eq!(AdcChannel::Vbat.decode(0x0000), 0);
+        assert_eq!(AdcChannel::Vbat.decode(0x0064), 500_000);
+        assert_eq!(AdcChannel::Vbat.decode(107 * 256 + 33), 4_005_000);
+        assert_eq!(AdcChannel::Iin.decode(0x0064), 489_000);
+        assert_eq!(AdcChannel::Vin.decode(34 * 256 + 168), 8_864_000);
+        assert_eq!(AdcChannel::Vac.decode(168 * 256 + 156), 8_896_000);
         // Формула эталона: (935 - raw) * 4350 / 1000, ограничение [-250; 1600].
-        assert_eq!(AdcChannel::DieTemp.decode(935), 0);
-        assert_eq!(AdcChannel::DieTemp.decode(900), 152);
+        assert_eq!(AdcChannel::DieTemp.decode(13 * 256 + 107), 334);
+        assert_eq!(AdcChannel::DieTemp.decode(14 * 256 + 156), 0);
         assert_eq!(AdcChannel::DieTemp.decode(0), 1_600);
-        assert_eq!(AdcChannel::DieTemp.decode(2_000), -250);
-        assert_eq!(AdcChannel::TsBat.decode(1_000), 2_933_000);
+        assert_eq!(AdcChannel::DieTemp.decode(15 * 256 + 252), -250);
+        assert_eq!(AdcChannel::TsBat.decode(0x0000), 0);
     }
 
     #[test]
