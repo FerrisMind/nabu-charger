@@ -33,7 +33,7 @@ mod spb_abi;
 extern crate wdk_panic;
 
 use ioctl::{
-    Ln8000LimitsRequest, Ln8000ModeRequest, Ln8000RegRequest, Ln8000Sample, Ln8000SamplesRequest, Ln8000Sessions,
+    Ln8000ChargeRequest, Ln8000LimitsRequest, Ln8000ModeRequest, Ln8000RegRequest, Ln8000Sample, Ln8000SamplesRequest, Ln8000Sessions,
     Ln8000Status, LN8000_STATUS_MAGIC, LN8000_STATUS_VERSION,
 };
 use ln8000::encoding::decode_iin_limit;
@@ -1423,6 +1423,7 @@ unsafe extern "C" fn evt_io_device_control(
         ioctl::IOCTL_LN8000_WRITE_REG => unsafe { handle_write_reg(request, input_buffer_length) },
         ioctl::IOCTL_LN8000_SET_LIMITS => unsafe { handle_set_limits(request, input_buffer_length) },
         ioctl::IOCTL_LN8000_SET_MODE => unsafe { handle_set_mode(request, input_buffer_length) },
+        ioctl::IOCTL_LN8000_SET_CHARGE => unsafe { handle_set_charge(request, input_buffer_length) },
         ioctl::IOCTL_LN8000_GET_SESSIONS => unsafe { handle_get_sessions(request) },
         ioctl::IOCTL_LN8000_GET_SAMPLES => unsafe {
             handle_get_samples(request, input_buffer_length)
@@ -1466,6 +1467,21 @@ unsafe fn handle_get_status(request: WDFREQUEST) {
         status.vbat_uv = sample.vbat_uv;
         status.vbus_uv = sample.vbus_uv;
         status.die_temp_dc = sample.die_temp_dc;
+        status.op_mode = sample.op_mode.code();
+    } else if let Some(pump) = st.pump.as_mut() {
+        // Сохранённого снимка ещё нет (периодический сбор не наполнил его),
+        // поэтому читаем показатели на месте: обмен по шине занимает единицы
+        // миллисекунд, и обработчик не блокируется.
+        status.vbat_uv =
+            u32::try_from(pump.read_adc(AdcChannel::Vbat).unwrap_or_default().max(0)).unwrap_or(0);
+        status.vbus_uv =
+            u32::try_from(pump.read_adc(AdcChannel::Vin).unwrap_or_default().max(0)).unwrap_or(0);
+        status.iin_ua =
+            u32::try_from(pump.read_adc(AdcChannel::Iin).unwrap_or_default().max(0)).unwrap_or(0);
+        status.die_temp_dc = pump.read_adc(AdcChannel::DieTemp).unwrap_or_default();
+        if let Ok(live) = pump.status() {
+            status.op_mode = live.op_mode.code();
+        }
     }
     unsafe { write_output(request, &status) };
 }
@@ -1610,11 +1626,42 @@ unsafe fn handle_set_mode(request: WDFREQUEST, input_length: usize) {
     unsafe { write_output(request, &answer) };
 }
 
+/// Явный старт/стоп заряда через [`IOCTL_LN8000_SET_CHARGE`].
+///
+/// # Safety
+///
+/// `request` валиден; входной/выходной буфер достаточного размера.
+unsafe fn handle_set_charge(request: WDFREQUEST, input_length: usize) {
+    if input_length < core::mem::size_of::<Ln8000ChargeRequest>() {
+        unsafe { complete(request, wdk_sys::STATUS_BUFFER_TOO_SMALL, 0) };
+        return;
+    }
+    // SAFETY: буфер проверен по размеру.
+    let Some(mut answer) = (unsafe { read_input::<Ln8000ChargeRequest>(request) }) else {
+        unsafe { complete(request, wdk_sys::STATUS_INVALID_PARAMETER, 0) };
+        return;
+    };
+    // SAFETY: доступ к глобальному состоянию WDF.
+    let st = unsafe { state() };
+    if let Some(pump) = st.pump.as_mut() {
+        match pump.set_charging(answer.on != 0) {
+            Ok(applied) => {
+                answer.applied_mode = applied.code();
+                answer.sys_sts = pump.status().map_or(0, |s| s.sys_sts);
+            }
+            Err(err) => answer.error_code = pump_error_code(err),
+        }
+    } else {
+        answer.error_code = -1;
+    }
+    unsafe { write_output(request, &answer) };
+}
+
 /// Отдаёт сведения о сеансах заряда.
 ///
 /// # Safety
 ///
-/// `request` валиден; выходной буфер достаточного размера.
+/// `request` валиден; вывод проверяется вызывающим.
 unsafe fn handle_get_sessions(request: WDFREQUEST) {
     // SAFETY: доступ сериализован WDF.
     let st = unsafe { state() };

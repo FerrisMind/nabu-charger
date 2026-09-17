@@ -28,6 +28,14 @@ pub const IOCTL_LN8000_GET_SESSIONS: u32 = ctl_code(0x815, 0, 0);
 /// Выгрузить последние отсчёты телеметрии.
 pub const IOCTL_LN8000_GET_SAMPLES: u32 = ctl_code(0x816, 0, 0);
 
+/// Explicit charge start/stop.
+///
+/// Mirrors the reference `psy_chg_set_charging_enable` sequence: disable
+/// reverse-current protection, request the op mode, read the mode back and
+/// report what the chip actually answered. Unlike the automatic path this
+/// never fails silently: the caller sees the raw `SYS_STS`.
+pub const IOCTL_LN8000_SET_CHARGE: u32 = ctl_code(0x817, 0, 0);
+
 /// Идентификатор структуры состояния.
 pub const LN8000_STATUS_MAGIC: u32 = 0x4C4E_3830; // "LN80"
 
@@ -118,6 +126,22 @@ pub struct Ln8000ModeRequest {
     /// Зарезервировано.
     pub reserved: [u8; 2],
     /// Код ошибки.
+    pub error_code: i32,
+}
+
+/// Запрос явного старта/стопа заряда для [`IOCTL_LN8000_SET_CHARGE`].
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Ln8000ChargeRequest {
+    /// 1 = start charging (switching mode), 0 = stop charging (standby).
+    pub on: u8,
+    /// Op mode actually reported by the chip after the attempt.
+    pub applied_mode: u8,
+    /// Raw `SYS_STS` read back from the chip.
+    pub sys_sts: u8,
+    /// Reserved.
+    pub reserved: u8,
+    /// Error code (0 = ok, negative = pump error).
     pub error_code: i32,
 }
 
