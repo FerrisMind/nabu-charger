@@ -1,12 +1,16 @@
 ; =====================================================================
-; ln8000-kmdf — драйвер charge pump LN8000 (Xiaomi Pad 5, nabu)
+; ln8000-kmdf: LN8000 charge pump driver (Xiaomi Pad 5, nabu)
 ;
-; Модуль: ln8000_kmdf.inx → ln8000_kmdf.inf
-; Целевой узел: ACPI\QCOM057E (PEIC, I²C 0x51 на \_SB.I2C5)
-; Платформа: Windows on ARM64 (aarch64-pc-windows-msvc)
+; Source:   ln8000_kmdf.inx -> ln8000_kmdf.inf
+; Device:   ACPI\QCOM057E (PEIC, I2C 0x51 on \_SB.I2C5)
+; Platform: Windows on ARM64 (aarch64-pc-windows-msvc)
 ;
-; Узел PEIC уже описан в DSDT планшета (_HID = QCOM057E, _STA = 0x0F),
-; поэтому ACPI-правки не нужны: драйвер встаёт на существующий _HID.
+; The PEIC node already exists in the tablet DSDT (_HID = QCOM057E,
+; _STA = 0x0F), so no ACPI changes are needed.
+;
+; ASCII ONLY. INF string values are read by setupapi as ANSI, so any
+; non-ASCII character (Cyrillic, em dash) turns into mojibake in Device
+; Manager. Russian explanations live in docs/, not in the INF.
 ; =====================================================================
 
 [Version]
@@ -15,7 +19,7 @@ Class       = Battery
 ClassGuid   = {72631e54-78a4-11d0-bcf7-00aa00b7b32a}
 Provider    = %ProviderString%
 PnpLockDown = 1
-DriverVer   = 09/16/2026,0.2.0.0
+DriverVer   = 09/17/2026,0.2.2.0
 
 [DestinationDirs]
 DefaultDestDir = 13
@@ -26,7 +30,7 @@ DefaultDestDir = 13
 [SourceDisksFiles]
 ln8000_kmdf.sys = 1,,
 
-; ================= Установка устройства =================
+; ================= device installation =================
 
 [Manufacturer]
 %StdMfg% = Ln8000,NT$ARCH$.10.0...16299
@@ -41,7 +45,7 @@ CopyFiles = Drivers_Dir
 [Drivers_Dir]
 ln8000_kmdf.sys
 
-; ================= Установка службы =================
+; ================= service installation =================
 
 [Ln8000_Device.NT$ARCH$.Services]
 AddService = ln8000_kmdf, %SPSVCINST_ASSOCSERVICE%, Ln8000_Service_Inst
@@ -53,24 +57,36 @@ StartType      = 3               ; SERVICE_DEMAND_START
 ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
 ServiceBinary  = %13%\ln8000_kmdf.sys
 
-; ================= Параметры (профили) =================
-; Значения по умолчанию; при необходимости переопределяются в реестре
-; (см. docs/DEPLOY-LN8000.md, раздел «Профили»).
+; ================= parameters (profiles) =================
+; Defaults only; override in the registry without rebuilding the driver
+; (see docs/DEPLOY-LN8000.md, "profiles").
 
 [Ln8000_Device.NT$ARCH$.HW]
 HKR, Parameters, IinLimitUa,      %REG_DWORD%, 2000000
 HKR, Parameters, VbatFloatUv,     %REG_DWORD%, 4440000
 HKR, Parameters, VacOvpUv,        %REG_DWORD%, 9500000
-HKR, Parameters, ThermalLimitUv,  %REG_DWORD%, 1000000
+; protection thresholds (tenths of degC) and currents (uA):
+HKR, Parameters, TempReduceDc,    %REG_DWORD%, 430
+HKR, Parameters, TempBypassDc,    %REG_DWORD%, 480
+HKR, Parameters, TempStopDc,      %REG_DWORD%, 550
+HKR, Parameters, IinMaxUa,        %REG_DWORD%, 3500000
+HKR, Parameters, IinTargetUa,     %REG_DWORD%, 2000000
+HKR, Parameters, IinFloorUa,      %REG_DWORD%, 500000
+HKR, Parameters, VbatReduceUv,    %REG_DWORD%, 4420000
 HKR, Parameters, TelemetryMs,     %REG_DWORD%, 1000
+HKR, Parameters, BusRetryCount,   %REG_DWORD%, 2
+HKR, Parameters, NtcAlarmCfg,     %REG_DWORD%, 226
+HKR, Parameters, WatchdogEnabled, %REG_DWORD%, 0
+; 0 = pump protections as in the tablet Device Tree, 1 = loops enabled
+HKR, Parameters, ProtectionProfile, %REG_DWORD%, 0
 
-; ================= Строки =================
+; ================= strings =================
 
 [Strings]
 SPSVCINST_ASSOCSERVICE = 0x00000002
 REG_DWORD              = 0x00010001
 ProviderString         = "nabu-fastcharge"
-StdMfg                 = "(Стандартные системные устройства)"
-DiskId1                = "ln8000-kmdf, установочный диск #1"
-Ln8000.DeviceDesc      = "Charge pump LN8000 (PEIC) — Xiaomi Pad 5"
-Ln8000.SVCDESC         = "ln8000_kmdf — драйвер charge pump LN8000"
+StdMfg                 = "(Standard system devices)"
+DiskId1                = "ln8000-kmdf installation disk #1"
+Ln8000.DeviceDesc      = "Charge pump LN8000 (PEIC) - Xiaomi Pad 5"
+Ln8000.SVCDESC         = "ln8000_kmdf - LN8000 charge pump driver"

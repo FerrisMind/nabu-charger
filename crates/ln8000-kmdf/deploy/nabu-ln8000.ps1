@@ -1,4 +1,4 @@
-# nabu-ln8000.ps1 — диагностика драйвера charge pump LN8000
+﻿# nabu-ln8000.ps1 — диагностика драйвера charge pump LN8000
 #
 # Открывает устройство \\.\nabu_ln8000 (символическая ссылка, созданная
 # драйвером) и общается с ним через DeviceIoControl. Коды управления вычисляются
@@ -59,7 +59,12 @@ public static extern bool CloseHandle(IntPtr handle);
 }
 
 function Open-Device {
-  $handle = [NabuNative]::CreateFileW($DevicePath, 0xC0000000, 3, [IntPtr]::Zero, 3, 0, [IntPtr]::Zero)
+  # 0xC0000000 = GENERIC_READ | GENERIC_WRITE, 3 = OPEN_EXISTING, share = READ|WRITE.
+  # Значения проводим как UInt32: иначе PowerShell передаёт отрицательный Int32
+  # и разбор перегрузки падает.
+  $desiredAccess = [uint32]3221225472
+  $handle = [NabuNative]::CreateFileW($DevicePath, $desiredAccess, [uint32]3, [IntPtr]::Zero,
+                                      [uint32]3, [uint32]0, [IntPtr]::Zero)
   if ($handle -eq [IntPtr]::new(-1)) {
     throw ("не удалось открыть $DevicePath (код " + [Runtime.InteropServices.Marshal]::GetLastWin32Error() +
            "). Драйвер установлен и устройство PEIC доступно?")
@@ -205,30 +210,54 @@ function Invoke-WriteReg {
 }
 
 function Invoke-Journal {
-  param([string]$Path)
+  param([string]$Path, [int]$Pd = 0)
   Write-Host '=== журнал сеансов ===' -ForegroundColor Cyan
   $status = Invoke-Status
   $sessions = Invoke-Sessions
+
+  # Уровень заряда и состояние питания насос знать не может — их даёт ОС.
+  $battery = Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue | Select-Object -First 1
+  $soc = -1
+  $batteryStatus = 0
+  if ($battery -and $null -ne $battery.EstimatedChargeRemaining) {
+    $soc = [int]$battery.EstimatedChargeRemaining
+  }
+  if ($battery -and $null -ne $battery.BatteryStatus) {
+    $batteryStatus = [int]$battery.BatteryStatus
+  }
+  $pdLabel = switch ($Pd) {
+    0 { 'неизвестно' }
+    1 { '5 В / обычный блок' }
+    2 { 'повышенное напряжение 9 В и выше' }
+    3 { 'согласован QC' }
+    default { '?' }
+  }
+
   $record = [ordered]@{
-    exported_at = (Get-Date).ToString('o')
-    host        = $env:COMPUTERNAME
-    mode        = $status.OpMode
-    state       = $status.State
-    sys_sts     = $status.SysSts
-    fault1_sts  = $status.Fault1Sts
-    fault2_sts  = $status.Fault2Sts
-    safety_sts  = $status.SafetySts
-    critical    = $status.CriticalFault
-    iin_ua      = $status.IinUa
-    vbat_uv     = $status.VbatUv
-    vbus_uv     = $status.VbusUv
-    die_temp_dc = $status.DieTempDc
-    sessions    = $sessions.Total
-    samples     = $status.Samples
+    exported_at     = (Get-Date).ToString('o')
+    host            = $env:COMPUTERNAME
+    soc_percent     = $soc
+    battery_status  = $batteryStatus
+    pd_status       = $Pd
+    pd_status_label = $pdLabel
+    mode            = $status.OpMode
+    state           = $status.State
+    sys_sts         = $status.SysSts
+    fault1_sts      = $status.Fault1Sts
+    fault2_sts      = $status.Fault2Sts
+    safety_sts      = $status.SafetySts
+    critical        = $status.CriticalFault
+    iin_ua          = $status.IinUa
+    vbat_uv         = $status.VbatUv
+    vbus_uv         = $status.VbusUv
+    die_temp_dc     = $status.DieTempDc
+    sessions        = $sessions.Total
+    samples         = $status.Samples
   }
   $json = $record | ConvertTo-Json -Compress
   Add-Content -LiteralPath $Path -Value $json -Encoding UTF8
   Write-Host ("  записано в " + $Path) -ForegroundColor Green
+  Write-Host ("  заряд по данным ОС: " + $soc + " %; согласование: " + $pdLabel)
 }
 
 switch ($Command.ToLower()) {
@@ -244,7 +273,9 @@ switch ($Command.ToLower()) {
   }
   'journal' {
     if (-not $Arg1) { throw 'укажите файл: journal out.jsonl' }
-    Invoke-Journal $Arg1
+    $pdCode = 0
+    if ($Arg2) { $pdCode = [int]$Arg2 }
+    Invoke-Journal $Arg1 $pdCode
   }
   default {
     Write-Host 'Команды: status | sessions | read <hex> | write <hex> <hex> | journal <file>'

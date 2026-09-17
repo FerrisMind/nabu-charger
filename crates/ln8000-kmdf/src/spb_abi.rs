@@ -51,9 +51,27 @@ pub const FILE_DEVICE_CONTROLLER: u32 = 0x0000_0004;
 /// из `shared/spb.h`.
 pub const IOCTL_SPB_EXECUTE_SEQUENCE: u32 = 0x0004_1808;
 
+/// `CTL_CODE(FILE_DEVICE_CONTROLLER, 0x603, METHOD_BUFFERED, FILE_ANY_ACCESS)`.
+pub const IOCTL_SPB_LOCK_CONNECTION: u32 = 0x0004_180C;
+
+/// `CTL_CODE(FILE_DEVICE_CONTROLLER, 0x604, METHOD_BUFFERED, FILE_ANY_ACCESS)`.
+#[allow(dead_code)]
+pub const IOCTL_SPB_UNLOCK_CONNECTION: u32 = 0x0004_1810;
+
 /// Направление передачи: чтение с устройства.
-pub const SPB_DIRECTION_FROM_DEVICE: u32 = 1;
-/// Направление передачи: запись в устройство.
+/// Направление `None`: завершающий элемент списка передач.
+pub const SPB_DIRECTION_NONE: u32 = 0;
+
+/// Запрос подключения к периферии: эталонный клиент Qualcomm отправляет его
+/// узлу до доступа к регистрам (`0x32C004` из разбора `qcpmicEIC8150.sys`).
+pub const IOCTL_ATTACH: u32 = 0x0032_C004;
+
+/// Магия во входе запроса подключения (`0x42696541` — `AeiB`).
+pub const ATTACH_MAGIC: u32 = 0x4269_6541;
+
+/// Длина ответа узла на запрос подключения.
+pub const ATTACH_REPLY_LEN: usize = 1024;
+pub const SPB_DIRECTION_FROM_DEVICE: u32 = 1;/// Направление передачи: запись в устройство.
 pub const SPB_DIRECTION_TO_DEVICE: u32 = 2;
 
 /// Формат буфера: простая буферная область.

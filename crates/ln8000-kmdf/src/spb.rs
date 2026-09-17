@@ -16,7 +16,8 @@
 //! (`peripheral.cpp`, `device.cpp`), заголовки WDK `spb.h` и `reshub.h`.
 
 use crate::spb_abi::{
-    IOCTL_SPB_EXECUTE_SEQUENCE, SPB_DIRECTION_FROM_DEVICE, SPB_DIRECTION_TO_DEVICE,
+    ATTACH_MAGIC, ATTACH_REPLY_LEN, IOCTL_ATTACH, IOCTL_SPB_EXECUTE_SEQUENCE, IOCTL_SPB_LOCK_CONNECTION,
+    SPB_DIRECTION_FROM_DEVICE, SPB_DIRECTION_NONE, SPB_DIRECTION_TO_DEVICE, SPB_FORMAT_SIMPLE,
     SpbTransferList, SpbTransferListEntry, entry_init,
 };
 use ln8000::{BusError, RegAddr, RegisterBus};
@@ -32,13 +33,30 @@ use wdk_sys::{
 pub const RESOURCE_HUB_PREFIX: &str = "/Device/RESOURCE_HUB/";
 
 /// Максимальное число передач в последовательности.
-pub const MAX_TRANSFERS: usize = 2;
+pub const MAX_TRANSFERS: usize = 3;
 
 /// Таймаут транзакции в единицах 100 нс (одна секунда).
 const SPB_TIMEOUT_100NS: i64 = -10_000 * 1_000;
 
+/// Формат буфера `SimpleNonPaged`: разрешает буфер вне буферов запроса.
+const SPB_FORMAT_SIMPLE_NON_PAGED: u32 = 3;
+
+/// Вариант 1: данные в буфере данных запроса, формат `Simple`.
+const VARIANT_OUTPUT_SIMPLE: u8 = 0;
+/// Вариант 2: те же данные, но формат `SimpleNonPaged`.
+const VARIANT_OUTPUT_NON_PAGED: u8 = 1;
+/// Вариант 3: в поле `Size` — полная длина списка, а не заголовок.
+const VARIANT_TOTAL_SIZE: u8 = 2;
+/// Вариант 5: список завершается элементом с направлением `None`.
+const VARIANT_TERMINATED: u8 = 3;
+/// Вариант 6: данные внутри выходного буфера, который передан в запрос.
+const VARIANT_OUTPUT_MEMORY: u8 = 4;
+/// Вариант 7: то же, но формат `SimpleNonPaged`.
+const VARIANT_OUTPUT_MEMORY_NON_PAGED: u8 = 5;
+
 /// Размер области передач с запасом под элементы и данные.
-const TRANSFER_AREA: usize = 256;
+/// Размер области передач: ровно под максимальное число передач.
+const TRANSFER_AREA: usize = SpbTransferList::area_size(MAX_TRANSFERS);
 
 /// Транспорт LN8000 поверх SPB.
 ///
@@ -48,12 +66,40 @@ const TRANSFER_AREA: usize = 256;
 pub struct SpbBus {
     target: WDFIOTARGET,
     request: WDFREQUEST,
+    /// Владелец области передач: сам буфер не читается, но держит выделение.
+    #[allow(dead_code)]
     input: WDFMEMORY,
+    /// Буфер данных: в запрос не передаётся (так делает эталонный пример),
+    /// но нужен как область для байтов обмена.
+    #[allow(dead_code)]
     output: WDFMEMORY,
     area: *mut u8,
     data: *mut u8,
     peripheral_id: u64,
     name: &'static str,
+    /// Статус последнего обмена: нужен при разборе отказов на железе,
+    /// где отладочный вывод драйвера недоступен.
+    last_status: i32,
+    /// Как оформлять запрос: см. `VARIANT_*`. Переключается пробой.
+    variant: u8,
+    /// Вид буфера передач на одну передачу: точная длина 48 байт.
+    input_one: WDFMEMORY,
+    /// Вид буфера передач на две передачи: точная длина 80 байт.
+    input_two: WDFMEMORY,
+    /// Вид буфера передач на три передачи (с завершающим элементом).
+    input_three: WDFMEMORY,
+    /// Буфер входа запроса подключения (8 байт).
+    attach_in: WDFMEMORY,
+    /// Буфер ответа на запрос подключения (1024 байта).
+    attach_out: WDFMEMORY,
+    /// Указатель на вход подключения.
+    attach_in_ptr: *mut u8,
+    /// Указатель на ответ подключения.
+    attach_out_ptr: *mut u8,
+    /// Первые слова ответа узла: доказательство для реестра.
+    attach_words: [u32; 4],
+    /// Сколько передач объявил последний собранный список.
+    last_count: u32,
 }
 
 impl SpbBus {
@@ -135,6 +181,89 @@ impl SpbBus {
             return Err(BusError::unsupported("не удалось выделить буфер передач"));
         }
 
+        // Виды того же буфера с точной длиной: узел проверяет длину списка
+        // передач, поэтому "с запасом" он не принимает.
+        let one_len = SpbTransferList::area_size(1);
+        let two_len = SpbTransferList::area_size(2);
+        let mut input_one: WDFMEMORY = WDF_NO_HANDLE.cast();
+        // SAFETY: буфер выделен выше и живёт до удаления устройства.
+        let status = unsafe {
+            call_unsafe_wdf_function_binding!(
+                WdfMemoryCreatePreallocated,
+                WDF_NO_OBJECT_ATTRIBUTES,
+                area,
+                one_len,
+                &raw mut input_one,
+            )
+        };
+        if !nt_ok(status) {
+            return Err(BusError::unsupported("не удалось создать вид буфера на одну передачу"));
+        }
+        let mut input_two: WDFMEMORY = WDF_NO_HANDLE.cast();
+        // SAFETY: то же самое, длина на две передачи.
+        let status = unsafe {
+            call_unsafe_wdf_function_binding!(
+                WdfMemoryCreatePreallocated,
+                WDF_NO_OBJECT_ATTRIBUTES,
+                area,
+                two_len,
+                &raw mut input_two,
+            )
+        };
+        if !nt_ok(status) {
+            return Err(BusError::unsupported("не удалось создать вид буфера на две передачи"));
+        }
+        let three_len = SpbTransferList::area_size(3);
+        let mut input_three: WDFMEMORY = WDF_NO_HANDLE.cast();
+        // SAFETY: то же самое, длина на три передачи.
+        let status = unsafe {
+            call_unsafe_wdf_function_binding!(
+                WdfMemoryCreatePreallocated,
+                WDF_NO_OBJECT_ATTRIBUTES,
+                area,
+                three_len,
+                &raw mut input_three,
+            )
+        };
+        if !nt_ok(status) {
+            return Err(BusError::unsupported("не удалось создать вид буфера на три передачи"));
+        }
+
+        let mut attach_in: *mut core::ffi::c_void = core::ptr::null_mut();
+        let mut attach_in_mem: WDFMEMORY = WDF_NO_HANDLE.cast();
+        // SAFETY: вход подключения — восемь байт в невыгружаемом пуле.
+        let status = unsafe {
+            call_unsafe_wdf_function_binding!(
+                WdfMemoryCreate,
+                WDF_NO_OBJECT_ATTRIBUTES,
+                wdk_sys::_POOL_TYPE::NonPagedPool,
+                0,
+                8,
+                &raw mut attach_in_mem,
+                &raw mut attach_in,
+            )
+        };
+        if !nt_ok(status) {
+            return Err(BusError::unsupported("не удалось выделить вход подключения"));
+        }
+        let mut attach_out: *mut core::ffi::c_void = core::ptr::null_mut();
+        let mut attach_out_mem: WDFMEMORY = WDF_NO_HANDLE.cast();
+        // SAFETY: ответ подключения — 1024 байта в невыгружаемом пуле.
+        let status = unsafe {
+            call_unsafe_wdf_function_binding!(
+                WdfMemoryCreate,
+                WDF_NO_OBJECT_ATTRIBUTES,
+                wdk_sys::_POOL_TYPE::NonPagedPool,
+                0,
+                ATTACH_REPLY_LEN,
+                &raw mut attach_out_mem,
+                &raw mut attach_out,
+            )
+        };
+        if !nt_ok(status) {
+            return Err(BusError::unsupported("не удалось выделить ответ подключения"));
+        }
+
         let mut data: *mut core::ffi::c_void = core::ptr::null_mut();
         // SAFETY: аналогично буферу передач.
         let status = unsafe {
@@ -161,7 +290,31 @@ impl SpbBus {
             data: data.cast::<u8>(),
             peripheral_id,
             name: "spb-i2c",
+            last_status: 0,
+            variant: VARIANT_OUTPUT_SIMPLE,
+            input_one,
+            input_two,
+            input_three,
+            attach_in: attach_in_mem,
+            attach_out: attach_out_mem,
+            attach_in_ptr: attach_in.cast::<u8>(),
+            attach_out_ptr: attach_out.cast::<u8>(),
+            attach_words: [0; 4],
+            last_count: 0,
         })
+    }
+
+    /// Переключает оформление запроса к узлу шины.
+    pub fn set_variant(&mut self, variant: u8) {
+        self.variant = variant;
+    }
+
+    /// Сырой статус последнего обмена по шине (`NTSTATUS`).
+    ///
+    /// Ноль — успех; отрицательное значение — код отказа от WDF или от узла шины.
+    #[must_use]
+    pub fn last_status(&self) -> i32 {
+        self.last_status
     }
 
     /// Идентификатор подключения, полученный из `_CRS`.
@@ -198,9 +351,19 @@ impl SpbBus {
                 self.target,
                 self.request,
                 IOCTL_SPB_EXECUTE_SEQUENCE,
-                self.input,
+                match self.last_count {
+                    1 => self.input_one,
+                    2 => self.input_two,
+                    _ => self.input_three,
+                },
                 core::ptr::null_mut(),
-                self.output,
+                // Выходной буфер передаём только в вариантах, которые это
+                // проверяют: данные лежат внутри него.
+                if self.variant >= VARIANT_OUTPUT_MEMORY {
+                    self.output
+                } else {
+                    core::ptr::null_mut()
+                },
                 core::ptr::null_mut(),
             )
         };
@@ -224,19 +387,152 @@ impl SpbBus {
             )
         };
         if sent == 0 {
+            self.last_status = -1;
             unsafe { reuse_request(self.request) };
             return Err(BusError::timeout("шина I²C не ответила"));
         }
 
         // SAFETY: запрос завершён; читаем статус и значение.
         let status = unsafe { call_unsafe_wdf_function_binding!(WdfRequestGetStatus, self.request) };
-        // SAFETY: буфер данных создан размером 8 байт.
-        let byte = unsafe { core::ptr::read_volatile(self.data) };
+        self.last_status = status;
+        // SAFETY: буфер данных не меньше двух байт; байт ответа идёт вторым —
+        // первым записан адрес регистра.
+        let byte = unsafe { core::ptr::read_volatile(self.data.add(1)) };
         unsafe { reuse_request(self.request) };
         if !nt_ok(status) {
             return Err(BusError::io("SPB вернул отказ на транзакцию"));
         }
         Ok(if value.is_none() { byte } else { 0 })
+    }
+
+    /// Пробует выполнить подключение к периферии.
+    ///
+    /// Эталонный драйвер делает этот шаг до доступа к регистрам: шлёт во входе
+    /// восемь байт (магия `0x42696541` плюс четыре байта) и получает 1024 байта
+    /// ответа. Возвращает статус запроса; первые слова ответа сохраняются.
+    pub fn attach(&mut self) -> i32 {
+        if self.attach_in_ptr.is_null() || self.attach_out_ptr.is_null() {
+            return -1;
+        }
+        // SAFETY: буферы созданы в `open`; входа ровно восемь байт.
+        unsafe {
+            core::ptr::write_volatile(self.attach_in_ptr.cast::<u32>(), ATTACH_MAGIC);
+            core::ptr::write_volatile(self.attach_in_ptr.add(4).cast::<u32>(), 1);
+        }
+        // SAFETY: цель и запрос валидны; буферы созданы в `open`.
+        let status = unsafe {
+            call_unsafe_wdf_function_binding!(
+                WdfIoTargetFormatRequestForIoctl,
+                self.target,
+                self.request,
+                IOCTL_ATTACH,
+                self.attach_in,
+                core::ptr::null_mut(),
+                self.attach_out,
+                core::ptr::null_mut(),
+            )
+        };
+        if !nt_ok(status) {
+            self.last_status = status;
+            return status;
+        }
+        let mut options: WDF_REQUEST_SEND_OPTIONS = unsafe { core::mem::zeroed() };
+        options.Size = size_of_ulong::<WDF_REQUEST_SEND_OPTIONS>();
+        options.Flags = WDF_REQUEST_SEND_OPTION_TIMEOUT as ULONG;
+        options.Timeout = SPB_TIMEOUT_100NS;
+        // SAFETY: синхронная отправка на пассивном уровне.
+        let sent = unsafe {
+            call_unsafe_wdf_function_binding!(
+                WdfRequestSend,
+                self.request,
+                self.target,
+                &raw mut options,
+            )
+        };
+        if sent == 0 {
+            self.last_status = -1;
+            unsafe { reuse_request(self.request) };
+            return -1;
+        }
+        // SAFETY: запрос завершён; читаем статус и первые слова ответа.
+        let status = unsafe { call_unsafe_wdf_function_binding!(WdfRequestGetStatus, self.request) };
+        self.last_status = status;
+        if nt_ok(status) {
+            for index in 0..4 {
+                // SAFETY: ответ 1024 байта, четыре слова в его пределах.
+                self.attach_words[index] = unsafe {
+                    core::ptr::read_volatile(self.attach_out_ptr.add(index * 4).cast::<u32>())
+                };
+            }
+        }
+        unsafe { reuse_request(self.request) };
+        status
+    }
+
+    /// Слово из ответа узла на запрос подключения.
+    #[must_use]
+    pub fn attach_word(&self, index: usize) -> u32 {
+        self.attach_words.get(index).copied().unwrap_or(0)
+    }
+
+    /// Собирает элемент списка передач с указанным форматом буфера.
+    fn entry_with_format(
+        format: u32,
+        direction: u32,
+        buffer: *mut core::ffi::c_void,
+        buffer_cb: u32,
+    ) -> SpbTransferListEntry {
+        let mut entry = entry_init(direction, buffer, buffer_cb);
+        entry.buffer.format = format;
+        entry
+    }
+
+    /// Пытается занять соединение (`IOCTL_SPB_LOCK_CONNECTION`).
+    ///
+    /// Это проверка цели: если узел отвечает успехом, значит перед нами
+    /// настоящее SPB-соединение и дело в оформлении последовательности;
+    /// если отказом — цель выбрана неверно.
+    pub fn lock_connection(&mut self) -> i32 {
+        // SAFETY: цель и запрос валидны; запрос без буферов.
+        let status = unsafe {
+            call_unsafe_wdf_function_binding!(
+                WdfIoTargetFormatRequestForIoctl,
+                self.target,
+                self.request,
+                IOCTL_SPB_LOCK_CONNECTION,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+            )
+        };
+        if !nt_ok(status) {
+            self.last_status = status;
+            return status;
+        }
+        let mut options: WDF_REQUEST_SEND_OPTIONS = unsafe { core::mem::zeroed() };
+        options.Size = size_of_ulong::<WDF_REQUEST_SEND_OPTIONS>();
+        options.Flags = WDF_REQUEST_SEND_OPTION_TIMEOUT as ULONG;
+        options.Timeout = SPB_TIMEOUT_100NS;
+        // SAFETY: синхронная отправка на пассивном уровне.
+        let sent = unsafe {
+            call_unsafe_wdf_function_binding!(
+                WdfRequestSend,
+                self.request,
+                self.target,
+                &raw mut options,
+            )
+        };
+        if sent == 0 {
+            self.last_status = -1;
+            unsafe { reuse_request(self.request) };
+            return -1;
+        }
+        // SAFETY: запрос завершён, читаем его статус.
+        let status = unsafe { call_unsafe_wdf_function_binding!(WdfRequestGetStatus, self.request) };
+        self.last_status = status;
+        unsafe { reuse_request(self.request) };
+        status
     }
 
     /// Заполняет область передач под чтение или запись регистра.
@@ -251,20 +547,40 @@ impl SpbBus {
         }
         // SAFETY: выравнивание области обеспечено аллокатором невыгружаемого пула.
         let list = self.area.cast::<SpbTransferList>();
+        // Сколько передач объявляем и что пишем в поле `Size`.
+        let write = value.is_some();
+        let terminated = self.variant == VARIANT_TERMINATED;
+        let count: u32 = match (write, terminated) {
+            (true, false) => 1,
+            (false, false) => 2,
+            (true, true) => 2,
+            (false, true) => 3,
+        };
+        self.last_count = count;
+        let size_field = if self.variant == VARIANT_TOTAL_SIZE {
+            SpbTransferList::area_size(usize::try_from(count).unwrap_or(0))
+        } else {
+            SpbTransferList::header_size()
+        };
         // SAFETY: запись заголовка списка.
         unsafe {
-            (*list).size = u32::try_from(SpbTransferList::header_size()).unwrap_or(0);
+            (*list).size = u32::try_from(size_field).unwrap_or(0);
             (*list).reserved = 0;
-            (*list).transfer_count = match value {
-                Some(_) => 1,
-                None => 2,
-            };
+            (*list).transfer_count = count;
         }
 
-        // Данные лежат сразу за элементами списка.
-        let data_offset = SpbTransferList::area_size(MAX_TRANSFERS);
-        // SAFETY: смещение с запасом входит в TRANSFER_AREA.
-        let payload = unsafe { self.area.add(data_offset) };
+        // Байты лежат в буфере данных запроса: список передач занимает
+        // входной буфер целиком, и данные внутри него уже не помещаются.
+        let format =
+            if self.variant == VARIANT_OUTPUT_NON_PAGED || self.variant == VARIANT_OUTPUT_MEMORY_NON_PAGED {
+                SPB_FORMAT_SIMPLE_NON_PAGED
+            } else {
+                SPB_FORMAT_SIMPLE
+            };
+        let payload = self.data;
+        // Байт ответа идёт сразу за адресом в том же буфере.
+        // SAFETY: выходной буфер 8 байт, второй байт в его пределах.
+        let read_target = unsafe { self.data.add(1) };
         match value {
             Some(byte) => {
                 // Запись: одна передача «адрес + значение».
@@ -273,23 +589,15 @@ impl SpbBus {
                 unsafe {
                     core::ptr::copy_nonoverlapping(frame.as_mut_ptr(), payload, 2);
                     let entry = core::ptr::addr_of_mut!((*list).transfers[0]);
-                    *entry = entry_init(
+                    *entry = Self::entry_with_format(
+                        format,
                         SPB_DIRECTION_TO_DEVICE,
                         payload.cast::<core::ffi::c_void>(),
                         2,
                     );
                 }
-                for index in 1..MAX_TRANSFERS {
-                    // SAFETY: элементы лежат подряд за первым.
-                    unsafe {
-                        let slot = self
-                            .area
-                            .add(SpbTransferList::header_size())
-                            .cast::<SpbTransferListEntry>()
-                            .add(index);
-                        *slot = entry_init(SPB_DIRECTION_TO_DEVICE, core::ptr::null_mut(), 0);
-                    }
-                }
+                // Вторая передача не нужна: список объявляет одну передачу,
+                // и его буфер имеет ровно эту длину.
             }
             None => {
                 // Чтение: запись адреса, затем чтение байта.
@@ -297,7 +605,8 @@ impl SpbBus {
                 unsafe {
                     core::ptr::write_volatile(payload, addr);
                     let first = core::ptr::addr_of_mut!((*list).transfers[0]);
-                    *first = entry_init(
+                    *first = Self::entry_with_format(
+                        format,
                         SPB_DIRECTION_TO_DEVICE,
                         payload.cast::<core::ffi::c_void>(),
                         1,
@@ -307,12 +616,26 @@ impl SpbBus {
                         .add(SpbTransferList::header_size())
                         .cast::<SpbTransferListEntry>()
                         .add(1);
-                    *second = entry_init(
+                    *second = Self::entry_with_format(
+                        format,
                         SPB_DIRECTION_FROM_DEVICE,
-                        self.data.cast::<core::ffi::c_void>(),
+                        read_target.cast::<core::ffi::c_void>(),
                         1,
                     );
                 }
+            }
+        }
+        if terminated {
+            // Завершающий элемент с направлением `None`: это единственный
+            // элемент ABI, который мы раньше не использовали вообще.
+            // SAFETY: элемент лежит в пределах выделенной области.
+            unsafe {
+                let offset = SpbTransferList::header_size()
+                    + usize::try_from(count).unwrap_or(2).saturating_sub(2)
+                        * SpbTransferList::entry_size();
+                let tail = self.area.add(offset).cast::<SpbTransferListEntry>();
+                *tail =
+                    Self::entry_with_format(format, SPB_DIRECTION_NONE, core::ptr::null_mut(), 0);
             }
         }
         Ok(())

@@ -6,4 +6,6 @@
 target = "aarch64-pc-windows-msvc"
 # Ядро линкуется со статическим CRT (требование WDK, wdk-build без него падает
 # с `Error: StaticCrtNotEnabled`); `panic=abort` — обязательный режим для ядра.
-rustflags = ["-C", "target-feature=+crt-static", "-C", "panic=abort"]
+# `/Brepro` делает метку времени PE-заголовка детерминированной: без неё каждый
+# прогон даёт другой хеш, и о воспроизводимости говорить нельзя.
+rustflags = ["-C", "target-feature=+crt-static", "-C", "panic=abort", "-C", "link-arg=/Brepro"]

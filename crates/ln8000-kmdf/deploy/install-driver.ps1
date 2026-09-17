@@ -1,4 +1,4 @@
-# install-driver.ps1 — установка драйвера charge pump LN8000 на планшет nabu
+﻿# install-driver.ps1 — установка драйвера charge pump LN8000 на планшет nabu
 #
 # Запуск: PowerShell от имени администратора на планшете, из папки с пакетом:
 #     .\install-driver.ps1
@@ -56,8 +56,34 @@ if (-not $SkipSignatureCheck) {
 }
 
 Write-Host '=== 2. установка пакета ===' -ForegroundColor Cyan
+
+# Тестовый сертификат WDK должен быть в доверенных хранилищах, иначе pnputil
+# падает с 0x800B0109 (CERT_E_UNTRUSTEDROOT): одной тестовой подписи мало.
+$cer = Join-Path $PackageDir 'WDRLocalTestCert.cer'
+if (Test-Path -LiteralPath $cer) {
+  $thumb = (Get-PfxCertificate -FilePath $cer).Thumbprint
+  foreach ($store in @('Root', 'TrustedPublisher')) {
+    $present = Get-ChildItem "Cert:\LocalMachine\$store" -ErrorAction SilentlyContinue |
+      Where-Object { $_.Thumbprint -eq $thumb }
+    if ($present) {
+      Write-Host "  сертификат уже в $store" -ForegroundColor DarkGray
+    } else {
+      Import-Certificate -FilePath $cer -CertStoreLocation "Cert:\LocalMachine\$store" | Out-Null
+      Write-Host "  сертификат добавлен в $store" -ForegroundColor Green
+    }
+  }
+} else {
+  Write-Host '  WDRLocalTestCert.cer рядом нет — предполагаю, что сертификат уже установлен' -ForegroundColor DarkGray
+}
+
 & pnputil /add-driver $inf /install
-if ($LASTEXITCODE -ne 0) { throw "pnputil вернул код $LASTEXITCODE" }
+$code = $LASTEXITCODE
+# 3010 — пакет установлен, нужна перезагрузка; 1641 — перезагрузка уже запущена.
+# Это успешные коды, а не ошибка.
+if ($code -notin @(0, 3010, 1641)) { throw "pnputil вернул код $code" }
+if ($code -ne 0) {
+  Write-Host "  пакет установлен, нужна перезагрузка (код $code)" -ForegroundColor Yellow
+}
 
 Write-Host '=== 3. проверка привязки драйвера ===' -ForegroundColor Cyan
 $device = Get-PnpDevice -PresentOnly | Where-Object { $_.InstanceId -like "*$hwid*" } | Select-Object -First 1

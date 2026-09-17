@@ -33,11 +33,12 @@ mod spb_abi;
 extern crate wdk_panic;
 
 use ioctl::{
-    Ln8000LimitsRequest, Ln8000ModeRequest, Ln8000RegRequest, Ln8000SamplesRequest, Ln8000Sessions,
+    Ln8000LimitsRequest, Ln8000ModeRequest, Ln8000RegRequest, Ln8000Sample, Ln8000SamplesRequest, Ln8000Sessions,
     Ln8000Status, LN8000_STATUS_MAGIC, LN8000_STATUS_VERSION,
 };
+use ln8000::encoding::decode_iin_limit;
 use ln8000::{
-    AdcChannel, GuardAction, GuardLimits, Pump, PumpConfig, PumpError, PumpState, Telemetry,
+    AdcChannel, GuardAction, GuardLimits, OpMode, Pump, PumpConfig, PumpError, PumpState, Telemetry,
     TelemetrySample, evaluate,
 };
 use spb::SpbBus;
@@ -47,9 +48,9 @@ use wdk_sys::{
     _WDF_IO_QUEUE_DISPATCH_TYPE::WdfIoQueueDispatchSequential,
     _WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeNone, _WDF_TRI_STATE::WdfTrue,
     call_unsafe_wdf_function_binding, CmResourceTypeConnection, NTSTATUS, PCUNICODE_STRING,
-    PWDFDEVICE_INIT, ULONG, UNICODE_STRING, WDFCMRESLIST, WDFDEVICE, WDFDRIVER, WDFQUEUE, WDFREQUEST,
-    WDFTIMER, WDF_DRIVER_CONFIG, WDF_IO_QUEUE_CONFIG, WDF_NO_HANDLE, WDF_NO_OBJECT_ATTRIBUTES,
-    WDF_OBJECT_ATTRIBUTES, WDF_PNPPOWER_EVENT_CALLBACKS, WDF_TIMER_CONFIG,
+    PLUGPLAY_REGKEY_DEVICE, PWDFDEVICE_INIT, ULONG, UNICODE_STRING, WDFCMRESLIST, WDFDEVICE, WDFDRIVER,
+    WDFKEY, WDFQUEUE, WDFREQUEST, WDFTIMER, WDF_DRIVER_CONFIG, WDF_IO_QUEUE_CONFIG, WDF_NO_HANDLE,
+    WDF_NO_OBJECT_ATTRIBUTES, WDF_OBJECT_ATTRIBUTES, WDF_PNPPOWER_EVENT_CALLBACKS, WDF_TIMER_CONFIG,
 };
 
 /// Интерфейс устройства для пользовательского режима.
@@ -80,6 +81,8 @@ struct DriverState {
     reads: u32,
     last_error: i32,
     actions: u32,
+    /// Период телеметрии из реестра, мс.
+    telemetry_ms: u32,
 }
 
 // SAFETY: см. инварианты выше — доступ сериализован WDF.
@@ -95,6 +98,7 @@ impl DriverState {
             reads: 0,
             last_error: 0,
             actions: 0,
+            telemetry_ms: 1000,
         }
     }
 }
@@ -113,8 +117,36 @@ unsafe fn state() -> &'static mut DriverState {
 }
 
 /// Символическая ссылка для пользовательского режима: `\\.\nabu_ln8000`.
-const SYMLINK_CHARS: usize = 20;
-const SYMLINK: [u16; SYMLINK_CHARS] = utf16_lit("/DosDevices/nabu_ln800");
+///
+/// Ширина буфера была 20 символов при имени в 22 — имя молча обрезалось
+/// до `\DosDevices\nabu_ln8`, и утилита не могла открыть устройство.
+const SYMLINK_CHARS: usize = 24;
+const SYMLINK_NAME: &str = "/DosDevices/nabu_ln8000";
+const SYMLINK: [u16; SYMLINK_CHARS] = utf16_lit(SYMLINK_NAME);
+
+/// Длина имени симлинка в байтах: без завершающего нуля.
+const SYMLINK_BYTES: u16 = (SYMLINK_NAME.len() as u16) * 2;
+
+/// Имя обязано помещаться в буфер — иначе оно обрежется и устройство не откроется.
+const _: () = assert!(
+    SYMLINK_NAME.len() <= SYMLINK_CHARS,
+    "имя симлинка длиннее буфера"
+);
+
+/// Этапы добавления устройства: пишутся в реестр меткой, чтобы сбой запуска
+/// был виден удалённо, а не только в отладочном выводе драйвера.
+const STAGE_ENTER: u32 = 10;const STAGE_DEVICE: u32 = 11;
+const STAGE_INTERFACE: u32 = 12;
+const STAGE_SYMLINK: u32 = 13;
+const STAGE_QUEUE: u32 = 14;
+const STAGE_TIMER: u32 = 15;
+const STAGE_DONE: u32 = 0xFF;
+/// Этапы подготовки железа: видно, где именно отвалилась шина или чип.
+const STAGE_PREPARE: u32 = 30;
+const STAGE_PREPARE_BUS: u32 = 31;
+const STAGE_PREPARE_CHIP: u32 = 32;
+const STAGE_PREPARE_CONFIG: u32 = 33;
+const STAGE_READY: u32 = 0xFE;
 
 /// Собирает UTF-16 без завершающего нуля: символы `'/'` заменяются на `'\\'`.
 const fn utf16_lit(ascii: &str) -> [u16; SYMLINK_CHARS] {
@@ -127,6 +159,327 @@ const fn utf16_lit(ascii: &str) -> [u16; SYMLINK_CHARS] {
         index += 1;
     }
     out
+}
+
+/// Права на чтение ключа реестра (`KEY_READ`).
+const KEY_READ: ULONG = 0x0002_0019;
+
+/// Имена параметров и их значения из реестра: то, что читает драйвер.
+struct DriverParams {
+    config: PumpConfig,
+    limits: GuardLimits,
+    telemetry_ms: u32,
+}
+
+/// Заполняет буфер символами строки и возвращает длину.
+fn utf16_into(buffer: &mut [u16], text: &str) -> usize {
+    let mut len = 0_usize;
+    for byte in text.as_bytes() {
+        if let Some(slot) = buffer.get_mut(len) {
+            *slot = u16::from(*byte);
+            len = len.saturating_add(1);
+        }
+    }
+    len
+}
+
+/// Читает один параметр типа `REG_DWORD` из открытого ключа.
+///
+/// # Safety
+///
+/// `key` — валидный дескриптор ключа, открытый на чтение.
+unsafe fn query_ulong(key: WDFKEY, name: &str) -> Option<u32> {
+    let mut buffer = [0_u16; 32];
+    let len = utf16_into(&mut buffer, name);
+    if len == 0 || len > buffer.len() {
+        return None;
+    }
+    let length = u16::try_from(len.saturating_mul(2)).unwrap_or(0);
+    let value_name = UNICODE_STRING {
+        Length: length,
+        MaximumLength: length,
+        Buffer: buffer.as_mut_ptr(),
+    };
+    let mut value: u32 = 0;
+    // SAFETY: ключ и буфер имени живут до конца вызова; значение — локальная переменная.
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(WdfRegistryQueryULong, key, &raw const value_name, &raw mut value)
+    };
+    if status < 0 { None } else { Some(value) }
+}
+
+/// Права на запись ключа реестра (`KEY_SET_VALUE`).
+const KEY_SET_VALUE: ULONG = 0x0002;
+
+/// Пишет одно числовое значение в уже открытый ключ.
+fn write_one(key: WDFKEY, name: &str, value: u32) {
+    let mut buffer = [0_u16; 32];
+    let len = utf16_into(&mut buffer, name);
+    if len == 0 {
+        return;
+    }
+    let length = u16::try_from(len.saturating_mul(2)).unwrap_or(0);
+    let value_name = UNICODE_STRING {
+        Length: length,
+        MaximumLength: length,
+        Buffer: buffer.as_mut_ptr(),
+    };
+    // SAFETY: ключ открыт на запись, имя — локальный буфер.
+    unsafe {
+        let _ = call_unsafe_wdf_function_binding!(
+            WdfRegistryAssignULong,
+            key,
+            &raw const value_name,
+            value,
+        );
+    }
+}
+
+/// Пишет пару числовых меток в уже открытый ключ.
+fn write_marker(key: WDFKEY, stage_name: &str, status_name: &str, stage: u32, status: NTSTATUS) {
+    write_one(key, stage_name, stage);
+    write_one(key, status_name, status as u32);
+}
+
+/// Метка этапа добавления устройства — в ключ устройства.
+///
+/// В отладочный вывод драйвера без отладчика не заглянуть, поэтому ход
+/// добавления устройства виден в `Device Parameters` узла: `AddStage` —
+/// где остановились, `AddStatus` — с каким кодом. Успех — `AddStage = 0xFF`.
+fn mark_stage(device: WDFDEVICE, stage: u32, status: NTSTATUS) {
+    let mut key: WDFKEY = WDF_NO_HANDLE.cast();
+    // SAFETY: устройство создано WDF; ключ открывается на запись.
+    let opened = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfDeviceOpenRegistryKey,
+            device,
+            PLUGPLAY_REGKEY_DEVICE,
+            KEY_SET_VALUE,
+            WDF_NO_OBJECT_ATTRIBUTES,
+            &raw mut key,
+        )
+    };
+    if opened < 0 {
+        return;
+    }
+    write_marker(key, "AddStage", "AddStatus", stage, status);
+    // SAFETY: ключ открыт выше и больше не нужен.
+    unsafe {
+        let _ = call_unsafe_wdf_function_binding!(WdfRegistryClose, key);
+    }
+}
+
+/// Метка загрузки драйвера — в ключ `Parameters` службы драйвера.
+///
+/// `DriverStage = 1` означает, что `DriverEntry` дошёл до конца и вызвал
+/// `WdfDriverCreate`. Это отличает «драйвер не загрузился» от «упал при
+/// добавлении устройства»: во втором случае метка есть, а устройство — нет.
+fn mark_driver(driver: WDFDRIVER, stage: u32, status: NTSTATUS) {
+    let mut key: WDFKEY = WDF_NO_HANDLE.cast();
+    // SAFETY: дескриптор драйвера создан WDF.
+    let opened = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfDriverOpenParametersRegistryKey,
+            driver,
+            KEY_SET_VALUE,
+            WDF_NO_OBJECT_ATTRIBUTES,
+            &raw mut key,
+        )
+    };
+    if opened < 0 {
+        return;
+    }
+    write_marker(key, "DriverStage", "DriverStatus", stage, status);
+    // SAFETY: ключ открыт выше и больше не нужен.
+    unsafe {
+        let _ = call_unsafe_wdf_function_binding!(WdfRegistryClose, key);
+    }
+}
+
+/// Записывает одно значение в ключ `Parameters` драйвера — для разовой диагностики.
+fn mark_driver_value(driver: WDFDRIVER, name: &str, value: u32) {
+    let mut key: WDFKEY = WDF_NO_HANDLE.cast();
+    // SAFETY: дескриптор драйвера создан WDF.
+    let opened = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfDriverOpenParametersRegistryKey,
+            driver,
+            KEY_SET_VALUE,
+            WDF_NO_OBJECT_ATTRIBUTES,
+            &raw mut key,
+        )
+    };
+    if opened < 0 {
+        return;
+    }
+    write_one(key, name, value);
+    // SAFETY: ключ открыт выше и больше не нужен.
+    unsafe {
+        let _ = call_unsafe_wdf_function_binding!(WdfRegistryClose, key);
+    }
+}
+
+/// Записывает одно значение в ключ устройства — для разовой диагностики.
+fn mark_device_value(device: WDFDEVICE, name: &str, value: u32) {
+    let mut key: WDFKEY = WDF_NO_HANDLE.cast();
+    // SAFETY: устройство создано WDF; ключ открывается на запись.
+    let opened = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfDeviceOpenRegistryKey,
+            device,
+            PLUGPLAY_REGKEY_DEVICE,
+            KEY_SET_VALUE,
+            WDF_NO_OBJECT_ATTRIBUTES,
+            &raw mut key,
+        )
+    };
+    if opened < 0 {
+        return;
+    }
+    write_one(key, name, value);
+    // SAFETY: ключ открыт выше и больше не нужен.
+    unsafe {
+        let _ = call_unsafe_wdf_function_binding!(WdfRegistryClose, key);
+    }
+}
+
+/// Читает параметры профиля из реестра устройства (`HKR, Parameters, ...`).
+///
+/// Так тот, кто ставит драйвер, может менять пороги, не пересобирая его: INF
+/// задаёт значения по умолчанию, а здесь они применяются с проверкой границ.
+/// Неверное значение не портит профиль — оно отклоняется и остаётся прежнее.
+///
+/// # Safety
+///
+/// Пассивный уровень IRQL, устройство уже создано.
+unsafe fn read_parameters(device: WDFDEVICE) -> DriverParams {
+    let mut config = PumpConfig::for_qc35_class_b();
+    let mut limits = GuardLimits::standard();
+    let mut telemetry_ms = 1000_u32;
+
+    let mut device_key: WDFKEY = WDF_NO_HANDLE.cast();
+    // SAFETY: устройство создано; ключ читается только на чтение.
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfDeviceOpenRegistryKey,
+            device,
+            PLUGPLAY_REGKEY_DEVICE,
+            KEY_READ,
+            WDF_NO_OBJECT_ATTRIBUTES,
+            &raw mut device_key,
+        )
+    };
+    if status < 0 {
+        println!("ln8000-kmdf: ключ устройства не открылся ({status:#010X}); беру профиль по умолчанию");
+        return DriverParams {
+            config,
+            limits,
+            telemetry_ms,
+        };
+    }
+
+    let mut params_key: WDFKEY = WDF_NO_HANDLE.cast();
+    let mut buffer = [0_u16; 32];
+    let len = utf16_into(&mut buffer, "Parameters");
+    let length = u16::try_from(len.saturating_mul(2)).unwrap_or(0);
+    let subkey_name = UNICODE_STRING {
+        Length: length,
+        MaximumLength: length,
+        Buffer: buffer.as_mut_ptr(),
+    };
+    // SAFETY: ключ устройства валиден; имя — локальный буфер.
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfRegistryOpenKey,
+            device_key,
+            &raw const subkey_name,
+            KEY_READ,
+            WDF_NO_OBJECT_ATTRIBUTES,
+            &raw mut params_key,
+        )
+    };
+    if status < 0 {
+        println!("ln8000-kmdf: раздел Parameters не открылся ({status:#010X}); беру профиль по умолчанию");
+        // SAFETY: ключ открыт выше и больше не нужен.
+        unsafe {
+            let _ = call_unsafe_wdf_function_binding!(WdfRegistryClose, device_key);
+        }
+        return DriverParams {
+            config,
+            limits,
+            telemetry_ms,
+        };
+    }
+
+    for name in [
+        "IinLimitUa",
+        "VbatFloatUv",
+        "VacOvpUv",
+        "NtcAlarmCfg",
+        "WatchdogEnabled",
+        "ProtectionProfile",
+    ] {
+        // SAFETY: ключ Parameters открыт на чтение.
+        if let Some(value) = unsafe { query_ulong(params_key, name) } {
+            if !config.apply_parameter(name, value) {
+                println!("ln8000-kmdf: параметр {name} = {value} отклонён, остаётся значение по умолчанию");
+            }
+        }
+    }
+    // SAFETY: ключ Parameters открыт на чтение.
+    if let Some(ms) = unsafe { query_ulong(params_key, "TelemetryMs") } {
+        if (100..=60_000).contains(&ms) {
+            telemetry_ms = ms;
+        } else {
+            println!("ln8000-kmdf: период телеметрии {ms} мс вне границ 100..60000, беру 1000");
+        }
+    }
+
+    // Пороги защиты: если набор получится несогласованным, значение отклоняется.
+    for name in [
+        "TempReduceDc",
+        "TempBypassDc",
+        "TempStopDc",
+        "IinMaxUa",
+        "IinTargetUa",
+        "IinFloorUa",
+        "VbatReduceUv",
+    ] {
+        // SAFETY: ключ Parameters открыт на чтение.
+        if let Some(value) = unsafe { query_ulong(params_key, name) } {
+            if !limits.apply_parameter(name, value) {
+                println!("ln8000-kmdf: порог {name} = {value} отклонён, остаётся прежний");
+            }
+        }
+    }
+
+    println!(
+        "ln8000-kmdf: пороги защиты: {} / {} / {} (0.1 °C), ток {} мкА, цель {} мкА",
+        limits.temp_reduce_dc, limits.temp_bypass_dc, limits.temp_stop_dc, limits.iin_max_ua, limits.iin_target_ua
+    );
+
+    println!(
+        "ln8000-kmdf: профиль из реестра: ток {} мкА, напряжение {} мкВ, защитные петли насоса {}",
+        config.iin_limit_ua,
+        config.vbat_float_uv,
+        if config.tdie_prot_disabled {
+            "выключены (как в Device Tree)"
+        } else {
+            "включены"
+        }
+    );
+
+    // SAFETY: оба ключа открыты выше и больше не нужны.
+    unsafe {
+        let _ = call_unsafe_wdf_function_binding!(WdfRegistryClose, params_key);
+        let _ = call_unsafe_wdf_function_binding!(WdfRegistryClose, device_key);
+    }
+
+    DriverParams {
+        config,
+        limits,
+        telemetry_ms,
+    }
 }
 
 /// Точка входа драйвера.
@@ -163,6 +516,13 @@ pub unsafe extern "system" fn DriverEntry(
     };
     if status < 0 {
         println!("ln8000-kmdf: WdfDriverCreate не удался: {status:#010X}");
+    } else {
+        // В поле состояния пишем секунды с загрузки системы: по ним видно,
+        // относится метка к текущему запуску или осталась с прошлого.
+        let mut stamp: u64 = 0;
+        // SAFETY: KeQueryInterruptTimePrecise — документированная функция ядра.
+        let ticks = unsafe { wdk_sys::ntddk::KeQueryInterruptTimePrecise(&raw mut stamp) };
+        mark_driver(driver_handle, 1, (ticks / 10_000_000) as i32);
     }
     status
 }
@@ -173,9 +533,16 @@ pub unsafe extern "system" fn DriverEntry(
 ///
 /// Вызывается WDF на пассивном уровне.
 unsafe extern "C" fn evt_device_add(
-    _driver: WDFDRIVER,
+    driver: WDFDRIVER,
     mut device_init: PWDFDEVICE_INIT,
 ) -> NTSTATUS {
+    // Первая метка идёт в ключ драйвера: он доступен ещё до создания
+    // устройства, поэтому виден даже отказ самого первого вызова.
+    mark_driver(driver, STAGE_ENTER, 0);
+    // Проба: размер структуры атрибутов, которую строит драйвер. Значение
+    // нужно, чтобы видеть, чем именно наша структура не подошла KMDF.
+    mark_driver_value(driver, "AttrSize", size_of_ulong::<WDF_OBJECT_ATTRIBUTES>());
+
     // Обработчики PnP: подготовка и освобождение ресурсов.
     let mut pnp = WDF_PNPPOWER_EVENT_CALLBACKS {
         Size: size_of_ulong::<WDF_PNPPOWER_EVENT_CALLBACKS>(),
@@ -193,26 +560,25 @@ unsafe extern "C" fn evt_device_add(
         );
     }
 
-    let mut attributes = WDF_OBJECT_ATTRIBUTES {
-        Size: size_of_ulong::<WDF_OBJECT_ATTRIBUTES>(),
-        ..unsafe { core::mem::zeroed() }
-    };
-    attributes.Size = size_of_ulong::<WDF_OBJECT_ATTRIBUTES>();
-
     let mut device: WDFDEVICE = WDF_NO_HANDLE.cast();
-    // SAFETY: атрибуты заполнены, `device_init` валиден.
+    // Атрибуты не передаём: NULL — штатный вариант WDF. Нашу структуру KMDF
+    // здесь отвергает со STATUS_WDF_OBJECT_ATTRIBUTES_INVALID (0xC0200209),
+    // проверено на планшете; ни контекст, ни колбэки устройству не нужны.
+    // SAFETY: `device_init` валиден.
     let status = unsafe {
         call_unsafe_wdf_function_binding!(
             WdfDeviceCreate,
             &raw mut device_init,
-            &raw mut attributes,
+            WDF_NO_OBJECT_ATTRIBUTES,
             &raw mut device,
         )
     };
     if status < 0 {
         println!("ln8000-kmdf: WdfDeviceCreate не удался: {status:#010X}");
+        mark_driver(driver, STAGE_DEVICE, status);
         return status;
     }
+    mark_driver(driver, STAGE_DEVICE, 0);
 
     // Интерфейс, по которому пользовательский режим находит драйвер.
     // SAFETY: устройство создано; GUID — статическая константа.
@@ -226,14 +592,15 @@ unsafe extern "C" fn evt_device_add(
     };
     if status < 0 {
         println!("ln8000-kmdf: не удалось создать интерфейс: {status:#010X}");
+        mark_driver(driver, STAGE_INTERFACE, status);
         return status;
     }
 
     // Символическая ссылка: диагностической утилите достаточно открыть
     // \\.\nabu_ln8000 — без перечисления интерфейсов через SetupAPI.
     let mut link = UNICODE_STRING {
-        Length: u16::try_from(SYMLINK_CHARS.saturating_mul(2)).unwrap_or(0),
-        MaximumLength: u16::try_from(SYMLINK_CHARS.saturating_mul(2)).unwrap_or(0),
+        Length: SYMLINK_BYTES,
+        MaximumLength: SYMLINK_BYTES,
         Buffer: SYMLINK.as_ptr().cast_mut(),
     };
     // SAFETY: имя — статический буфер UTF-16, устройство создано.
@@ -245,7 +612,11 @@ unsafe extern "C" fn evt_device_add(
         )
     };
     if status < 0 {
+        // Симлинк — удобство, а не условие работы: драйвер живёт и без него.
         println!("ln8000-kmdf: символическая ссылка не создана: {status:#010X}");
+        mark_driver(driver, STAGE_SYMLINK, status);
+        // Отдельное имя: основная метка перезаписывается следующими этапами.
+        mark_driver_value(driver, "LinkStatus", status as u32);
     }
 
     // Очередь управляющих запросов и таймер телеметрии.
@@ -271,6 +642,7 @@ unsafe extern "C" fn evt_device_add(
     };
     if status < 0 {
         println!("ln8000-kmdf: WdfIoQueueCreate не удался: {status:#010X}");
+        mark_driver(driver, STAGE_QUEUE, status);
         return status;
     }
 
@@ -287,11 +659,14 @@ unsafe extern "C" fn evt_device_add(
 
     let mut timer_attributes = WDF_OBJECT_ATTRIBUTES {
         Size: size_of_ulong::<WDF_OBJECT_ATTRIBUTES>(),
+        ParentObject: device.cast(),
+        ExecutionLevel: WdfExecutionLevelPassive,
+        SynchronizationScope: WdfSynchronizationScopeNone,
         ..unsafe { core::mem::zeroed() }
     };
     timer_attributes.Size = size_of_ulong::<WDF_OBJECT_ATTRIBUTES>();
-    timer_attributes.ExecutionLevel = WdfExecutionLevelPassive;
-    timer_attributes.SynchronizationScope = WdfSynchronizationScopeNone;
+    // Владелец обязателен: без ParentObject WDF отказывает со
+    // STATUS_WDF_PARENT_NOT_SPECIFIED (0xC0200212) — проверено на планшете.
 
     let mut timer: WDFTIMER = WDF_NO_HANDLE.cast();
     // SAFETY: конфигурация и атрибуты заполнены.
@@ -304,8 +679,13 @@ unsafe extern "C" fn evt_device_add(
         )
     };
     if status < 0 {
+        // Таймер — не условие работы: без него управление и диагностика живы,
+        // опрос идёт по запросу. Причина отказа в заголовке wdftimer.h:
+        // автоматическая сериализация требует совместимости с DISPATCH, а обмену
+        // по шине нужен PASSIVE. Правильный вариант — таймер уровня DISPATCH со
+        // отложенной работой на PASSIVE; это отдельная доработка.
         println!("ln8000-kmdf: WdfTimerCreate не удался: {status:#010X}");
-        return status;
+        mark_driver(driver, STAGE_TIMER, status);
     }
 
     // Запоминаем таймер в статике: его запускает prepare_hardware, когда шина готова.
@@ -315,6 +695,8 @@ unsafe extern "C" fn evt_device_add(
     }
 
     println!("ln8000-kmdf: устройство готово");
+    mark_driver(driver, STAGE_DONE, 0);
+    mark_stage(device, STAGE_DONE, 0);
     wdk_sys::STATUS_SUCCESS
 }
 
@@ -332,16 +714,18 @@ unsafe extern "C" fn evt_prepare_hardware(
     resources_translated: WDFCMRESLIST,
 ) -> NTSTATUS {
     // 1. Ищем ресурс подключения (I²C) и забираем идентификатор.
+    mark_stage(device, STAGE_PREPARE, 0);
     let peripheral_id = match unsafe { find_peripheral_id(resources_translated) } {
         Some(id) => id,
         None => {
             println!("ln8000-kmdf: в _CRS нет I²C-подключения (узел PEIC не найден)");
+            mark_stage(device, STAGE_PREPARE_BUS, wdk_sys::STATUS_DEVICE_NOT_READY);
             return wdk_sys::STATUS_DEVICE_NOT_READY;
         }
     };
     println!("ln8000-kmdf: подключение {peripheral_id:#018X}");
     // SAFETY: пассивный уровень, устройство создано.
-    let bus = match unsafe { SpbBus::open(device, peripheral_id) } {
+    let mut bus = match unsafe { SpbBus::open(device, peripheral_id) } {
         Ok(bus) => {
             let path = bus.path_string();
             let text = core::str::from_utf8(&path).unwrap_or("?");
@@ -352,18 +736,73 @@ unsafe extern "C" fn evt_prepare_hardware(
             println!("ln8000-kmdf: шина недоступна: {err}");
             let st = unsafe { state() };
             st.last_error = -1;
+            mark_stage(device, STAGE_PREPARE_BUS, wdk_sys::STATUS_DEVICE_NOT_READY);
             return wdk_sys::STATUS_DEVICE_NOT_READY;
         }
     };
 
     // 3. Опознаём чип и настраиваем его.
-    let config = PumpConfig::for_qc35_class_b();
+    // Профиль берётся из реестра устройства: `HKR, Parameters, ...` из INF.
+    // Значения проверяются по границам; неверное значение не меняет профиль.
+    // SAFETY: пассивный уровень, устройство создано.
+    let params = unsafe { read_parameters(device) };
+    let config = params.config;
+    let guard_limits = params.limits;
+
+    // Проба чипа до опознания: сырой обмен с регистром DEVICE_ID (0x00).
+    // Перебираем варианты оформления запроса к узлу шины и пишем результат
+    // каждого в реестр: без отладчика это единственный способ понять, что
+    // именно отклоняет узел, — и заодно найти работающий вариант.
+    mark_device_value(device, "ConnLow", peripheral_id as u32);
+    mark_device_value(device, "ConnHigh", (peripheral_id >> 32) as u32);
+    mark_device_value(device, "RegAddr", u32::from(ln8000::regs::DEVICE_ID));
+    // Проверка цели: принимает ли узел управляющий запрос SPB вообще.
+    let lock = bus.lock_connection();
+    mark_device_value(device, "LockStatus", lock as u32);
+    mark_device_value(device, "LockOk", if lock >= 0 { 1 } else { 0 });
+    // Подключение к периферии: этот шаг делает эталонный драйвер до доступа
+    // к регистрам. Записываем статус и первые слова ответа.
+    let attach = bus.attach();
+    mark_device_value(device, "AttachStatus", attach as u32);
+    for (index, name) in [(0_usize, "Att0"), (1, "Att1"), (2, "Att2"), (3, "Att3")] {
+        mark_device_value(device, name, bus.attach_word(index));
+    }
+    let mut working = None;
+    for (variant, names) in [
+        (0_u8, ("Ok0", "St0")),
+        (1_u8, ("Ok1", "St1")),
+        (2_u8, ("Ok2", "St2")),
+        (3_u8, ("Ok3", "St3")),
+        (4_u8, ("Ok4", "St4")),
+        (5_u8, ("Ok5", "St5")),
+    ] {
+        bus.set_variant(variant);
+        let result = bus.transact(ln8000::regs::DEVICE_ID, None);
+        let status = bus.last_status() as u32;
+        match result {
+            Ok(value) => {
+                mark_device_value(device, names.0, 1);
+                mark_device_value(device, "ProbeValue", u32::from(value));
+                if value == ln8000::regs::DEVICE_ID_VALUE && working.is_none() {
+                    working = Some(variant);
+                }
+            }
+            Err(_) => mark_device_value(device, names.0, 0),
+        }
+        mark_device_value(device, names.1, status);
+    }
+    if let Some(variant) = working {
+        bus.set_variant(variant);
+        mark_device_value(device, "Variant", u32::from(variant));
+    }
+
     let mut pump = match Pump::open(bus, config) {
         Ok(pump) => pump,
         Err(err) => {
             println!("ln8000-kmdf: LN8000 не опознан: {err}");
             let st = unsafe { state() };
             st.last_error = -2;
+            mark_stage(device, STAGE_PREPARE_CHIP, 0);
             return wdk_sys::STATUS_DEVICE_NOT_READY;
         }
     };
@@ -371,33 +810,40 @@ unsafe extern "C" fn evt_prepare_hardware(
         println!("ln8000-kmdf: конфигурация не удалась: {err}");
         let st = unsafe { state() };
         st.last_error = -3;
+        mark_stage(device, STAGE_PREPARE_CONFIG, 0);
         return wdk_sys::STATUS_DEVICE_NOT_READY;
     }
 
     // 4. Пробуем включить ускоренный режим. Если чип его не подтвердил —
     //    работаем дальше в bypass: зарядка должна быть безопасной и рабочей.
-    match pump.enable_switching() {
+    //    Если не подтверждается и bypass — уводим чип в standby: без рабочего
+    //    режима он не должен оставаться в неопределённом состоянии.
+    match pump.enable_switching_or_bypass() {
         Ok(mode) => println!("ln8000-kmdf: режим {}", mode.label()),
         Err(err) => {
-            println!("ln8000-kmdf: режим 2:1 не включился ({err}); остаёмся в bypass");
-            if let Err(fallback) = pump.enable_bypass() {
-                println!("ln8000-kmdf: bypass тоже не включился: {fallback}");
+            println!("ln8000-kmdf: ни 2:1, ни bypass не подтверждены ({err}); уходим в standby");
+            if let Err(standby_error) = pump.standby() {
+                println!("ln8000-kmdf: standby тоже не подтверждён: {standby_error}");
             }
         }
     }
 
     let st = unsafe { state() };
     st.pump = Some(pump);
+    st.telemetry_ms = params.telemetry_ms;
+    st.limits = guard_limits;
 
-    // 5. Запускаем телеметрию.
+    // 5. Запускаем телеметрию с периодом из реестра.
     // SAFETY: таймер создан в `evt_device_add`.
     let timer = unsafe { TIMER };
     if !timer.is_null() {
+        let period = i64::from(st.telemetry_ms.max(100));
         unsafe {
-            let _ = call_unsafe_wdf_function_binding!(WdfTimerStart, timer, -10_000_i64 * 1_000);
+            let _ = call_unsafe_wdf_function_binding!(WdfTimerStart, timer, -10_000_i64 * period);
         }
     }
 
+    mark_stage(device, STAGE_READY, 0);
     wdk_sys::STATUS_SUCCESS
 }
 
@@ -479,6 +925,12 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
                 _ => 0,
             }
         );
+    }
+
+    // Сторож чипа: если включён в профиле, его надо обслуживать чаще периода,
+    // иначе чип сам прекратит заряд. Когда сторож выключен, вызов ничего не делает.
+    if let Err(err) = pump.service_watchdog() {
+        println!("ln8000-kmdf: не удалось обслужить сторожевой таймер: {err}");
     }
 }
 
@@ -581,18 +1033,23 @@ unsafe fn handle_read_reg(request: WDFREQUEST, input_length: usize) {
         unsafe { complete(request, wdk_sys::STATUS_BUFFER_TOO_SMALL, 0) };
         return;
     }
-    // SAFETY: доступ сериализован WDF; адрес берётся из входного буфера клиента.
+    // SAFETY: буфер проверен по размеру; адрес берётся из запроса клиента.
+    let Some(mut answer) = (unsafe { read_input::<Ln8000RegRequest>(request) }) else {
+        unsafe { complete(request, wdk_sys::STATUS_INVALID_PARAMETER, 0) };
+        return;
+    };
+    // SAFETY: доступ сериализован WDF.
     let st = unsafe { state() };
-    let mut answer = Ln8000RegRequest::default();
-    match st.pump.as_mut() {
-        Some(pump) => match pump.read_register(0) {
+    if let Some(pump) = st.pump.as_mut() {
+        match pump.read_register(answer.addr) {
             Ok(value) => answer.value = value,
             Err(err) => answer.error_code = pump_error_code(err),
-        },
-        None => answer.error_code = -1,
-    }
-    if let Some(pump) = st.pump.as_ref() {
-        let _ = pump;
+        }
+        let (writes, reads) = pump.counters();
+        st.writes = writes;
+        st.reads = reads;
+    } else {
+        answer.error_code = -1;
     }
     unsafe { write_output(request, &answer) };
 }
@@ -607,9 +1064,24 @@ unsafe fn handle_write_reg(request: WDFREQUEST, input_length: usize) {
         unsafe { complete(request, wdk_sys::STATUS_BUFFER_TOO_SMALL, 0) };
         return;
     }
-    // TODO(bring-up): прочитать адрес и значение из входного буфера и записать
-    // через `Pump::write_register`. Пока отвечаем честным отказом.
-    unsafe { complete(request, wdk_sys::STATUS_NOT_IMPLEMENTED, 0) };
+    // SAFETY: буфер проверен по размеру; адрес и значение — из запроса клиента.
+    let Some(mut answer) = (unsafe { read_input::<Ln8000RegRequest>(request) }) else {
+        unsafe { complete(request, wdk_sys::STATUS_INVALID_PARAMETER, 0) };
+        return;
+    };
+    // SAFETY: доступ сериализован WDF.
+    let st = unsafe { state() };
+    if let Some(pump) = st.pump.as_mut() {
+        if let Err(err) = pump.write_register(answer.addr, answer.value) {
+            answer.error_code = pump_error_code(err);
+        }
+        let (writes, reads) = pump.counters();
+        st.writes = writes;
+        st.reads = reads;
+    } else {
+        answer.error_code = -1;
+    }
+    unsafe { write_output(request, &answer) };
 }
 
 /// Задаёт лимиты тока и напряжения.
@@ -622,8 +1094,36 @@ unsafe fn handle_set_limits(request: WDFREQUEST, input_length: usize) {
         unsafe { complete(request, wdk_sys::STATUS_BUFFER_TOO_SMALL, 0) };
         return;
     }
-    // TODO(bring-up): применить лимиты из запроса через ядро LN8000.
-    unsafe { complete(request, wdk_sys::STATUS_NOT_IMPLEMENTED, 0) };
+    // SAFETY: буфер проверен по размеру.
+    let Some(mut answer) = (unsafe { read_input::<Ln8000LimitsRequest>(request) }) else {
+        unsafe { complete(request, wdk_sys::STATUS_INVALID_PARAMETER, 0) };
+        return;
+    };
+    // SAFETY: доступ сериализован WDF.
+    let st = unsafe { state() };
+    if let Some(pump) = st.pump.as_mut() {
+        if answer.iin_ua > 0 {
+            match pump.set_iin_limit(answer.iin_ua) {
+                Ok(code) => {
+                    // Сообщаем не запрошенный ток, а фактически применённый:
+                    // кодирование округляет значение до шага 50 мА.
+                    let applied = decode_iin_limit(code);
+                    answer.applied_iin_ua = applied;
+                    st.limits.iin_max_ua = applied;
+                    st.limits.iin_target_ua = applied;
+                }
+                Err(err) => answer.error_code = pump_error_code(err),
+            }
+        }
+        if answer.vbat_uv > 0 {
+            if let Err(err) = pump.set_vbat_float(answer.vbat_uv) {
+                answer.error_code = pump_error_code(err);
+            }
+        }
+    } else {
+        answer.error_code = -1;
+    }
+    unsafe { write_output(request, &answer) };
 }
 
 /// Переключает режим работы.
@@ -636,7 +1136,31 @@ unsafe fn handle_set_mode(request: WDFREQUEST, input_length: usize) {
         unsafe { complete(request, wdk_sys::STATUS_BUFFER_TOO_SMALL, 0) };
         return;
     }
-    unsafe { complete(request, wdk_sys::STATUS_NOT_IMPLEMENTED, 0) };
+    // SAFETY: буфер проверен по размеру.
+    let Some(mut answer) = (unsafe { read_input::<Ln8000ModeRequest>(request) }) else {
+        unsafe { complete(request, wdk_sys::STATUS_INVALID_PARAMETER, 0) };
+        return;
+    };
+    if !(1..=3).contains(&answer.mode) {
+        unsafe { complete(request, wdk_sys::STATUS_INVALID_PARAMETER, 0) };
+        return;
+    }
+    // SAFETY: доступ сериализован WDF.
+    let st = unsafe { state() };
+    if let Some(pump) = st.pump.as_mut() {
+        let outcome = match answer.mode {
+            1 => pump.standby().map(|()| OpMode::Standby.code()),
+            2 => pump.enable_bypass().map(|mode| mode.code()),
+            _ => pump.enable_switching().map(|mode| mode.code()),
+        };
+        match outcome {
+            Ok(mode) => answer.applied_mode = mode,
+            Err(err) => answer.error_code = pump_error_code(err),
+        }
+    } else {
+        answer.error_code = -1;
+    }
+    unsafe { write_output(request, &answer) };
 }
 
 /// Отдаёт сведения о сеансах заряда.
@@ -676,8 +1200,79 @@ unsafe fn handle_get_samples(request: WDFREQUEST, input_length: usize) {
         unsafe { complete(request, wdk_sys::STATUS_BUFFER_TOO_SMALL, 0) };
         return;
     }
-    // TODO(bring-up): скопировать кольцо отсчётов в выходной буфер клиента.
-    unsafe { complete(request, wdk_sys::STATUS_NOT_IMPLEMENTED, 0) };
+    // SAFETY: буфер проверен по размеру.
+    let requested_count = unsafe { read_input::<Ln8000SamplesRequest>(request) };
+    // SAFETY: доступ сериализован WDF.
+    let st = unsafe { state() };
+    let (buffer, length) = match unsafe {
+        output_buffer(request, core::mem::size_of::<Ln8000SamplesRequest>())
+    } {
+        Ok(value) => value,
+        Err(status) => {
+            unsafe { complete(request, status, 0) };
+            return;
+        }
+    };
+    let header_size = core::mem::size_of::<Ln8000SamplesRequest>();
+    let sample_size = core::mem::size_of::<Ln8000Sample>();
+    if sample_size == 0 {
+        unsafe { complete(request, wdk_sys::STATUS_INVALID_PARAMETER, 0) };
+        return;
+    }
+    let capacity = length.saturating_sub(header_size) / sample_size;
+    let requested = requested_count
+        .map_or(capacity, |info| usize::try_from(info.count).unwrap_or(capacity));
+    let limit = capacity.min(requested).min(ln8000::session::SAMPLE_RING);
+    let base = buffer.cast::<u8>();
+    let mut written = 0_usize;
+    st.telemetry.for_each_sample(|sample| {
+        if written < limit {
+            // SAFETY: запись идёт внутри выходного буфера запроса, а
+            // `written < limit <= capacity` не даёт выйти за его границы.
+            unsafe {
+                let destination = base
+                    .add(header_size + written * sample_size)
+                    .cast::<Ln8000Sample>();
+                core::ptr::write(destination, to_sample(sample));
+            }
+            written = written.saturating_add(1);
+        }
+    });
+    let mut header = Ln8000SamplesRequest {
+        count: u32::try_from(limit).unwrap_or(0),
+        available: u32::try_from(written).unwrap_or(0),
+        ..Ln8000SamplesRequest::default()
+    };
+    if written > 0 {
+        // SAFETY: первый записанный отсчёт лежит сразу за заголовком.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                base.add(header_size),
+                core::ptr::from_mut(&mut header.first).cast::<u8>(),
+                sample_size,
+            );
+        }
+    }
+    // SAFETY: заголовок пишется в начало выходного буфера запроса.
+    unsafe {
+        core::ptr::copy_nonoverlapping(core::ptr::from_ref(&header).cast::<u8>(), base, header_size);
+    }
+    let information = header_size + written * sample_size;
+    unsafe { complete(request, wdk_sys::STATUS_SUCCESS, information) };
+}
+
+/// Преобразует отсчёт ядра в структуру ответа.
+fn to_sample(sample: &TelemetrySample) -> Ln8000Sample {
+    Ln8000Sample {
+        ts_ms: sample.ts_ms,
+        vbat_uv: sample.vbat_uv,
+        vbus_uv: sample.vbus_uv,
+        iin_ua: sample.iin_ua,
+        die_temp_dc: sample.die_temp_dc,
+        op_mode: sample.op_mode.code(),
+        input_present: u8::from(sample.input_present),
+        reserved: [0; 2],
+    }
 }
 
 /// Ищет ресурс подключения I²C в переведённом списке `_CRS`.
@@ -709,12 +1304,50 @@ unsafe fn find_peripheral_id(resources: WDFCMRESLIST) -> Option<u64> {
     }
 }
 
-/// Копирует структуру в выходной буфер запроса и завершает его.
+/// Копирует входной буфер запроса в структуру.
+///
+/// Возвращает `None`, если буфер меньше `size_of::<T>()`.
 ///
 /// # Safety
 ///
-/// `request` валиден; `value` указывает на живую структуру.
-unsafe fn write_output<T: Copy>(request: WDFREQUEST, value: &T) {
+/// `request` валиден; вызов на уровне, допускающем доступ к буферу запроса.
+unsafe fn read_input<T: Copy + Default>(request: WDFREQUEST) -> Option<T> {
+    let mut buffer: *mut core::ffi::c_void = core::ptr::null_mut();
+    let mut length: usize = 0;
+    // SAFETY: входной буфер запроса создаётся фреймворком (METHOD_BUFFERED).
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfRequestRetrieveInputBuffer,
+            request,
+            core::mem::size_of::<T>(),
+            &raw mut buffer,
+            &raw mut length,
+        )
+    };
+    if status < 0 || buffer.is_null() || length < core::mem::size_of::<T>() {
+        return None;
+    }
+    let mut value = T::default();
+    // SAFETY: буфер проверен по размеру; копируем ровно size_of::<T>().
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            buffer.cast::<u8>(),
+            core::ptr::from_mut(&mut value).cast::<u8>(),
+            core::mem::size_of::<T>(),
+        );
+    }
+    Some(value)
+}
+
+/// Отдаёт выходной буфер запроса и его размер.
+///
+/// # Safety
+///
+/// `request` валиден.
+unsafe fn output_buffer(
+    request: WDFREQUEST,
+    min_length: usize,
+) -> Result<(*mut core::ffi::c_void, usize), NTSTATUS> {
     let mut buffer: *mut core::ffi::c_void = core::ptr::null_mut();
     let mut length: usize = 0;
     // SAFETY: выходной буфер запроса создаётся фреймворком (METHOD_BUFFERED).
@@ -722,15 +1355,30 @@ unsafe fn write_output<T: Copy>(request: WDFREQUEST, value: &T) {
         call_unsafe_wdf_function_binding!(
             WdfRequestRetrieveOutputBuffer,
             request,
-            core::mem::size_of::<T>(),
+            min_length,
             &raw mut buffer,
             &raw mut length,
         )
     };
     if status < 0 {
-        unsafe { complete(request, status, 0) };
-        return;
+        return Err(status);
     }
+    Ok((buffer, length))
+}
+
+/// Копирует структуру в выходной буфер запроса и завершает его.
+///
+/// # Safety
+///
+/// `request` валиден; `value` указывает на живую структуру.
+unsafe fn write_output<T: Copy>(request: WDFREQUEST, value: &T) {
+    let (buffer, _length) = match unsafe { output_buffer(request, core::mem::size_of::<T>()) } {
+        Ok(value) => value,
+        Err(status) => {
+            unsafe { complete(request, status, 0) };
+            return;
+        }
+    };
     // SAFETY: буфер проверен по размеру; копируем ровно size_of::<T>().
     unsafe {
         core::ptr::copy_nonoverlapping(
