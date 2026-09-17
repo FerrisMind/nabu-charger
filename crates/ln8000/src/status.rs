@@ -35,14 +35,19 @@ impl AdcChannel {
     #[must_use]
     pub const fn register(self) -> u8 {
         regs::ADC_FIRST_STS.saturating_add(match self {
+            // Номера каналов как в эталонном драйвере (`enum ln8000_adc_channel_index`):
+            // VOUT=1, VIN=2, VBAT=3, VAC=4, IIN=5, DIETEMP=6, TSBAT=7, TSBUS=8.
+            // Регистр ADC05 (0x0D) не используется ни одним каналом, поэтому
+            // простым смещением от ADC01 обойтись нельзя: VBAT и далее стоят на
+            // один регистр дальше.
             Self::Iin => 0,
             Self::Vac => 1,
             Self::Vin => 2,
             Self::Vout => 3,
-            Self::Vbat => 4,
-            Self::DieTemp => 5,
-            Self::TsBat => 6,
-            Self::TsBus => 7,
+            Self::Vbat => 5,
+            Self::DieTemp => 6,
+            Self::TsBat => 7,
+            Self::TsBus => 8,
         })
     }
 
@@ -122,7 +127,11 @@ impl AdcChannel {
             Self::Vbat => 1_000_000 + code * 5_000,
             Self::Vac => (code + 5) * 16_000,
             Self::Iin => code * 4_890,
-            Self::DieTemp => -250 + code * 4_350 / 1_000,
+            // Как в эталоне: (935 - raw) * 4350 / 1000, с ограничением [-250; 1600].
+            Self::DieTemp => {
+                let dc = (935_i32 - i32::from(code)) * 4_350 / 1_000;
+                dc.clamp(-250, 1_600)
+            }
             Self::TsBat | Self::TsBus => code * 2_933,
         }
     }
@@ -232,10 +241,11 @@ mod tests {
         assert_eq!(AdcChannel::Vac.register(), regs::ADC_FIRST_STS + 1);
         assert_eq!(AdcChannel::Vin.register(), regs::ADC_FIRST_STS + 2);
         assert_eq!(AdcChannel::Vout.register(), regs::ADC_FIRST_STS + 3);
-        assert_eq!(AdcChannel::Vbat.register(), regs::ADC_FIRST_STS + 4);
-        assert_eq!(AdcChannel::DieTemp.register(), regs::ADC_FIRST_STS + 5);
-        assert_eq!(AdcChannel::TsBat.register(), regs::ADC_FIRST_STS + 6);
-        assert_eq!(AdcChannel::TsBus.register(), regs::ADC_FIRST_STS + 7);
+        // Регистр ADC05 (0x0D) не используется: VBAT и далее идут на один дальше.
+        assert_eq!(AdcChannel::Vbat.register(), regs::ADC_FIRST_STS + 5);
+        assert_eq!(AdcChannel::DieTemp.register(), regs::ADC_FIRST_STS + 6);
+        assert_eq!(AdcChannel::TsBat.register(), regs::ADC_FIRST_STS + 7);
+        assert_eq!(AdcChannel::TsBus.register(), regs::ADC_FIRST_STS + 8);
         assert_eq!(AdcChannel::Vbat.adc_index(), 6);
         assert_eq!(AdcChannel::TsBus.adc_index(), 9);
         assert_eq!(regs::ADC_LAST_STS, 0x12);
@@ -248,8 +258,11 @@ mod tests {
         assert_eq!(AdcChannel::Iin.decode(100), 489_000);
         assert_eq!(AdcChannel::Vin.decode(100), 1_600_000);
         assert_eq!(AdcChannel::Vac.decode(0), 80_000);
-        assert_eq!(AdcChannel::DieTemp.decode(0), -250);
-        assert_eq!(AdcChannel::DieTemp.decode(100), 185);
+        // Формула эталона: (935 - raw) * 4350 / 1000, ограничение [-250; 1600].
+        assert_eq!(AdcChannel::DieTemp.decode(935), 0);
+        assert_eq!(AdcChannel::DieTemp.decode(900), 152);
+        assert_eq!(AdcChannel::DieTemp.decode(0), 1_600);
+        assert_eq!(AdcChannel::DieTemp.decode(2_000), -250);
         assert_eq!(AdcChannel::TsBat.decode(1_000), 2_933_000);
     }
 

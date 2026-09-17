@@ -24,7 +24,10 @@ use ln8000::{
 ///
 /// Кодирование обратно формуле эталонного драйвера: `dC = raw * 4350 / 1000 - 250`.
 fn set_die_temp(pump: &mut Pump<MockPumpBus>, deci_celsius: i32) {
-    let raw = u16::try_from(((deci_celsius + 250) * 1000) / 4350).unwrap_or(0);
+    // Обратное преобразование к формуле эталона: (935 - raw) * 4350 / 1000,
+    // то есть raw = 935 - (dC * 1000) / 4350. Значение ограничиваем диапазоном АЦП.
+    let raw = (935_i32 - (deci_celsius * 1000) / 4350).clamp(0, 65_535);
+    let raw = u16::try_from(raw).unwrap_or(0);
     let register = AdcChannel::DieTemp.register();
     let bus = pump.bus_mut();
     bus.set_reg(register, u8::try_from(raw & 0x00FF).unwrap_or(0));
