@@ -70,6 +70,22 @@ pub const GUID_DEVINTERFACE_LN8000: wdk_sys::GUID = wdk_sys::GUID {
 /// Период телеметрии по умолчанию, мс.
 const TELEMETRY_PERIOD_MS: u32 = 1_000;
 
+/// Нижний порог входа для попытки автозапуска заряда, мкВ.
+const CHARGE_ATTEMPT_MIN_VBUS_UV: i32 = 4_600_000;
+
+/// Период повторных попыток автозапуска, мс.
+const CHARGE_RETRY_MS: u64 = 30_000;
+
+/// Изменение входа, при котором попытка повторяется сразу, мкВ.
+const CHARGE_RETRY_DELTA_UV: u32 = 300_000;
+
+/// Сколько отказов подряд считать защёлкнутым состоянием чипа.
+///
+/// Чип защёлкивает отказ, если режим запрошен при невалидном входе, и после этого
+/// отказывает даже при нормальном входе. Штатный выход — программный сброс
+/// и повторная настройка, как это делает эталонный драйвер при потере обмена.
+const CHARGE_FAILS_BEFORE_RESET: u32 = 3;
+
 /// Состояние драйвера: единственный экземпляр устройства.
 ///
 /// # Инварианты
@@ -87,6 +103,14 @@ struct DriverState {
     actions: u32,
     /// Период телеметрии из реестра, мс.
     telemetry_ms: u32,
+    /// Время последней попытки автозапуска заряда, мс.
+    last_charge_attempt_ms: u64,
+    /// Напряжение входа при последней попытке, мкВ.
+    last_attempt_vbus_uv: u32,
+    /// Сколько раз автозапуск включал заряд.
+    auto_starts: u32,
+    /// Отказов заряда подряд: считаем, чтобы понять про защёлкнутое состояние.
+    failed_attempts: u32,
 }
 
 // SAFETY: см. инварианты выше — доступ сериализован WDF.
@@ -103,6 +127,10 @@ impl DriverState {
             last_error: 0,
             actions: 0,
             telemetry_ms: 1000,
+            last_charge_attempt_ms: 0,
+            last_attempt_vbus_uv: 0,
+            auto_starts: 0,
+            failed_attempts: 0,
         }
     }
 }
@@ -1216,6 +1244,44 @@ unsafe extern "C" fn evt_prepare_hardware(
         mark_device_value(device, "Hub0", 0xFFFF_FFFF);
     }
 
+    // Перебор идентификаторов узла ресурсов: какие подключения хаб отдаёт
+    // вообще. Наш узел получил идентификатор 1 — проверяем соседние, чтобы
+    // понять, есть ли среди них подключение к регистрам зарядника PM8150B.
+    // Результат каждого шага пишем в реестр: иначе с устройства этого не
+    // увидеть, а без ответа дальше двигаться нечем.
+    if hub_bus.is_some() {
+        const CANDIDATES: [(u64, (&str, &str, &str)); 8] = [
+            (2, ("Sc2Open", "Sc2St", "Sc2Val")),
+            (3, ("Sc3Open", "Sc3St", "Sc3Val")),
+            (4, ("Sc4Open", "Sc4St", "Sc4Val")),
+            (5, ("Sc5Open", "Sc5St", "Sc5Val")),
+            (6, ("Sc6Open", "Sc6St", "Sc6Val")),
+            (8, ("Sc8Open", "Sc8St", "Sc8Val")),
+            (16, ("Sc16Open", "Sc16St", "Sc16Val")),
+            (0x31, ("Sc31Open", "Sc31St", "Sc31Val")),
+        ];
+        for (candidate, names) in CANDIDATES {
+            // SAFETY: пассивный уровень, устройство создано.
+            match unsafe { SpbBus::open(device, candidate, true) } {
+                Ok(mut probe) => {
+                    mark_device_value(device, names.0, 1);
+                    probe.set_variant(0);
+                    let result = probe.transact(ln8000::regs::DEVICE_ID, None);
+                    mark_device_value(device, names.1, probe.last_status() as u32);
+                    match result {
+                        Ok(value) => mark_device_value(device, names.2, u32::from(value)),
+                        Err(_) => mark_device_value(device, names.2, 0xFFFF_FFFF),
+                    }
+                }
+                Err(_) => {
+                    mark_device_value(device, names.0, 0);
+                    mark_device_value(device, names.1, 0xFFFF_FFFF);
+                    mark_device_value(device, names.2, 0xFFFF_FFFF);
+                }
+            }
+        }
+    }
+
     // Рабочий маршрут к насосу — через узел ресурсов: только он несёт адрес
     // устройства (0x51). Родительский маршрут запросы принимает, но данных не
     // отдаёт, поэтому насос на нём не опознаётся. Если узел недоступен,
@@ -1372,6 +1438,51 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
                 _ => 0,
             }
         );
+    }
+
+    // Автозапуск заряда: блок может появиться позже старта устройства, а насос
+    // сам не включается — без команды он остаётся в заглушке, и это главная
+    // причина медленной зарядки при подключении блока к работающей системе.
+    // Пробуем включить ускоренный режим, когда вход есть: сначала 2:1, при
+    // отказе сквозной 1:1. Чип сам решает, валиден ли вход, поэтому попытка
+    // безопасна: она лишь читает ответ. Повтор — не чаще периода и обязательно
+    // при заметной смене входа, чтобы не будить чип зря.
+    let vbus_uv = u32::try_from(vbus.max(0)).unwrap_or(0);
+    let charging = matches!(status.op_mode, OpMode::Switching | OpMode::Bypass);
+    if charging {
+        st.last_charge_attempt_ms = monotonic_ms();
+        st.last_attempt_vbus_uv = vbus_uv;
+    } else if vbus >= CHARGE_ATTEMPT_MIN_VBUS_UV && !action.is_change() {
+        let now = monotonic_ms();
+        let cooled = now.saturating_sub(st.last_charge_attempt_ms) >= CHARGE_RETRY_MS;
+        let changed = st.last_attempt_vbus_uv.abs_diff(vbus_uv) >= CHARGE_RETRY_DELTA_UV;
+        if cooled || changed {
+            st.last_charge_attempt_ms = now;
+            st.last_attempt_vbus_uv = vbus_uv;
+            // SAFETY: сессия открыта, доступ сериализован таймером.
+            match pump.set_charging(true) {
+                Ok(mode) => {
+                    st.auto_starts = st.auto_starts.saturating_add(1);
+                    st.failed_attempts = 0;
+                    st.last_error = 0;
+                    println!("ln8000-kmdf: заряд включён автоматически, режим {}", mode.code());
+                }
+                Err(err) => {
+                    st.last_error = pump_error_code(err);
+                    st.failed_attempts = st.failed_attempts.saturating_add(1);
+                    // Чип защёлкивает отказ, если режим запрошен при невалидном входе,
+                    // и потом отказывает даже при нормальном. Штатный выход — сброс
+                    // и повторная настройка: проверено на устройстве, после него
+                    // сквозной режим на пяти вольтах включается и даёт около 2,9 А.
+                    if st.failed_attempts >= CHARGE_FAILS_BEFORE_RESET {
+                        st.failed_attempts = 0;
+                        let _ = pump.soft_reset();
+                        let _ = pump.configure();
+                        println!("ln8000-kmdf: выполнены сброс и повторная настройка насоса");
+                    }
+                }
+            }
+        }
     }
 
     // Сторож чипа: если включён в профиле, его надо обслуживать чаще периода,
