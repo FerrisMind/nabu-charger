@@ -1,0 +1,13 @@
+[package]
+name = "spb"
+version = "0.2.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Структуры SPB и сборка последовательностей передач для драйверов nabu"
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true
