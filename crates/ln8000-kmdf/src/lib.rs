@@ -46,11 +46,15 @@ use wdk::println;
 use wdk_sys::{
     _WDF_EXECUTION_LEVEL::WdfExecutionLevelPassive,
     _WDF_IO_QUEUE_DISPATCH_TYPE::WdfIoQueueDispatchSequential,
+    _WDF_REQUEST_SEND_OPTIONS_FLAGS::{
+        WDF_REQUEST_SEND_OPTION_SYNCHRONOUS, WDF_REQUEST_SEND_OPTION_TIMEOUT,
+    },
     _WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeNone, _WDF_TRI_STATE::WdfTrue,
     call_unsafe_wdf_function_binding, CmResourceTypeConnection, NTSTATUS, PCUNICODE_STRING,
     PLUGPLAY_REGKEY_DEVICE, PWDFDEVICE_INIT, ULONG, UNICODE_STRING, WDFCMRESLIST, WDFDEVICE, WDFDRIVER,
-    WDFKEY, WDFQUEUE, WDFREQUEST, WDFTIMER, WDF_DRIVER_CONFIG, WDF_IO_QUEUE_CONFIG, WDF_NO_HANDLE,
-    WDF_NO_OBJECT_ATTRIBUTES, WDF_OBJECT_ATTRIBUTES, WDF_PNPPOWER_EVENT_CALLBACKS, WDF_TIMER_CONFIG,
+    WDFIOTARGET, WDFKEY, WDFMEMORY, WDFQUEUE, WDFREQUEST, WDFTIMER, WDF_DRIVER_CONFIG,
+    WDF_IO_QUEUE_CONFIG, WDF_NO_HANDLE, WDF_NO_OBJECT_ATTRIBUTES, WDF_OBJECT_ATTRIBUTES,
+    WDF_PNPPOWER_EVENT_CALLBACKS, WDF_REQUEST_SEND_OPTIONS, WDF_TIMER_CONFIG,
 };
 
 /// Интерфейс устройства для пользовательского режима.
@@ -343,6 +347,335 @@ fn mark_device_value(device: WDFDEVICE, name: &str, value: u32) {
     }
 }
 
+/// Длина входа запроса подключения (восемь байт, как у эталонного клиента).
+const ATTACH_INPUT_LEN: usize = 8;
+
+/// Отправляет запрос подключения (`0x32C004`) в цель родителя устройства.
+///
+/// Эталонный клиент делает этот шаг до доступа к регистрам, и отправляет его
+/// не в узел Resource Hub, а в собственную цель устройства. Возвращает статус;
+/// первые слова ответа пишутся в реестр как доказательство.
+unsafe fn parent_attach_probe(device: WDFDEVICE) -> i32 {
+    // SAFETY: устройство создано; цель принадлежит WDF.
+    let target: WDFIOTARGET = unsafe { call_unsafe_wdf_function_binding!(WdfDeviceGetIoTarget, device) };
+    if target.is_null() {
+        return -3;
+    }
+
+    let mut request: WDFREQUEST = WDF_NO_HANDLE.cast();
+    // SAFETY: цель валидна; дескрипторы — локальные переменные под выход.
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfRequestCreate,
+            WDF_NO_OBJECT_ATTRIBUTES,
+            target,
+            &raw mut request,
+        )
+    };
+    if status < 0 {
+        return status;
+    }
+
+    let mut in_ptr: *mut core::ffi::c_void = core::ptr::null_mut();
+    let mut in_mem: WDFMEMORY = WDF_NO_HANDLE.cast();
+    // SAFETY: вход подключения — восемь байт в невыгружаемом пуле.
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfMemoryCreate,
+            WDF_NO_OBJECT_ATTRIBUTES,
+            wdk_sys::_POOL_TYPE::NonPagedPool,
+            0,
+            ATTACH_INPUT_LEN,
+            &raw mut in_mem,
+            &raw mut in_ptr,
+        )
+    };
+    if status < 0 {
+        return status;
+    }
+    let mut out_ptr: *mut core::ffi::c_void = core::ptr::null_mut();
+    let mut out_mem: WDFMEMORY = WDF_NO_HANDLE.cast();
+    // SAFETY: ответ подключения — 1024 байта в невыгружаемом пуле.
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfMemoryCreate,
+            WDF_NO_OBJECT_ATTRIBUTES,
+            wdk_sys::_POOL_TYPE::NonPagedPool,
+            0,
+            spb_abi::ATTACH_REPLY_LEN,
+            &raw mut out_mem,
+            &raw mut out_ptr,
+        )
+    };
+    if status < 0 {
+        return status;
+    }
+
+    // Эталонный клиент кладёт во вход магию и четырёхбайтовое значение.
+    // SAFETY: вход — восемь байт, запись в его пределах.
+    unsafe {
+        core::ptr::write_volatile(in_ptr.cast::<u32>(), spb_abi::ATTACH_MAGIC);
+        core::ptr::write_volatile(in_ptr.add(4).cast::<u32>(), 1);
+    }
+
+    // SAFETY: цель, запрос и буферы валидны.
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfIoTargetFormatRequestForIoctl,
+            target,
+            request,
+            spb_abi::IOCTL_ATTACH,
+            in_mem,
+            core::ptr::null_mut(),
+            out_mem,
+            core::ptr::null_mut(),
+        )
+    };
+    if status < 0 {
+        return status;
+    }
+
+    let mut options: WDF_REQUEST_SEND_OPTIONS = unsafe { core::mem::zeroed() };
+    options.Size = size_of_ulong::<WDF_REQUEST_SEND_OPTIONS>();
+    options.Flags =
+        (WDF_REQUEST_SEND_OPTION_SYNCHRONOUS | WDF_REQUEST_SEND_OPTION_TIMEOUT) as ULONG;
+    options.Timeout = -10_000_000_i64;
+    // SAFETY: синхронная отправка на пассивном уровне.
+    let sent = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfRequestSend,
+            request,
+            target,
+            &raw mut options,
+        )
+    };
+    if sent == 0 {
+        return -1;
+    }
+    // SAFETY: запрос завершён, читаем статус и первые слова ответа.
+    let status = unsafe { call_unsafe_wdf_function_binding!(WdfRequestGetStatus, request) };
+    if status >= 0 {
+        for (index, name) in [(0_usize, "Par0"), (1, "Par1"), (2, "Par2"), (3, "Par3")] {
+            // SAFETY: ответ 1024 байта; читаем первые четыре слова.
+            let word = unsafe { core::ptr::read_volatile(out_ptr.add(index * 4).cast::<u32>()) };
+            mark_device_value(device, name, word);
+        }
+    }
+    // SAFETY: объекты созданы здесь и больше не нужны.
+    unsafe {
+        let _ = call_unsafe_wdf_function_binding!(WdfObjectDelete, request.cast());
+        let _ = call_unsafe_wdf_function_binding!(WdfObjectDelete, in_mem.cast());
+        let _ = call_unsafe_wdf_function_binding!(WdfObjectDelete, out_mem.cast());
+    }
+    status
+}
+
+/// Класс и типы ресурсов подключения из заголовка WDM.
+const CONNECTION_CLASS_SERIAL: u32 = 0x02;
+const CONNECTION_TYPE_SERIAL_I2C: u32 = 0x01;
+const CONNECTION_TYPE_SERIAL_SPI: u32 = 0x02;
+
+/// Пишет сведения о ресурсе подключения в реестр (разбор на железе).
+fn mark_connection(device: WDFDEVICE, index: usize, id: u64, class: u32, kind: u32) {
+    let (class_name, type_name, id_name) = match index {
+        0 => ("C0Class", "C0Type", "C0Low"),
+        1 => ("C1Class", "C1Type", "C1Low"),
+        2 => ("C2Class", "C2Type", "C2Low"),
+        _ => ("C3Class", "C3Type", "C3Low"),
+    };
+    mark_device_value(device, class_name, class);
+    mark_device_value(device, type_name, kind);
+    mark_device_value(device, id_name, id as u32);
+}
+
+/// Собирает все ресурсы подключения из `_CRS` в порядке объявления.
+///
+/// # Safety
+///
+/// Список ресурсов валиден; `out` — локальный буфер вызывающего.
+unsafe fn collect_connections(resources: WDFCMRESLIST, out: &mut [(u64, u32, u32); 4]) -> usize {
+    let mut index: ULONG = 0;
+    let mut found = 0_usize;
+    loop {
+        // SAFETY: список ресурсов неизменен на время перебора.
+        let descriptor = unsafe {
+            call_unsafe_wdf_function_binding!(WdfCmResourceListGetDescriptor, resources, index)
+        };
+        if descriptor.is_null() {
+            break;
+        }
+        // SAFETY: дескриптор получен из списка ресурсов.
+        let kind = unsafe { (*descriptor).Type };
+        if u32::from(kind) == CmResourceTypeConnection {
+            // SAFETY: для типа Connection поле `Connection` заполнено.
+            let class = unsafe { (*descriptor).u.Connection.Class };
+            let connection_kind = unsafe { (*descriptor).u.Connection.Type };
+            let low = unsafe { (*descriptor).u.Connection.IdLowPart };
+            let high = unsafe { (*descriptor).u.Connection.IdHighPart };
+            if found < out.len() {
+                out[found] = (
+                    (u64::from(high) << 32) | u64::from(low),
+                    u32::from(class),
+                    u32::from(connection_kind),
+                );
+                found = found.saturating_add(1);
+            }
+        }
+        index = index.saturating_add(1);
+    }
+    found
+}
+
+/// Выбирает идентификатор последовательного подключения (I²C или SPI).
+///
+/// Классы и типы — из `wdm.h`: `CLASS_SERIAL` = 0x02, `TYPE_SERIAL_I2C` = 0x01,
+/// `TYPE_SERIAL_SPI` = 0x02. Брать первый попавшийся ресурс нельзя: у узла
+/// бывают и другие подключения (например, GPIO), и их узел чужой.
+fn select_serial_connection(connections: &[(u64, u32, u32); 4], count: usize) -> Option<u64> {
+    for (id, class, kind) in connections.iter().take(count) {
+        if *class == CONNECTION_CLASS_SERIAL
+            && (*kind == CONNECTION_TYPE_SERIAL_I2C || *kind == CONNECTION_TYPE_SERIAL_SPI)
+        {
+            return Some(*id);
+        }
+    }
+    None
+}
+
+/// Пробует прочитать регистр чипа, отправив последовательность SPB в цель
+/// родителя устройства (стек контроллера), а не в узел Resource Hub.
+///
+/// Эталонный клиент хранит дескриптор цели в глобальной переменной и строит
+/// список передач так же, как мы; вопрос был именно в том, куда идёт запрос.
+unsafe fn parent_sequence_probe(device: WDFDEVICE, address: u8) -> i32 {
+    // SAFETY: устройство создано; цель принадлежит WDF.
+    let target: WDFIOTARGET = unsafe { call_unsafe_wdf_function_binding!(WdfDeviceGetIoTarget, device) };
+    if target.is_null() {
+        return -3;
+    }
+
+    let mut request: WDFREQUEST = WDF_NO_HANDLE.cast();
+    // SAFETY: цель валидна; дескриптор — локальная переменная под выход.
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfRequestCreate,
+            WDF_NO_OBJECT_ATTRIBUTES,
+            target,
+            &raw mut request,
+        )
+    };
+    if status < 0 {
+        return status;
+    }
+
+    // Список передач: ровно столько, сколько передач — как в эталоне.
+    let list_len = spb_abi::SpbTransferList::area_size(2);
+    let mut list_ptr: *mut core::ffi::c_void = core::ptr::null_mut();
+    let mut list_mem: WDFMEMORY = WDF_NO_HANDLE.cast();
+    // SAFETY: выделяем невыгружаемый буфер под список передач.
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfMemoryCreate,
+            WDF_NO_OBJECT_ATTRIBUTES,
+            wdk_sys::_POOL_TYPE::NonPagedPool,
+            0,
+            list_len,
+            &raw mut list_mem,
+            &raw mut list_ptr,
+        )
+    };
+    if status < 0 {
+        return status;
+    }
+
+    let mut data_ptr: *mut core::ffi::c_void = core::ptr::null_mut();
+    let mut data_mem: WDFMEMORY = WDF_NO_HANDLE.cast();
+    // SAFETY: буфер данных — регистр плюс байт ответа.
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfMemoryCreate,
+            WDF_NO_OBJECT_ATTRIBUTES,
+            wdk_sys::_POOL_TYPE::NonPagedPool,
+            0,
+            8,
+            &raw mut data_mem,
+            &raw mut data_ptr,
+        )
+    };
+    if status < 0 {
+        return status;
+    }
+
+    // SAFETY: оба буфера выделены выше и имеют достаточный размер.
+    unsafe {
+        core::ptr::write_volatile(data_ptr.cast::<u8>(), address);
+        let list = list_ptr.cast::<spb_abi::SpbTransferList>();
+        (*list).size = u32::try_from(spb_abi::SpbTransferList::header_size()).unwrap_or(0);
+        (*list).reserved = 0;
+        (*list).transfer_count = 2;
+        (*list).transfers[0] = spb_abi::entry_init(
+            spb_abi::SPB_DIRECTION_TO_DEVICE,
+            data_ptr,
+            1,
+        );
+        let second = core::ptr::addr_of_mut!((*list).transfers[0]).add(1);
+        *second = spb_abi::entry_init(
+            spb_abi::SPB_DIRECTION_FROM_DEVICE,
+            data_ptr.add(1),
+            1,
+        );
+    }
+
+    // SAFETY: цель, запрос и буферы валидны.
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfIoTargetFormatRequestForIoctl,
+            target,
+            request,
+            spb_abi::IOCTL_SPB_EXECUTE_SEQUENCE,
+            list_mem,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        )
+    };
+    if status < 0 {
+        return status;
+    }
+
+    let mut options: WDF_REQUEST_SEND_OPTIONS = unsafe { core::mem::zeroed() };
+    options.Size = size_of_ulong::<WDF_REQUEST_SEND_OPTIONS>();
+    options.Flags =
+        (WDF_REQUEST_SEND_OPTION_SYNCHRONOUS | WDF_REQUEST_SEND_OPTION_TIMEOUT) as ULONG;
+    options.Timeout = -10_000_000_i64;
+    // SAFETY: синхронная отправка на пассивном уровне.
+    let sent = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfRequestSend,
+            request,
+            target,
+            &raw mut options,
+        )
+    };
+    if sent == 0 {
+        return -1;
+    }
+    // SAFETY: запрос завершён; читаем статус и прочитанный байт.
+    let status = unsafe { call_unsafe_wdf_function_binding!(WdfRequestGetStatus, request) };
+    if status >= 0 {
+        // SAFETY: буфер данных — 8 байт; ответ лежит вторым.
+        let value = unsafe { core::ptr::read_volatile(data_ptr.add(1).cast::<u8>()) };
+        mark_device_value(device, "ParSeqValue", u32::from(value));
+    }
+    // SAFETY: объекты созданы здесь и больше не нужны.
+    unsafe {
+        let _ = call_unsafe_wdf_function_binding!(WdfObjectDelete, request.cast());
+        let _ = call_unsafe_wdf_function_binding!(WdfObjectDelete, list_mem.cast());
+        let _ = call_unsafe_wdf_function_binding!(WdfObjectDelete, data_mem.cast());
+    }
+    status
+}
+
 /// Читает параметры профиля из реестра устройства (`HKR, Parameters, ...`).
 ///
 /// Так тот, кто ставит драйвер, может менять пороги, не пересобирая его: INF
@@ -622,6 +955,10 @@ unsafe extern "C" fn evt_device_add(
     // Очередь управляющих запросов и таймер телеметрии.
     let mut queue_config = WDF_IO_QUEUE_CONFIG {
         Size: size_of_ulong::<WDF_IO_QUEUE_CONFIG>(),
+        // Очередь по умолчанию: сюда попадают управляющие запросы клиента.
+        // Без этого флага они уходят в очередь WDF по умолчанию и завершаются
+        // статусом «неизвестная функция» (клиент видит код ошибки 1).
+        DefaultQueue: 1,
         DispatchType: WdfIoQueueDispatchSequential,
         PowerManaged: WdfTrue,
         EvtIoDeviceControl: Some(evt_io_device_control),
@@ -715,17 +1052,24 @@ unsafe extern "C" fn evt_prepare_hardware(
 ) -> NTSTATUS {
     // 1. Ищем ресурс подключения (I²C) и забираем идентификатор.
     mark_stage(device, STAGE_PREPARE, 0);
-    let peripheral_id = match unsafe { find_peripheral_id(resources_translated) } {
+    let mut connections = [(0_u64, 0_u32, 0_u32); 4];
+    // SAFETY: список ресурсов валиден, буфер — локальный.
+    let connection_count = unsafe { collect_connections(resources_translated, &mut connections) };
+    mark_device_value(device, "ConnCount", u32::try_from(connection_count).unwrap_or(0));
+    for (index, (id, class, kind)) in connections.iter().take(connection_count).enumerate() {
+        mark_connection(device, index, *id, *class, *kind);
+    }
+    let peripheral_id = match select_serial_connection(&connections, connection_count) {
         Some(id) => id,
         None => {
-            println!("ln8000-kmdf: в _CRS нет I²C-подключения (узел PEIC не найден)");
+            println!("ln8000-kmdf: в _CRS нет последовательного подключения (I2C/SPI)");
             mark_stage(device, STAGE_PREPARE_BUS, wdk_sys::STATUS_DEVICE_NOT_READY);
             return wdk_sys::STATUS_DEVICE_NOT_READY;
         }
     };
     println!("ln8000-kmdf: подключение {peripheral_id:#018X}");
     // SAFETY: пассивный уровень, устройство создано.
-    let mut bus = match unsafe { SpbBus::open(device, peripheral_id) } {
+    let mut bus = match unsafe { SpbBus::open(device, peripheral_id, false) } {
         Ok(bus) => {
             let path = bus.path_string();
             let text = core::str::from_utf8(&path).unwrap_or("?");
@@ -756,15 +1100,18 @@ unsafe extern "C" fn evt_prepare_hardware(
     mark_device_value(device, "ConnLow", peripheral_id as u32);
     mark_device_value(device, "ConnHigh", (peripheral_id >> 32) as u32);
     mark_device_value(device, "RegAddr", u32::from(ln8000::regs::DEVICE_ID));
-    // Проверка цели: принимает ли узел управляющий запрос SPB вообще.
-    let lock = bus.lock_connection();
-    mark_device_value(device, "LockStatus", lock as u32);
-    mark_device_value(device, "LockOk", if lock >= 0 { 1 } else { 0 });
-    // Подключение к периферии: этот шаг делает эталонный драйвер до доступа
-    // к регистрам. Записываем статус и первые слова ответа.
+    // Подключение к периферии через цель родителя устройства: именно так это
+    // делает эталонный клиент Qualcomm, и именно туда (а не в узел) уходит
+    // запрос 0x32C004.
+    let parent_attach = unsafe { parent_attach_probe(device) };
+    mark_device_value(device, "ParAttachStatus", parent_attach as u32);
+    mark_device_value(device, "ParAttachOk", if parent_attach >= 0 { 1 } else { 0 });
+    // Последовательность в цель родителя: та же операция, но другой адресат.
+    let parent_sequence = unsafe { parent_sequence_probe(device, ln8000::regs::DEVICE_ID) };
+    mark_device_value(device, "ParSeqStatus", parent_sequence as u32);
+    mark_device_value(device, "ParSeqOk", if parent_sequence >= 0 { 1 } else { 0 });
     let attach = bus.attach();
-    mark_device_value(device, "AttachStatus", attach as u32);
-    for (index, name) in [(0_usize, "Att0"), (1, "Att1"), (2, "Att2"), (3, "Att3")] {
+    mark_device_value(device, "AttachStatus", attach as u32);    for (index, name) in [(0_usize, "Att0"), (1, "Att1"), (2, "Att2"), (3, "Att3")] {
         mark_device_value(device, name, bus.attach_word(index));
     }
     let mut working = None;
@@ -796,14 +1143,113 @@ unsafe extern "C" fn evt_prepare_hardware(
         mark_device_value(device, "Variant", u32::from(variant));
     }
 
-    let mut pump = match Pump::open(bus, config) {
+    // Проверяем, влияет ли удержание соединения: та же последовательность,
+    // но уже на занятом соединении. Если занятие ломает обмен — увидим разницу.
+    let lock = bus.lock_connection();
+    mark_device_value(device, "LockStatus", lock as u32);
+    mark_device_value(device, "LockOk", if lock >= 0 { 1 } else { 0 });
+    bus.set_variant(0);
+    let locked = bus.transact(ln8000::regs::DEVICE_ID, None);
+    match locked {
+        Ok(value) => {
+            mark_device_value(device, "LockedOk", 1);
+            mark_device_value(device, "LockedValue", u32::from(value));
+        }
+        Err(_) => mark_device_value(device, "LockedOk", 0),
+    }
+    mark_device_value(device, "LockedStatus", bus.last_status() as u32);
+
+    // Читаем несколько регистров напрямую: если чип отвечает, увидим его
+    // опознавательный код (ожидаем 0x42 в регистре 0x00).
+    for (address, name) in [(0x00_u8, "Reg00"), (0x03, "Reg03"), (0x31, "Reg31")] {
+        bus.set_variant(0);
+        match bus.transact(address, None) {
+            Ok(value) => mark_device_value(device, name, u32::from(value)),
+            Err(_) => mark_device_value(device, name, 0xFFFF_FFFF),
+        }
+    }
+
+    // Матрица возможностей узла: какие управляющие запросы SPB он принимает.
+    // Это отделяет «узел не умеет последовательности» от «недоволен запросом».
+    for (name, code) in [
+        ("Io0", spb_abi::IOCTL_SPB_LOCK_CONTROLLER),
+        ("Io1", spb_abi::IOCTL_SPB_UNLOCK_CONTROLLER),
+        ("Io2", spb_abi::IOCTL_SPB_EXECUTE_SEQUENCE),
+        ("Io3", spb_abi::IOCTL_SPB_LOCK_CONNECTION),
+        ("Io4", spb_abi::IOCTL_SPB_UNLOCK_CONNECTION),
+        ("Io5", spb_abi::IOCTL_SPB_FULL_DUPLEX),
+        ("Io6", spb_abi::IOCTL_SPB_MULTI_SPI_TRANSFER),
+    ] {
+        let status = bus.probe_ioctl(code);
+        mark_device_value(device, name, status as u32);
+    }
+
+    // Матрица на узле Resource Hub с маской доступа штатного драйвера:
+    // если узел теперь принимает последовательности, это и есть рабочий путь.
+    let mut hub_bus = unsafe { SpbBus::open(device, peripheral_id, true) }.ok();
+    let mut hub_working: Option<u8> = None;
+    if let Some(hub) = hub_bus.as_mut() {
+        for (variant, names) in [
+            (0_u8, ("Hub0", "HubS0")),
+            (1_u8, ("Hub1", "HubS1")),
+            (2_u8, ("Hub2", "HubS2")),
+            (3_u8, ("Hub3", "HubS3")),
+            (4_u8, ("Hub4", "HubS4")),
+            (5_u8, ("Hub5", "HubS5")),
+        ] {
+            hub.set_variant(variant);
+            let result = hub.transact(ln8000::regs::DEVICE_ID, None);
+            let status = hub.last_status() as u32;
+            match result {
+                Ok(value) => {
+                    mark_device_value(device, names.0, 1);
+                    mark_device_value(device, "HubValue", u32::from(value));
+                    if value == ln8000::regs::DEVICE_ID_VALUE && hub_working.is_none() {
+                        hub_working = Some(variant);
+                    }
+                }
+                Err(_) => mark_device_value(device, names.0, 0),
+            }
+            mark_device_value(device, names.1, status);
+        }
+    } else {
+        mark_device_value(device, "Hub0", 0xFFFF_FFFF);
+    }
+
+    // Рабочий маршрут к насосу — через узел ресурсов: только он несёт адрес
+    // устройства (0x51). Родительский маршрут запросы принимает, но данных не
+    // отдаёт, поэтому насос на нём не опознаётся. Если узел недоступен,
+    // остаёмся на прежнем маршруте, чтобы не терять диагностику.
+    // Узел ресурсов уже открыт выше; повторно его не открываем — второе
+    // открытие не проходит. Берём готовую цель, иначе остаёмся на прежнем
+    // маршруте, чтобы не терять диагностику.
+    let pump_bus = match hub_bus {
+        Some(hub) => {
+            mark_device_value(device, "PumpBusOpen", 1);
+            hub
+        }
+        None => {
+            mark_device_value(device, "PumpBusOpen", 0);
+            bus
+        }
+    };
+    // Проба перебирала варианты оформления и остановилась на последнем.
+    // Перед работой с насосом возвращаем рабочий вариант: иначе опознание
+    // идёт заведомо неподдерживаемым запросом и падает.
+    let mut pump_bus = pump_bus;
+    let pump_variant = hub_working.unwrap_or(0);
+    pump_bus.set_variant(pump_variant);
+    mark_device_value(device, "PumpVariant", u32::from(pump_variant));
+    let mut pump = match Pump::open(pump_bus, config) {
         Ok(pump) => pump,
         Err(err) => {
             println!("ln8000-kmdf: LN8000 не опознан: {err}");
             let st = unsafe { state() };
             st.last_error = -2;
-            mark_stage(device, STAGE_PREPARE_CHIP, 0);
-            return wdk_sys::STATUS_DEVICE_NOT_READY;
+            mark_device_value(device, "PumpOpen", 0);
+            mark_device_value(device, "PumpFailStatus", 0xC000_0001);
+            mark_stage(device, STAGE_PREPARE_CHIP, 0xC000_0001u32 as i32);
+            return wdk_sys::STATUS_SUCCESS;
         }
     };
     if let Err(err) = pump.configure() {
@@ -829,6 +1275,7 @@ unsafe extern "C" fn evt_prepare_hardware(
     }
 
     let st = unsafe { state() };
+    mark_device_value(device, "PumpOpen", 1);
     st.pump = Some(pump);
     st.telemetry_ms = params.telemetry_ms;
     st.limits = guard_limits;
@@ -1276,33 +1723,7 @@ fn to_sample(sample: &TelemetrySample) -> Ln8000Sample {
 }
 
 /// Ищет ресурс подключения I²C в переведённом списке `_CRS`.
-///
-/// Возвращает идентификатор подключения (Resource Hub).
-///
-/// # Safety
-///
-/// `resources` — валидный список ресурсов WDF.
-unsafe fn find_peripheral_id(resources: WDFCMRESLIST) -> Option<u64> {
-    let mut index: ULONG = 0;
-    loop {
-        // SAFETY: индекс увеличивается до момента, когда дескриптора нет.
-        let descriptor = unsafe {
-            call_unsafe_wdf_function_binding!(WdfCmResourceListGetDescriptor, resources, index)
-        };
-        if descriptor.is_null() {
-            return None;
-        }
-        // SAFETY: дескриптор валиден до следующего вызова.
-        let kind = unsafe { (*descriptor).Type };
-        if u32::from(kind) == CmResourceTypeConnection {
-            // SAFETY: для ресурса подключения поле Connection заполнено.
-            let low = unsafe { (*descriptor).u.Connection.IdLowPart };
-            let high = unsafe { (*descriptor).u.Connection.IdHighPart };
-            return Some((u64::from(high) << 32) | u64::from(low));
-        }
-        index = index.saturating_add(1);
-    }
-}
+
 
 /// Копирует входной буфер запроса в структуру.
 ///
