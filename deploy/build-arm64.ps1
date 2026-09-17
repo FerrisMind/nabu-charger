@@ -1,4 +1,4 @@
-# build-arm64.ps1 — воспроизводимая сборка пакетов драйверов под ARM64
+﻿# build-arm64.ps1 — воспроизводимая сборка пакетов драйверов под ARM64
 #
 # Собирает оба драйвера, складывает пакеты в artifacts/, считает SHA-256 и
 # пишет манифест сборки (версии инструментов, время, размеры, суммы).
@@ -14,7 +14,8 @@
 [CmdletBinding()]
 param(
   [string]$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path,
-  [switch]$SkipBuild
+  [switch]$SkipBuild,
+  [switch]$CheckReproducible
 )
 
 $ErrorActionPreference = 'Stop'
@@ -31,8 +32,8 @@ function Get-ToolVersions {
 }
 
 $targets = @(
-  @{ Name = 'SMB-детекция блока'; Crate = 'crates\kmdf';        Package = 'kmdf_package';        Out = 'driver-arm64' },
-  @{ Name = 'Charge pump LN8000'; Crate = 'crates\ln8000-kmdf'; Package = 'ln8000_kmdf_package'; Out = 'driver-ln8000-arm64' }
+  @{ Name = 'SMB-детекция блока'; Crate = 'crates\kmdf';        Package = 'kmdf_package';        Out = 'driver-arm64';        Deploy = $null },
+  @{ Name = 'Charge pump LN8000'; Crate = 'crates\ln8000-kmdf'; Package = 'ln8000_kmdf_package'; Out = 'driver-ln8000-arm64'; Deploy = 'deploy' }
 )
 
 if (-not $env:LIBCLANG_PATH) { $env:LIBCLANG_PATH = 'C:\Program Files\LLVM\bin' }
@@ -59,6 +60,26 @@ foreach ($t in $targets) {
   $outPath = Join-Path $RepoRoot ('artifacts\' + $t.Out)
   New-Item -ItemType Directory -Path $outPath -Force | Out-Null
   Copy-Item (Join-Path $packagePath '*') $outPath -Force
+
+  # Скрипты развёртывания кладём рядом с пакетом: на планшете они читают
+  # $PSScriptRoot, поэтому комплект копируется целиком в одну папку.
+  if ($t.Deploy) {
+    $deployPath = Join-Path $cratePath $t.Deploy
+    if (Test-Path $deployPath) {
+      Copy-Item (Join-Path $deployPath '*.ps1') $outPath -Force
+      Copy-Item (Join-Path $deployPath '*.md') $outPath -Force -ErrorAction SilentlyContinue
+    }
+  }
+
+  # Скрипты, которые запускаются на самом планшете, но живут в общем deploy:
+  # удалённый доступ включается там же, где и всё остальное.
+  if ($t.Out -eq 'driver-ln8000-arm64') {
+    $shared = Join-Path $RepoRoot 'deploy\enable-remote.ps1'
+    if (Test-Path $shared) {
+      Copy-Item $shared $outPath -Force
+    }
+  }
+
   $built += [pscustomobject]@{ Name = $t.Name; Out = $outPath }
 }
 
@@ -75,12 +96,61 @@ foreach ($b in $built) {
 $sumPath = Join-Path $RepoRoot 'artifacts\SHA256SUMS.txt'
 $sumLines | Set-Content -LiteralPath $sumPath -Encoding ascii
 
+Write-Host ''
+Write-Host '=== воспроизводимость ===' -ForegroundColor Cyan
+
+# Честная проверка: собираем ещё раз и сравниваем байты. Сравнивать только хеш
+# малоинформативно, поэтому считаем различия и записываем вывод в манифест.
+$reproducible = $null
+$reproNote = 'не проверялась (сборка пропущена)'
+if (-not $SkipBuild) {
+    $before = @{}
+    foreach ($b in $built) {
+        foreach ($file in (Get-ChildItem $b.Out -File | Where-Object { $_.Extension -eq '.sys' })) {
+            $before[$file.FullName] = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
+        }
+    }
+    foreach ($t in $targets) {
+        Push-Location (Join-Path $RepoRoot $t.Crate)
+        try { & cargo wdk build --target-arch arm64 --profile release | Out-Null } finally { Pop-Location }
+    }
+    $reproducible = $true
+    foreach ($entry in $before.GetEnumerator()) {
+        $now = (Get-FileHash -LiteralPath $entry.Key -Algorithm SHA256).Hash
+        if ($now -eq $entry.Value) {
+            Write-Host ('  ' + (Split-Path $entry.Key -Leaf) + ': совпадает') -ForegroundColor Green
+        } else {
+            $reproducible = $false
+            Write-Host ('  ' + (Split-Path $entry.Key -Leaf) + ': байты отличаются от первой сборки') -ForegroundColor Yellow
+        }
+    }
+    if ($reproducible) {
+        $reproNote = 'битовая воспроизводимость достигнута'
+    } else {
+        $reproNote = 'битовая воспроизводимость НЕ достигнута: между сборками меняются метаданные образа'
+    }
+}
+Write-Host ('  вывод: ' + $reproNote)
+
+# Суммы пересчитываются после последней сборки, иначе они описывали бы прежний файл.
+$finalSums = @()
+foreach ($b in $built) {
+    foreach ($file in (Get-ChildItem $b.Out -File | Sort-Object Name)) {
+        $finalSums += ((Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLower() + '  ' +
+                       (Split-Path $b.Out -Leaf) + '/' + $file.Name)
+    }
+}
+$sumPath = Join-Path $RepoRoot 'artifacts\SHA256SUMS.txt'
+$finalSums | Sort-Object -Unique | Set-Content -LiteralPath $sumPath -Encoding ascii
+Write-Host ''
 Write-Host '=== манифест ===' -ForegroundColor Cyan
 $manifest = [ordered]@{
-  built_at   = (Get-Date).ToString('o')
-  host       = "$env:COMPUTERNAME ($env:PROCESSOR_ARCHITECTURE)"
-  versions   = Get-ToolVersions
-  artifacts  = @()
+  built_at          = (Get-Date).ToString('o')
+  host              = "$env:COMPUTERNAME ($env:PROCESSOR_ARCHITECTURE)"
+  reproducible      = $reproducible
+  reproducible_note = $reproNote
+  versions          = Get-ToolVersions
+  artifacts         = @()
 }
 foreach ($b in $built) {
   $files = @()
