@@ -1,11 +1,14 @@
 # --- Rust / Cargo ---
-# Любой target/: корневой workspace и crates/kmdf (отдельный [workspace]).
+# Любой target/: корневой workspace и crates/*/ (отдельные [workspace]).
 target/
+**/target/
 **/*.rs.bk
 *.orig
+*.rlib
 
-# --- Локальные артефакты verify / bench / demo ---
+# --- Локальные артефакты verify / bench / demo / пакеты драйвера ---
 artifacts/
+**/artifacts/
 
 # --- Windows / KMDF / MSVC (сборочные артефакты) ---
 *.pdb
@@ -17,26 +20,48 @@ artifacts/
 !driver/*.sys
 *.cat
 *.cer
+*.map
+*.iobj
+*.ipdb
 
-# INF — исходники драйвера; не игнорируем.
-# Подписанные пакеты кладите в /artifacts/ или /driver/.
+# INF — исходники драйвера (*.inx / отслеживаемые *.inf); не игнорируем.
+# Подписанные пакеты кладите в artifacts/ или driver/.
 
-# --- IDE ---
+# --- IDE / редакторы ---
 .vscode/
 .idea/
+.vs/
 *.swp
 *~
+*.suo
+*.user
+*.userosscache
+
+# --- Агенты / локальные рабочие каталоги ---
+.swarm/
+.cursor/
+.codex/
 
 # --- ОС ---
 Thumbs.db
 Desktop.ini
 .DS_Store
+# Случайные файлы от редиректа в NUL на Windows
+NUL
+nul
+CON
+con
 
 # --- Секреты и локальная конфигурация ---
 .env
 .env.*
 !.env.example
+*.pem
+*.pfx
+*.p12
 
 # --- Прочее ---
 *.log
 *.tmp
+*.bak
+*.cache
