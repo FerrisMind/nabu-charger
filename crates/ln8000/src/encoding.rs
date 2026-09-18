@@ -112,11 +112,7 @@ pub const fn min_vin_for_switching_uv(vbat_uv: u32) -> u32 {
 /// Non-negative Vin in µV for unsigned comparisons (`0` for absent / negative).
 #[must_use]
 pub const fn non_negative_uv(vin_uv: i32) -> u32 {
-    if vin_uv > 0 {
-        vin_uv.unsigned_abs()
-    } else {
-        0
-    }
+    if vin_uv > 0 { vin_uv.unsigned_abs() } else { 0 }
 }
 
 /// Minimum Vin to attempt any charge mode (µV).
@@ -178,6 +174,13 @@ pub const fn soft_float_for_vbat(profile_float_uv: u32, vbat_uv: u32) -> u32 {
 /// report ~Vin/2 (e.g. 4780 mV @ Vin 9616 mV) while standby reads the pack
 /// (~4470 mV). Treat that as converter ceiling, not cell float.
 pub const VBAT_VIN_HALF_SLACK_UV: u32 = 80_000;
+
+/// Насколько должен измениться Vin, чтобы POR-бюджет считался новым входом.
+///
+/// Запас в 200 мВ выбран по живому разбросу: один и тот же блок на 5 В даёт
+/// 4,98–5,05 В (в пределах запаса, POR не повторяется), а переход 5 В → 9 В
+/// (QC3/PD) меняет вход на вольты и открывает новый бюджет.
+pub const POR_VIN_TOLERANCE_UV: u32 = 200_000;
 
 /// True when VBAT tracks `Vin/2` (switch-cap rail), not a credible pack reading.
 #[must_use]
@@ -629,18 +632,63 @@ mod tests {
         // QC3 (4,42 В). Иначе при цели 4,47 В ток режется уже с 4,32 В.
         assert_eq!(NABU_QC3_BAT_VOLT_MAX_UV, 4_420_000);
         // Цель 4,47 В → срез с 4,37 В.
-        assert!(!vbat_near_float_with_vin(4_350_000, NABU_VBAT_FLOAT_UV, false, 0));
-        assert!(!vbat_near_float_with_vin(4_369_999, NABU_VBAT_FLOAT_UV, false, 0));
-        assert!(vbat_near_float_with_vin(4_370_000, NABU_VBAT_FLOAT_UV, false, 0));
-        assert!(vbat_near_float_with_vin(4_460_000, NABU_VBAT_FLOAT_UV, false, 0));
+        assert!(!vbat_near_float_with_vin(
+            4_350_000,
+            NABU_VBAT_FLOAT_UV,
+            false,
+            0
+        ));
+        assert!(!vbat_near_float_with_vin(
+            4_369_999,
+            NABU_VBAT_FLOAT_UV,
+            false,
+            0
+        ));
+        assert!(vbat_near_float_with_vin(
+            4_370_000,
+            NABU_VBAT_FLOAT_UV,
+            false,
+            0
+        ));
+        assert!(vbat_near_float_with_vin(
+            4_460_000,
+            NABU_VBAT_FLOAT_UV,
+            false,
+            0
+        ));
         // Не-FFC цель 4,45 В → срез с 4,35 В, всё ещё не 4,32 В.
-        assert!(!vbat_near_float_with_vin(4_340_000, NABU_VBAT_NON_FFC_UV, false, 0));
-        assert!(vbat_near_float_with_vin(4_350_000, NABU_VBAT_NON_FFC_UV, false, 0));
+        assert!(!vbat_near_float_with_vin(
+            4_340_000,
+            NABU_VBAT_NON_FFC_UV,
+            false,
+            0
+        ));
+        assert!(vbat_near_float_with_vin(
+            4_350_000,
+            NABU_VBAT_NON_FFC_UV,
+            false,
+            0
+        ));
         // Если целью выбран сам лимит петли QC3, полоса едет за ним.
-        assert!(!vbat_near_float_with_vin(4_319_999, NABU_QC3_BAT_VOLT_MAX_UV, false, 0));
-        assert!(vbat_near_float_with_vin(4_320_000, NABU_QC3_BAT_VOLT_MAX_UV, false, 0));
+        assert!(!vbat_near_float_with_vin(
+            4_319_999,
+            NABU_QC3_BAT_VOLT_MAX_UV,
+            false,
+            0
+        ));
+        assert!(vbat_near_float_with_vin(
+            4_320_000,
+            NABU_QC3_BAT_VOLT_MAX_UV,
+            false,
+            0
+        ));
         // Защёлкнутый VBAT_OV и рэйл Vin/2 обрабатываются как раньше.
-        assert!(vbat_near_float_with_vin(4_000_000, NABU_VBAT_FLOAT_UV, true, 0));
+        assert!(vbat_near_float_with_vin(
+            4_000_000,
+            NABU_VBAT_FLOAT_UV,
+            true,
+            0
+        ));
         assert!(!vbat_near_float_with_vin(
             4_808_000,
             NABU_VBAT_FLOAT_UV,

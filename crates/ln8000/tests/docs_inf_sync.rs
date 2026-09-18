@@ -23,8 +23,7 @@ fn repo_file(relative: &str) -> String {
         .join("..")
         .join("..")
         .join(relative);
-    fs::read_to_string(&path)
-        .unwrap_or_else(|err| panic!("не читается {}: {err}", path.display()))
+    fs::read_to_string(&path).unwrap_or_else(|err| panic!("не читается {}: {err}", path.display()))
 }
 
 /// Разбирает строки `HKR, Parameters, <Имя>, %REG_DWORD%, <значение>` из INF.
@@ -142,7 +141,9 @@ fn guard_band_row_names_the_actual_profile() {
         group_digits(inf_profile)
     );
     assert!(
-        row.contains(&group_digits(ln8000::PumpConfig::for_qc35_class_b().iin_limit_ua)),
+        row.contains(&group_digits(
+            ln8000::PumpConfig::for_qc35_class_b().iin_limit_ua
+        )),
         "строка полосы среза не называет кодовый профиль QC: {row}"
     );
     assert!(

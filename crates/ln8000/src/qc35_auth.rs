@@ -186,14 +186,8 @@ mod tests {
 
     #[test]
     fn auth_attempt_when_vin_in_or_below_detect() {
-        assert_eq!(
-            decide_qc35_auth_attempt(5_000_000),
-            Qc35AuthGate::Attempt
-        );
-        assert_eq!(
-            decide_qc35_auth_attempt(6_000_000),
-            Qc35AuthGate::Attempt
-        );
+        assert_eq!(decide_qc35_auth_attempt(5_000_000), Qc35AuthGate::Attempt);
+        assert_eq!(decide_qc35_auth_attempt(6_000_000), Qc35AuthGate::Attempt);
         assert_eq!(
             qc35_authenticate_outcome(5_200_000, Some(6_000_000), Some(7_000_000)),
             Qc35AuthResult::Authenticated { power_w: 18 }
@@ -227,10 +221,7 @@ mod tests {
 
     #[test]
     fn fail_fallback_to_qc3() {
-        assert_eq!(
-            decide_qc35_auth_attempt(0),
-            Qc35AuthGate::SkipVinInvalid
-        );
+        assert_eq!(decide_qc35_auth_attempt(0), Qc35AuthGate::SkipVinInvalid);
         assert_eq!(
             qc35_authenticate_outcome(5_000_000, None, Some(7_000_000)),
             Qc35AuthResult::FallbackQc3

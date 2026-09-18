@@ -212,6 +212,22 @@ impl Status {
         self.fault1_sts & regs::FAULT1_WATCHDOG != 0
     }
 
+    /// Вендорский признак «годный вход» (`ln8000_check_status`, `.c:592-604`).
+    ///
+    /// Первая ступень — вся группа [`regs::FAULT1_VFAULTS_MASK`] в `FAULT1`;
+    /// вторая — [`regs::FAULT2_VOLT_FAULT`], и только когда первая чиста и заряд
+    /// разрешён. Живой `FAULT1=0x21` даёт `false` уже на первой ступени, из-за
+    /// чего [`Self::has_critical_fault`] (он смотрит только именованные биты) о
+    /// таком входе молчит. Публикуем оба сигнала, чтобы «нет отказов» не
+    /// читалось как «вход годен».
+    #[must_use]
+    pub const fn volt_qual(&self, charge_enabled: bool) -> bool {
+        if self.fault1_sts & regs::FAULT1_VFAULTS_MASK != 0 {
+            return false;
+        }
+        !(charge_enabled && (self.fault2_sts & regs::FAULT2_VOLT_FAULT) != 0)
+    }
+
     /// Есть ли критичный отказ, требующий вмешательства.
     #[must_use]
     pub const fn has_critical_fault(&self) -> bool {
@@ -326,5 +342,41 @@ mod tests {
         };
         assert!(overtemp.has_critical_fault());
         assert_eq!(overtemp.fault_summary(), "temp_max");
+    }
+
+    #[test]
+    fn unnamed_vfault_bits_fail_volt_qual_without_a_critical_fault() {
+        // Живой кадр 18.09: `FAULT1=0x21` — группа VFAULTS, но ни одного
+        // именованного бита. `has_critical_fault` молчит, вендорский
+        // `volt_qual` — нет: ровно этот разрыв и надо видеть в телеметрии.
+        let vfaults = Status {
+            sys_sts: 0x02,
+            op_mode: OpMode::Standby,
+            safety_sts: 0,
+            fault1_sts: 0x21,
+            fault2_sts: 0x3F,
+            ldo_sts: 0,
+        };
+        assert!(!vfaults.has_critical_fault());
+        assert!(!vfaults.volt_qual(false));
+        assert!(!vfaults.volt_qual(true));
+
+        // Чистая первая ступень + бит 5 во второй: вход негоден только тогда,
+        // когда заряд разрешён — так у вендора (`.c:592-604`).
+        let second_stage = Status {
+            fault1_sts: 0,
+            fault2_sts: regs::FAULT2_VOLT_FAULT,
+            ..vfaults
+        };
+        assert!(second_stage.volt_qual(false));
+        assert!(!second_stage.volt_qual(true));
+
+        // Обе ступени чисты — вход годен в любом состоянии заряда.
+        let clean = Status {
+            fault1_sts: 0,
+            fault2_sts: 0,
+            ..vfaults
+        };
+        assert!(clean.volt_qual(true));
     }
 }

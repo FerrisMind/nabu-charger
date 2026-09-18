@@ -278,10 +278,7 @@ pub const fn die_temp_usable(sample: &TelemetrySample) -> bool {
 /// `denied_strikes` хранится между эпизодами. Недостоверный отсчёт сбросом не
 /// считается — счётчик держится до честного замера.
 #[must_use]
-pub const fn bypass_strikes_expired(
-    sample: &TelemetrySample,
-    limits: &GuardLimits,
-) -> bool {
+pub const fn bypass_strikes_expired(sample: &TelemetrySample, limits: &GuardLimits) -> bool {
     die_temp_usable(sample)
         && sample.die_temp_dc <= limits.temp_bypass_dc.saturating_sub(TEMP_REDUCE_HYST_DC)
 }
@@ -782,8 +779,7 @@ mod tests {
         // Строгий профиль — не трогаем без обоснования: он и должен резать рано.
         assert_eq!(GuardLimits::conservative().vbat_reduce_uv, 4_350_000);
         assert!(
-            GuardLimits::conservative().vbat_reduce_uv
-                < GuardLimits::standard().vbat_reduce_uv
+            GuardLimits::conservative().vbat_reduce_uv < GuardLimits::standard().vbat_reduce_uv
         );
     }
 
@@ -1021,7 +1017,10 @@ mod tests {
         // Канал прочитан, но значение неправдоподобно (`AdcChannel::DieTemp`
         // отдаёт 160,0 °C на нулевом коде): предохранитель по мусору не срабатывает.
         let garbage = sample(2_000_000, 1_600, 4_000_000);
-        assert!(garbage.die_temp_valid, "канал при этом считается прочитанным");
+        assert!(
+            garbage.die_temp_valid,
+            "канал при этом считается прочитанным"
+        );
         assert!(!die_temp_usable(&garbage));
         assert_eq!(
             evaluate(&garbage, &limits, Some(profile), None),
@@ -1051,7 +1050,12 @@ mod tests {
         );
         // Тот же отсчёт, но жарко — возврата нет, а уставка уходит в полосу.
         assert_eq!(
-            evaluate(&sample(2_000_000, 440, 4_000_000), &limits, Some(2_800_000), None),
+            evaluate(
+                &sample(2_000_000, 440, 4_000_000),
+                &limits,
+                Some(2_800_000),
+                None
+            ),
             GuardAction::ReduceCurrent {
                 to_ua: 2_000_000,
                 reason: "die_temp_reduce",
@@ -1070,7 +1074,10 @@ mod tests {
             "внутри полосы счётчик не сбрасывается"
         );
         // 47,0 °C — ещё в полосе гистерезиса (порог сброса 48,0 − 3,0 = 45,0 °C).
-        assert!(!bypass_strikes_expired(&sample(2_000_000, 470, 4_250_000), &limits));
+        assert!(!bypass_strikes_expired(
+            &sample(2_000_000, 470, 4_250_000),
+            &limits
+        ));
         assert!(
             bypass_strikes_expired(&sample(2_000_000, 450, 4_250_000), &limits),
             "45,0 °C — выход из полосы перегрева"

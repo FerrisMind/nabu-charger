@@ -20,8 +20,8 @@
 
 use ln8000::testkit::MockPumpBus;
 use ln8000::{
-    evaluate, regs, resolve_bypass, AdcChannel, BypassResolution, GuardAction, GuardLimits, OpMode,
-    Pump, PumpConfig, TelemetrySample,
+    AdcChannel, BypassResolution, GuardAction, GuardLimits, OpMode, Pump, PumpConfig,
+    TelemetrySample, evaluate, regs, resolve_bypass,
 };
 
 /// Записывает температуру кристалла в регистры АЦП так, как это сделал бы чип.

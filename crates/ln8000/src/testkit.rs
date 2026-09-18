@@ -45,6 +45,15 @@ pub enum Fault {
         /// Какое значение всегда возвращать.
         value: u8,
     },
+    /// `SYS_STS` зафиксирован и **после** POR: отказ переживает `soft_reset`.
+    ///
+    /// Отличие от [`Fault::StuckSysSts`] принципиально: тот снимается
+    /// soft-reset'ом, как защёлка на живом LN8000, а этот моделирует настоящую
+    /// негодность входа, от которой POR не спасает.
+    RefuseSysSts {
+        /// Какое значение всегда возвращать.
+        value: u8,
+    },
 }
 
 impl Fault {
@@ -53,7 +62,7 @@ impl Fault {
             Self::ReadError { times, .. }
             | Self::WriteError { times, .. }
             | Self::WrongReadBack { times, .. } => times,
-            Self::StuckSysSts { .. } => u8::MAX,
+            Self::StuckSysSts { .. } | Self::RefuseSysSts { .. } => u8::MAX,
         }
     }
 }
@@ -156,7 +165,10 @@ impl MockPumpBus {
             if !matches {
                 continue;
             }
-            if matches!(slot.fault, Some(Fault::StuckSysSts { .. })) {
+            if matches!(
+                slot.fault,
+                Some(Fault::StuckSysSts { .. } | Fault::RefuseSysSts { .. })
+            ) {
                 return slot.fault;
             }
             slot.remaining = slot.remaining.saturating_sub(1);
@@ -188,7 +200,6 @@ impl MockPumpBus {
         }
     }
 }
-
 impl RegisterBus for MockPumpBus {
     fn read(&mut self, addr: u8) -> Result<u8, BusError> {
         if let Some(fault) =
@@ -204,6 +215,13 @@ impl RegisterBus for MockPumpBus {
         if addr == regs::SYS_STS {
             if let Some(Fault::StuckSysSts { value }) =
                 self.consume(|f| matches!(f, Fault::StuckSysSts { .. }))
+            {
+                return Ok(value);
+            }
+            // `RefuseSysSts` не потребляется: отказ обязан держаться до конца
+            // прогона, иначе тест стадии 3 не дойдёт до маски.
+            if let Some(Fault::RefuseSysSts { value }) =
+                self.consume(|f| matches!(f, Fault::RefuseSysSts { .. }))
             {
                 return Ok(value);
             }

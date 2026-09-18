@@ -33,12 +33,7 @@ pub const fn should_schedule_superuser_retry(negotiate_rc: i32) -> bool {
 
 /// Whether a pending SUPERUSER retry should run now.
 #[must_use]
-pub const fn superuser_retry_due(
-    pending: bool,
-    attempts: u32,
-    now_ms: u64,
-    next_ms: u64,
-) -> bool {
+pub const fn superuser_retry_due(pending: bool, attempts: u32, now_ms: u64, next_ms: u64) -> bool {
     pending && attempts < HVDCP_SUPERUSER_RETRY_MAX && now_ms >= next_ms
 }
 
@@ -72,6 +67,26 @@ pub const APSD_BIT_DCP: u8 = 1 << 3;
 pub const APSD_BIT_QC2: u8 = 1 << 5;
 /// `QC_3P0_BIT` in `APSD_RESULT_STATUS`.
 pub const APSD_BIT_QC3: u8 = 1 << 6;
+/// `QC_CHARGER_BIT` in `APSD_STATUS` (not in the result byte).
+pub const APSD_STAT_BIT_QC_CHARGER: u8 = 1 << 1;
+
+/// Vendor promotion applied to the APSD result before it is classified
+/// (`smb5-lib.c:610-630`, `smblib_get_apsd_result`).
+///
+/// Android does not trust a plain DCP result on its own: if `APSD_STATUS` has
+/// `QC_CHARGER_BIT` set, anything that is not already HVDCP3 is re-read as
+/// HVDCP2 (`0x28`). Without this step a brick that reports `0x08` while its
+/// D+/D- carry the QC signature is classified a plain DCP and — on a build that
+/// does not elevate DCP — never gets its 9 V. The promotion only widens the
+/// result; it never downgrades QC3.
+#[must_use]
+pub const fn promote_qc_charger(result: u8, apsd_status: u8) -> u8 {
+    if (apsd_status & APSD_STAT_BIT_QC_CHARGER) != 0 && (result & APSD_BIT_QC3) == 0 {
+        result | APSD_BIT_DCP | APSD_BIT_QC2
+    } else {
+        result
+    }
+}
 
 /// Elevate path Android takes for one APSD result byte (`smb5-lib.c`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,7 +135,12 @@ mod tests {
         assert!(superuser_retry_due(true, 0, 2_000, 2_000));
         assert!(!superuser_retry_due(false, 0, 2_000, 2_000));
         assert!(!superuser_retry_due(true, 0, 1_999, 2_000));
-        assert!(!superuser_retry_due(true, HVDCP_SUPERUSER_RETRY_MAX, 9_999, 0));
+        assert!(!superuser_retry_due(
+            true,
+            HVDCP_SUPERUSER_RETRY_MAX,
+            9_999,
+            0
+        ));
         assert!(superuser_retry_due(
             true,
             HVDCP_SUPERUSER_RETRY_MAX - 1,
@@ -141,8 +161,16 @@ mod tests {
             false,
             true
         ));
-        assert!(should_renegotiate_on_input_edge(HVDCP_PHASE_DONE, false, true));
-        assert!(should_renegotiate_on_input_edge(HVDCP_PHASE_IDLE, false, true));
+        assert!(should_renegotiate_on_input_edge(
+            HVDCP_PHASE_DONE,
+            false,
+            true
+        ));
+        assert!(should_renegotiate_on_input_edge(
+            HVDCP_PHASE_IDLE,
+            false,
+            true
+        ));
         assert!(!should_renegotiate_on_input_edge(
             HVDCP_PHASE_FIVE_V_BYPASS,
             true,
@@ -195,5 +223,32 @@ mod tests {
         // SDP / CDP / unknown never elevate.
         assert_eq!(apsd_elevate_path(0, false), ApsdElevate::Reject);
         assert_eq!(apsd_elevate_path(1 << 1, false), ApsdElevate::Reject);
+    }
+
+    #[test]
+    fn qc_charger_bit_promotes_unknown_result_to_hvdcp2() {
+        // `smb5-lib.c`: `if (apsd_stat & QC_CHARGER_BIT) result = HVDCP2`.
+        assert_eq!(promote_qc_charger(0, APSD_STAT_BIT_QC_CHARGER), 0x28);
+        assert_eq!(
+            promote_qc_charger(APSD_BIT_DCP, APSD_STAT_BIT_QC_CHARGER),
+            0x28
+        );
+        assert_eq!(
+            promote_qc_charger(APSD_BIT_QC2, APSD_STAT_BIT_QC_CHARGER),
+            0x28
+        );
+        // HVDCP3 is never downgraded by the promotion.
+        assert_eq!(
+            promote_qc_charger(APSD_BIT_QC3 | APSD_BIT_DCP, APSD_STAT_BIT_QC_CHARGER),
+            APSD_BIT_QC3 | APSD_BIT_DCP
+        );
+        // No QC bit in the status → result passes through untouched.
+        assert_eq!(promote_qc_charger(APSD_BIT_DCP, 0), APSD_BIT_DCP);
+        assert_eq!(promote_qc_charger(0, 0), 0);
+        // The promoted result then takes the QC2 elevate path.
+        assert_eq!(
+            apsd_elevate_path(promote_qc_charger(0, APSD_STAT_BIT_QC_CHARGER), false),
+            ApsdElevate::Force9v
+        );
     }
 }

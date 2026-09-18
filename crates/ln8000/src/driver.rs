@@ -25,9 +25,10 @@
 //! ```
 
 use crate::encoding::{
-    AdcHibernateDelay, AdcMode, OpMode, WatchdogPeriod, NABU_VBAT_FLOAT_UV, VBAT_TAPER_IIN_UA,
-    bypass_allowed_by_vin, charge_mode, decode_iin_limit, encode_iin_limit, encode_ntc_alarm,
-    encode_vac_ovp, encode_vbat_float, soft_float_for_vbat, vbat_near_float_with_vin,
+    AdcHibernateDelay, AdcMode, NABU_VBAT_FLOAT_UV, OpMode, POR_VIN_TOLERANCE_UV,
+    VBAT_TAPER_IIN_UA, WatchdogPeriod, bypass_allowed_by_vin, charge_mode, decode_iin_limit,
+    encode_iin_limit, encode_ntc_alarm, encode_vac_ovp, encode_vbat_float, soft_float_for_vbat,
+    vbat_near_float_with_vin,
 };
 use crate::error::{BusError, PumpError};
 use crate::regs;
@@ -300,6 +301,17 @@ pub struct Pump<T: RegisterBus> {
     config: PumpConfig,
     state: PumpState,
     op_mode: OpMode,
+    /// Стадия, которой достиг 5-вольтовый резерв в последней попытке: `0` — не
+    /// запрашивался, `1` — чистая запись режима, `2` — POR с профилем, `3` —
+    /// маска отказов. См. [`Self::bypass_stage`].
+    bypass_stage: u8,
+    /// Вход, на котором уже снимали защёлку через POR.
+    ///
+    /// Эталон ставит POR **один раз** и после него чип слушается; повторять
+    /// сброс на каждой попытке нельзя — это дёргает заряд и стирает состояние,
+    /// которое чип мог защёлкнуть законно. Пока Vin не сменился больше чем на
+    /// [`POR_VIN_TOLERANCE_UV`], второй POR не делается.
+    por_vin_uv: Option<u32>,
     /// Сколько записей и чтений выполнено (для отчётов).
     writes: u32,
     reads: u32,
@@ -323,6 +335,8 @@ impl<T: RegisterBus> Pump<T> {
             config,
             state: PumpState::Probed,
             op_mode: OpMode::Unknown,
+            bypass_stage: 0,
+            por_vin_uv: None,
             writes: 0,
             reads: 1,
         })
@@ -338,6 +352,26 @@ impl<T: RegisterBus> Pump<T> {
     #[must_use]
     pub const fn op_mode(&self) -> OpMode {
         self.op_mode
+    }
+
+    /// Стадия 5-вольтового резерва, которой достигла последняя попытка.
+    ///
+    /// `0` — режим 1:1 не запрашивался; `1` — чистая запись `SYS_CTRL` без
+    /// правок `FAULT_CTRL` (именно она работала 17.09); `2` — POR (`soft_reset`,
+    /// пауза, `configure`, запись режима); `3` — надстройка `.627` с маской
+    /// UV/OV и импульсом снятия защёлки. Вендор ни стадию 2, ни стадию 3 не
+    /// документирует: 2 подтверждена живыми прогонами, 3 — нет.
+    #[must_use]
+    pub const fn bypass_stage(&self) -> u8 {
+        self.bypass_stage
+    }
+
+    /// Потрачен ли POR-бюджет текущего входа: `true`, если защёлку на этом Vin
+    /// уже пытались снять. По этой марке видно, работает драйвер на первом
+    /// заходе или уже упёрся в отказ и ждёт смены блока питания.
+    #[must_use]
+    pub const fn por_spent(&self) -> bool {
+        self.por_vin_uv.is_some()
     }
 
     /// Доступ к шине только для чтения: диагностика и тесты.
@@ -674,6 +708,9 @@ impl<T: RegisterBus> Pump<T> {
         // Шаг эталона: перед стартом заряда обратная защита выключается.
         self.update(regs::SYS_CTRL, 1 << 2, 0, "disable_reverse_current")?;
         if !on {
+            // Заряд выключен — узел считается разомкнутым: POR-бюджет входа
+            // сбрасывается, чтобы следующее подключение имело право на сброс.
+            self.por_vin_uv = None;
             self.set_op_mode(OpMode::Standby)?;
             let status = self.settle_and_read_status()?;
             self.op_mode = status.op_mode;
@@ -697,34 +734,41 @@ impl<T: RegisterBus> Pump<T> {
             let _ = self.update(regs::TIMER_CTRL, 1 << 7, 0, "watchdog_force_off");
         }
 
+        self.bypass_stage = 0;
+
         // Near-float / FAULT1_VBAT_OV: Android cp_qc30 tapers and hands off to
         // SMB; on Windows we still need mode 3. Soft-raise V_FLOAT slightly,
         // mask VBAT_OV (like VIN_OV for QC), clear latch, taper IIN. Never use
         // 1:1 bypass at elevated Vin even if the battery is near full.
-        self.prepare_near_float_for_charge();
+        //
+        // Для 5-вольтового резерва ни тапер, ни снятие защёлки до запроса
+        // режима не делаются: проверенная 17.09 последовательность состояла из
+        // снятия обратной защиты (`SYS_CTRL` бит 2) и записи режима. Всё
+        // остальное — стадии 2–3 (`recover_5v_bypass`), и они применяются
+        // только после того, как чип отказал на чистом пути.
+        if want != OpMode::Bypass {
+            self.prepare_near_float_for_charge(true);
 
-        // Live nabu: FAULT1 VIN_OV latches at QC ~12 V and blocks mode change
-        // (volt_qual). Clear latch; mask VIN_OV for the elevated 2:1 path only.
-        // TA200/5V: FAULT1=0x21 (VFAULTS) blocks bypass — FAULT_CTRL=0x3C alone
-        // leaves SYS_STS=0x22; soft_reset then SYS_CTRL=0x01 → SYS_STS=0x28
-        // (live 603 soak). Mask first; soft-reset retry only on the 5 V path.
-        let _ = self.clear_latched_faults();
-        if want == OpMode::Switching {
-            let _ = self.update(
-                regs::FAULT_CTRL,
-                regs::FAULT_CTRL_DISABLE_VIN_OV,
-                regs::FAULT_CTRL_DISABLE_VIN_OV,
-                "disable_vin_ov_qc",
-            );
-        } else if want == OpMode::Bypass {
-            let _ = self.arm_5v_bypass_fault_mask();
+            // Live nabu: FAULT1 VIN_OV latches at QC ~12 V and blocks mode change
+            // (volt_qual). Clear latch; mask VIN_OV for the elevated 2:1 path only.
+            let _ = self.clear_latched_faults();
+            if want == OpMode::Switching {
+                let _ = self.update(
+                    regs::FAULT_CTRL,
+                    regs::FAULT_CTRL_DISABLE_VIN_OV,
+                    regs::FAULT_CTRL_DISABLE_VIN_OV,
+                    "disable_vin_ov_qc",
+                );
+            }
         }
 
         let result = match want {
             OpMode::Switching => self.enable_switching(),
-            OpMode::Bypass => self
-                .enable_bypass()
-                .or_else(|_| self.recover_5v_bypass(post_reset_delay)),
+            OpMode::Bypass => {
+                self.bypass_stage = 1;
+                self.enable_bypass()
+                    .or_else(|_| self.recover_5v_bypass(post_reset_delay))
+            }
             OpMode::Standby | OpMode::Unknown => Err(PumpError::ModeNotReached {
                 wanted: want.code(),
                 raw_status: 0,
@@ -738,6 +782,12 @@ impl<T: RegisterBus> Pump<T> {
                     OpMode::Switching => PumpState::Switching,
                     _ => PumpState::Configured,
                 };
+                // Тапер и смягчение `VBAT_OV` — после подтверждённого режима:
+                // на запрос режима они уже не влияют, а батарею у верха заряда
+                // защищают. Уставку `V_FLOAT` сквозной режим не поднимает.
+                if mode == OpMode::Bypass {
+                    self.prepare_near_float_for_charge(false);
+                }
                 Ok(mode)
             }
             Err(err) => {
@@ -762,10 +812,14 @@ impl<T: RegisterBus> Pump<T> {
         self.clear_latched_faults()
     }
 
-    /// Soft-reset recovery for TA200-class 5 V bypass.
+    /// Soft-reset recovery for the 5 V bypass, stage 2, then the masked
+    /// stage 3 if the chip still refuses.
     ///
-    /// Live sequence: `soft_reset` → **caller delay** → `configure` → remask →
-    /// `SYS_CTRL=0x01`. Never used at elevated Vin (would drop the QC latch).
+    /// Stage 2 is the sequence that worked on 17.09 both from the raw tool and
+    /// from the driver: `soft_reset` → **caller delay** → `configure` (profile
+    /// only) → `SYS_CTRL=0x01`. Stage 3 adds the `.627` overlay (mask UV/OV,
+    /// pulse the latch) and is the last resort — nothing in the vendor sources
+    /// asks for it. Never used at elevated Vin (would drop the QC latch).
     ///
     /// `post_reset_delay` must sleep ≥ [`regs::SOFT_RESET_DELAY_MS`] before any
     /// further I²C (POR). It comes from the caller of [`Self::set_charging`]:
@@ -775,7 +829,23 @@ impl<T: RegisterBus> Pump<T> {
         &mut self,
         post_reset_delay: &mut dyn FnMut(),
     ) -> Result<OpMode, PumpError> {
+        let vin_now =
+            u32::try_from(self.read_adc(AdcChannel::Vin).unwrap_or(0).max(0)).unwrap_or(0);
+        // POR — один раз на вход. Эталон снимает защёлку сбросом и после этого
+        // чип слушается; повторять сброс каждый тик нельзя: это дёргает заряд и
+        // стирает состояние, которое чип мог защёлкнуть законно.
+        if let Some(prev) = self.por_vin_uv {
+            if vin_now.abs_diff(prev) <= POR_VIN_TOLERANCE_UV {
+                return Err(PumpError::ModeNotReached {
+                    wanted: OpMode::Bypass.code(),
+                    raw_status: self.read(regs::SYS_STS).unwrap_or(0),
+                });
+            }
+        }
+        self.por_vin_uv = Some(vin_now);
+
         let _ = self.soft_reset();
+        self.bypass_stage = 2;
         post_reset_delay();
         let _ = self.configure();
         let vin = self.read_adc(AdcChannel::Vin).unwrap_or(0);
@@ -786,19 +856,40 @@ impl<T: RegisterBus> Pump<T> {
                 raw_status: 0,
             });
         }
-        self.prepare_near_float_for_charge();
-        let _ = self.arm_5v_bypass_fault_mask();
-        // Absolute write matches the working userspace FORCE_BYPASS path.
-        self.write(regs::SYS_CTRL, regs::SYS_CTRL_EN_1TO1)?;
+        // Маскированная запись, как `ln8000_change_opmode` вендора (маска
+        // `STANDBY_EN|EN_1TO1` = 0x09, `.c:697`): абсолютный `SYS_CTRL=0x01`
+        // обнулял биты 7:4 и 1, которых вендор не трогает. На живой плате это
+        // давало `SYS_STS=0x28` вместо `BYPASS_ENABLED`.
+        self.set_op_mode(OpMode::Bypass)?;
         let status = self.settle_and_read_status()?;
-        if status.op_mode != OpMode::Bypass {
-            return Err(PumpError::ModeNotReached {
-                wanted: OpMode::Bypass.code(),
-                raw_status: status.sys_sts,
-            });
+        if status.op_mode == OpMode::Bypass {
+            self.state = PumpState::Configured;
+            self.prepare_near_float_for_charge(false);
+            return Ok(status.op_mode);
         }
-        self.state = PumpState::Configured;
-        Ok(status.op_mode)
+
+        // Стадия 3: маска UV/OV и импульс снятия защёлки. Надстройка `.627`,
+        // вендором не документирована; на живой плате не проверена.
+        self.bypass_stage = 3;
+        let _ = self.arm_5v_bypass_fault_mask();
+        self.set_op_mode(OpMode::Bypass)?;
+        let status = self.settle_and_read_status()?;
+        if status.op_mode == OpMode::Bypass {
+            self.state = PumpState::Configured;
+            return Ok(status.op_mode);
+        }
+        // Маска не помогла — вернуть `FAULT_CTRL` как было: оставлять узел с
+        // выключенными защитами хуже, чем отказ режима.
+        let _ = self.update(
+            regs::FAULT_CTRL,
+            regs::FAULT_CTRL_MASK_5V_BYPASS,
+            0,
+            "unmask_after_failed_bypass",
+        );
+        Err(PumpError::ModeNotReached {
+            wanted: OpMode::Bypass.code(),
+            raw_status: status.sys_sts,
+        })
     }
 
     /// Намеренная уставка тапера у верха заряда, мкА.
@@ -825,7 +916,14 @@ impl<T: RegisterBus> Pump<T> {
     /// Matches live recovery (`V_FLOAT` ~4.50 V + latch clear) and Android
     /// taper-at-`bat_volt_lmt−100`. Does not permanently shrink the profile
     /// `iin_limit_ua` — only writes `IIN_CTRL` for this attempt.
-    fn prepare_near_float_for_charge(&mut self) {
+    ///
+    /// `allow_float_raise` разделяет два случая. Для 2:1 подъём `V_FLOAT`
+    /// нужен: без него защёлкнутый `VBAT_OV` блокирует смену режима. Для 1:1
+    /// он запрещён: проверенный прогон 17.09 шёл с `V_FLOAT = 0x7D` (4,35 В),
+    /// то есть **ниже** профиля, и повышать уставку на сквозном режиме значило
+    /// бы кормить батарею от 5 В до большего напряжения. Тапер тока от этого не
+    /// зависит и работает в обоих случаях.
+    fn prepare_near_float_for_charge(&mut self, allow_float_raise: bool) {
         let vbat = self.read_adc(AdcChannel::Vbat).unwrap_or(0);
         let vbat_uv = u32::try_from(vbat.max(0)).unwrap_or(0);
         let vin = self.read_adc(AdcChannel::Vin).unwrap_or(0);
@@ -841,7 +939,7 @@ impl<T: RegisterBus> Pump<T> {
         // Soft OV mask + float headroom only when OV is latched or Vbat is at
         // the float ceiling (not merely in the early taper band).
         let at_ceiling = ov_latched || vbat_uv.saturating_add(50_000) >= float_uv;
-        if at_ceiling {
+        if at_ceiling && allow_float_raise {
             let want_float = soft_float_for_vbat(float_uv, vbat_uv);
             if want_float > float_uv {
                 // Write float without permanently raising the configured profile
@@ -957,7 +1055,9 @@ impl<T: RegisterBus> Pump<T> {
     /// `None` — регистр не прочитан: уставка неизвестна, и решать по току нельзя.
     #[must_use]
     pub fn applied_iin_ua(&mut self) -> Option<u32> {
-        self.read_register(regs::IIN_CTRL).ok().map(decode_iin_limit)
+        self.read_register(regs::IIN_CTRL)
+            .ok()
+            .map(decode_iin_limit)
     }
 
     /// Обновляет целевое напряжение заряда.
@@ -1101,7 +1201,14 @@ impl<T: RegisterBus> Pump<T> {
         if self.state == PumpState::Closed {
             return;
         }
-        let _ = self.write(regs::SYS_CTRL, regs::SYS_CTRL_STANDBY_EN);
+        // Маскированно, как `ln8000_change_opmode` (маска 0x09): абсолютная
+        // запись `STANDBY_EN` обнуляла биты 7:4 и 1 `SYS_CTRL`.
+        let _ = self.update(
+            regs::SYS_CTRL,
+            OpMode::sys_ctrl_mask(),
+            regs::SYS_CTRL_STANDBY_EN,
+            "close_standby",
+        );
         self.state = PumpState::Closed;
         self.op_mode = OpMode::Standby;
     }
@@ -1238,7 +1345,7 @@ fn bus_recoverable(err: &BusError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::guard::{evaluate, GuardAction, GuardLimits};
+    use crate::guard::{GuardAction, GuardLimits, evaluate};
     use crate::session::TelemetrySample;
     use crate::testkit::{Fault, MockPumpBus};
 
@@ -1487,6 +1594,14 @@ mod tests {
         pump.configure().unwrap();
         set_vin_uv(&mut pump, 5_000_000);
         assert_eq!(pump.set_charging(true, &mut || {}).unwrap(), OpMode::Bypass);
+        // Чистый путь 1:1 не трогает `FAULT_CTRL`: маска — надстройка стадии 3,
+        // и именно её отсутствие отличало рабочий прогон 17.09 от `.627`–`.628`.
+        assert_eq!(pump.bypass_stage(), 1, "без отказа чипа POR не нужен");
+        assert_eq!(
+            pump.bus.reg(regs::FAULT_CTRL) & regs::FAULT_CTRL_MASK_5V_BYPASS,
+            0,
+            "стадия 1 не имеет права маскировать отказы"
+        );
     }
 
     #[test]
@@ -1509,13 +1624,93 @@ mod tests {
             "5 V recovery обязан выдержать POR после soft_reset"
         );
         assert_eq!(
+            pump.bypass_stage(),
+            2,
+            "режим подтверждён на стадии POR, а не на маске"
+        );
+        assert_eq!(
             pump.bus.reg(regs::FAULT_CTRL) & regs::FAULT_CTRL_MASK_5V_BYPASS,
-            regs::FAULT_CTRL_MASK_5V_BYPASS,
-            "5 V recovery must keep FAULT_CTRL bypass mask"
+            0,
+            "POR-путь профиля отказы не маскирует"
         );
         assert_eq!(
             pump.bus.reg(regs::SYS_CTRL) & regs::SYS_CTRL_EN_1TO1,
             regs::SYS_CTRL_EN_1TO1
+        );
+    }
+
+    #[test]
+    fn set_charging_5v_reports_stage_three_when_nothing_works() {
+        let bus = MockPumpBus::new();
+        let mut pump = Pump::open(bus, PumpConfig::default()).unwrap();
+        pump.configure().unwrap();
+        set_vin_uv(&mut pump, 5_000_000);
+        pump.bus.push_fault(crate::testkit::Fault::RefuseSysSts {
+            value: regs::SYS_STS_STANDBY | 0x20,
+        });
+        let err = pump.set_charging(true, &mut || {}).unwrap_err();
+        assert!(
+            matches!(err, PumpError::ModeNotReached { .. }),
+            "отказ должен называть режим, а не шину: {err:?}"
+        );
+        assert_eq!(
+            pump.bypass_stage(),
+            3,
+            "последней попыткой была маска отказов"
+        );
+        // Маска не помогла — на узле её быть не должно: выключенные защиты
+        // после неудачной попытки опаснее самого отказа режима.
+        assert_eq!(
+            pump.bus.reg(regs::FAULT_CTRL) & regs::FAULT_CTRL_MASK_5V_BYPASS,
+            0,
+            "неудачная стадия 3 обязана вернуть FAULT_CTRL как было"
+        );
+    }
+
+    #[test]
+    fn set_charging_5v_does_not_reset_twice_on_one_input() {
+        let bus = MockPumpBus::new();
+        let mut pump = Pump::open(bus, PumpConfig::default()).unwrap();
+        pump.configure().unwrap();
+        set_vin_uv(&mut pump, 5_000_000);
+        pump.bus.push_fault(crate::testkit::Fault::RefuseSysSts {
+            value: regs::SYS_STS_STANDBY | 0x20,
+        });
+        let mut por_delays = 0_u32;
+        assert!(pump.set_charging(true, &mut || por_delays += 1).is_err());
+        assert_eq!(por_delays, 1, "первый заход имеет право на POR");
+        assert!(pump.por_spent());
+
+        // Тот же вход: второй POR запрещён — иначе драйвер дёргает заряд каждый
+        // тик телеметрии и стирает законно защёлкнутое состояние.
+        let _ = pump.set_charging(true, &mut || por_delays += 1);
+        assert_eq!(por_delays, 1, "повторный POR на том же Vin запрещён");
+
+        // Вход сменился в пределах 5-вольтового окна (другой блок): бюджет POR
+        // открывается заново. Смена 5 В → 9 В бюджета не касается — там 1:1
+        // вообще не запрашивается.
+        set_vin_uv(&mut pump, 5_500_000);
+        let _ = pump.set_charging(true, &mut || por_delays += 1);
+        assert_eq!(por_delays, 2, "новый вход — новый POR-бюджет");
+    }
+
+    #[test]
+    fn charging_off_opens_a_fresh_por_budget() {
+        let bus = MockPumpBus::new();
+        let mut pump = Pump::open(bus, PumpConfig::default()).unwrap();
+        pump.configure().unwrap();
+        set_vin_uv(&mut pump, 5_000_000);
+        pump.bus.push_fault(crate::testkit::Fault::RefuseSysSts {
+            value: regs::SYS_STS_STANDBY | 0x20,
+        });
+        let mut por_delays = 0_u32;
+        assert!(pump.set_charging(true, &mut || por_delays += 1).is_err());
+        assert!(pump.por_spent());
+
+        let _ = pump.set_charging(false, &mut || por_delays += 1);
+        assert!(
+            !pump.por_spent(),
+            "выключение заряда размыкает узел: бюджет POR сбрасывается"
         );
     }
 
@@ -1574,7 +1769,10 @@ mod tests {
         let mut pump = Pump::open(bus, PumpConfig::default()).unwrap();
         pump.configure().unwrap();
         set_vin_uv(&mut pump, 9_000_000);
-        assert_eq!(pump.set_charging(true, &mut || {}).unwrap(), OpMode::Switching);
+        assert_eq!(
+            pump.set_charging(true, &mut || {}).unwrap(),
+            OpMode::Switching
+        );
         assert_eq!(
             pump.bus.reg(regs::FAULT_CTRL) & regs::FAULT_CTRL_DISABLE_VIN_OV,
             regs::FAULT_CTRL_DISABLE_VIN_OV,
@@ -1656,9 +1854,11 @@ mod tests {
         pump.configure().unwrap();
         set_vin_uv(&mut pump, 9_600_000);
         set_vbat_uv(&mut pump, 4_520_000);
-        pump.bus
-            .set_reg(regs::FAULT1_STS, regs::FAULT1_VBAT_OV);
-        assert_eq!(pump.set_charging(true, &mut || {}).unwrap(), OpMode::Switching);
+        pump.bus.set_reg(regs::FAULT1_STS, regs::FAULT1_VBAT_OV);
+        assert_eq!(
+            pump.set_charging(true, &mut || {}).unwrap(),
+            OpMode::Switching
+        );
         assert_eq!(
             pump.bus.reg(regs::FAULT_CTRL) & regs::FAULT_CTRL_DISABLE_VBAT_OV,
             regs::FAULT_CTRL_DISABLE_VBAT_OV,
