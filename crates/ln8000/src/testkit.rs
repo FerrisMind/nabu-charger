@@ -176,6 +176,17 @@ impl MockPumpBus {
         };
         self.set_reg(regs::SYS_STS, sys_sts);
     }
+
+    fn clear_stuck_sys_sts_faults(&mut self) {
+        for index in 0..self.fault_count {
+            if let Some(slot) = self.faults.get_mut(index) {
+                if matches!(slot.fault, Some(Fault::StuckSysSts { .. })) {
+                    slot.fault = None;
+                    slot.remaining = 0;
+                }
+            }
+        }
+    }
 }
 
 impl RegisterBus for MockPumpBus {
@@ -214,6 +225,13 @@ impl RegisterBus for MockPumpBus {
         self.set_reg(addr, value);
         if addr == regs::SYS_CTRL {
             self.apply_sys_ctrl(value);
+        }
+        // Soft-reset (LION unlock + BC_OP_2 bit0) clears latched mode refusal,
+        // matching live LN8000: FAULT1 VFAULTS drop and SYS_CTRL is honoured again.
+        if addr == regs::BC_OP_2 && value & (1 << 0) != 0 {
+            self.clear_stuck_sys_sts_faults();
+            self.set_reg(regs::FAULT1_STS, 0);
+            self.set_reg(regs::SYS_STS, regs::SYS_STS_STANDBY);
         }
         Ok(())
     }

@@ -69,6 +69,23 @@ pub const TIMER_CTRL: RegAddr = 0x26;
 /// мусорной — а по ней принимается решение о защите. Эталонный драйвер делает
 /// так же: ставит бит, читает пару, снимает бит.
 pub const TIMER_CTRL_PAUSE_ADC: u8 = 1 << 1;
+/// Pulse bit to clear latched fault/status (Android `ln8000_check_status`).
+pub const TIMER_CTRL_CLEAR_LATCH: u8 = 1 << 2;
+/// `FAULT_CTRL` bit: disable hardware `VIN_OV` (needed for QC 9–12 V bus).
+pub const FAULT_CTRL_DISABLE_VIN_OV: u8 = 1 << 2;
+/// `FAULT_CTRL` bit: disable hardware `VAC_UV` (`LN8000_BIT_DISABLE_VAC_UV`).
+/// Required for saggy 5 V bricks (TA200) where Vin dips near Vbat under load.
+pub const FAULT_CTRL_DISABLE_VAC_UV: u8 = 1 << 3;
+/// `FAULT_CTRL` bit: disable hardware `VAC_OV` (`LN8000_BIT_DISABLE_VAC_OV`).
+pub const FAULT_CTRL_DISABLE_VAC_OV: u8 = 1 << 4;
+/// `FAULT_CTRL` bit: disable hardware `VBAT_OV` (`LN8000_BIT_DISABLE_VBAT_OV`).
+/// Soft-mask near float so a latched OV does not block `volt_qual` / mode entry.
+pub const FAULT_CTRL_DISABLE_VBAT_OV: u8 = 1 << 5;
+/// Mask used before 5 V / TA200-class bypass: UV/OV that latch `FAULT1=0x21`.
+pub const FAULT_CTRL_MASK_5V_BYPASS: u8 = FAULT_CTRL_DISABLE_VIN_OV
+    | FAULT_CTRL_DISABLE_VAC_UV
+    | FAULT_CTRL_DISABLE_VAC_OV
+    | FAULT_CTRL_DISABLE_VBAT_OV;
 
 /// Пороги.
 pub const THRESHOLD_CTRL: RegAddr = 0x27;

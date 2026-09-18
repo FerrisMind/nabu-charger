@@ -138,10 +138,10 @@ impl AdcChannel {
             Self::Vout | Self::TsBus => (high & 0xFF) * 4 + (low & 0xC0) / 64,
         };
         match self {
-            Self::Vout => code * 5_000,
             Self::Vin => code * 16_000,
-            // У батареи смещения нет: код и есть напряжение шагами по 5 мВ.
-            Self::Vbat => code * 5_000,
+            // Android `ln8000_convert_adc_code`: `adc_raw * LN8000_ADC_VBAT_STEP`.
+            // `LN8000_ADC_VBAT_MIN` (1 V) is a validity threshold, not an additive offset.
+            Self::Vout | Self::Vbat => code * 5_000,
             Self::Vac => (code + 5) * 16_000,
             Self::Iin => code * 4_890,
             // Как в эталоне: (935 - raw) * 4350 / 1000, с ограничением [-250; 1600].
@@ -273,6 +273,11 @@ mod tests {
         assert_eq!(AdcChannel::Vbat.decode(0x0000), 0);
         assert_eq!(AdcChannel::Vbat.decode(0x0064), 500_000);
         assert_eq!(AdcChannel::Vbat.decode(107 * 256 + 33), 4_005_000);
+        // Live nabu raw pairs (sts[0]=ADC06, sts[1]=ADC07), Android VBAT packing.
+        // Switching artifact: 0xBC/0x5B → code 956 → 4780 mV (≈ Vin/2).
+        assert_eq!(AdcChannel::Vbat.decode(0x5B * 256 + 0xBC), 4_780_000);
+        // Standby pack: 0x7E/0x7B → code 894 → 4470 mV (Nabu float).
+        assert_eq!(AdcChannel::Vbat.decode(0x7B * 256 + 0x7E), 4_470_000);
         assert_eq!(AdcChannel::Iin.decode(0x0064), 489_000);
         assert_eq!(AdcChannel::Vin.decode(34 * 256 + 168), 8_864_000);
         assert_eq!(AdcChannel::Vac.decode(168 * 256 + 156), 8_896_000);

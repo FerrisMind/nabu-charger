@@ -25,8 +25,9 @@
 //! ```
 
 use crate::encoding::{
-    AdcHibernateDelay, AdcMode, OpMode, WatchdogPeriod, encode_iin_limit, encode_ntc_alarm,
-    encode_vac_ovp, encode_vbat_float,
+    AdcHibernateDelay, AdcMode, OpMode, WatchdogPeriod, NABU_VBAT_FLOAT_UV, VBAT_TAPER_IIN_UA,
+    bypass_allowed_by_vin, charge_mode, decode_iin_limit, encode_iin_limit, encode_ntc_alarm,
+    encode_vac_ovp, encode_vbat_float, soft_float_for_vbat, vbat_near_float_with_vin,
 };
 use crate::error::{BusError, PumpError};
 use crate::regs;
@@ -86,7 +87,8 @@ impl Default for PumpConfig {
             // Значения по умолчанию — из `ln8000_charger.h`
             // (`LN8000_BAT_OVP_DEFAULT`, `LN8000_BUS_OVP_DEFAULT`,
             // `LN8000_IIN_CFG_DEFAULT`, `LN8000_NTC_ALARM_CFG_DEFAULT`).
-            vbat_float_uv: 4_440_000,
+            // Android nabu: bat_ovp 4560 mV → V_FLOAT ≈ 4470 mV (ovp = float×1.02).
+            vbat_float_uv: NABU_VBAT_FLOAT_UV,
             vac_ovp_uv: 9_500_000,
             iin_limit_ua: 2_000_000,
             ntc_alarm_cfg: regs::NTC_ALARM_DEFAULT,
@@ -230,13 +232,24 @@ impl PumpConfig {
     ///
     /// Пороги соответствуют `BUS_OVP_FOR_QC`, `BUS_OCP_FOR_QC3P5_CLASS_B`
     /// из `ln8000_charger.h`.
+    ///
+    /// Android DTS disables LN8000 VFLOAT/IIN loops because SMB does CV. Under
+    /// Windows the PEIC path owns charging — keep VFLOAT + IIN regulation on so
+    /// VBAT cannot idle at `Vin/2` (~4.78 V) and starve Iin.
     #[must_use]
     pub fn for_qc35_class_b() -> Self {
         Self {
             vac_ovp_uv: 13_000_000,
             iin_limit_ua: 3_500_000 - 700_000,
-            // Базовая конфигурация для nabu — как в Device Tree планшета.
-            ..Self::for_nabu_dts()
+            vbat_reg_disabled: false,
+            iin_reg_disabled: false,
+            // Thermal / OCP monitors still follow nabu DTS (SMB-era defaults).
+            iin_ocp_disabled: true,
+            tdie_prot_disabled: true,
+            tdie_reg_disabled: true,
+            tbus_mon_disabled: true,
+            tbat_mon_disabled: true,
+            ..Self::default()
         }
     }
 
@@ -554,10 +567,22 @@ impl<T: RegisterBus> Pump<T> {
 
     /// Включает режим 1:1 (bypass) — например, для зарядки от 5 В.
     ///
+    /// Сам режим допустим только в окне обхода: `EN_1TO1` подаёт вход прямо на
+    /// батарею, поэтому при `Vin >= 8 В` (и ниже 4,2 В) вызов отклоняется с
+    /// [`PumpError::BypassNeedsFiveVoltVin`] — проверка внутри, чтобы ни один
+    /// вызывающий не мог включить 1:1 на повышенном входе.
+    ///
     /// # Errors
     ///
-    /// Пробрасывает ошибки шины.
+    /// * [`PumpError::BypassNeedsFiveVoltVin`] — Vin вне окна обхода.
+    /// * [`PumpError::ModeNotReached`] — чип не подтвердил режим.
+    /// * [`PumpError::Bus`] / [`PumpError::NotOpen`] — шина или сессия.
     pub fn enable_bypass(&mut self) -> Result<OpMode, PumpError> {
+        let vin = self.read_adc(AdcChannel::Vin)?;
+        let vbat = u32::try_from(self.read_adc(AdcChannel::Vbat).unwrap_or(0).max(0)).unwrap_or(0);
+        if !bypass_allowed_by_vin(vin, vbat) {
+            return Err(PumpError::BypassNeedsFiveVoltVin { vin_uv: vin });
+        }
         self.set_op_mode(OpMode::Bypass)?;
         let status = self.settle_and_read_status()?;
         // Проверяем так же, как для режима 2:1: молчаливый отказ чипа нельзя
@@ -569,7 +594,8 @@ impl<T: RegisterBus> Pump<T> {
                 raw_status: status.sys_sts,
             });
         }
-        self.state = PumpState::Switching;
+        // 1:1 — это не 2:1: состояние сессии должно называться честно.
+        self.state = PumpState::Configured;
         Ok(status.op_mode)
     }
 
@@ -603,38 +629,48 @@ impl<T: RegisterBus> Pump<T> {
     /// Эталон после записи режима ждёт 10 мс (`msleep(10)`) и только затем
     /// читает `SYS_STS`. Пустой цикл ожидания в ядре нам недоступен, поэтому
     /// перечитываем состояние несколько раз: один обмен по шине занимает
-    /// 8-46 мс, что заведомо больше паузы эталона. Заодно это даёт
-    /// доказательство, что чип действительно сменил режим, а не что мы
-    /// прочитали старое значение сразу после записи.
+    /// 8-46 мс, что заведомо больше паузы эталона.
     ///
     /// # Errors
     ///
     /// Пробрасывает ошибки шины.
     fn settle_and_read_status(&mut self) -> Result<Status, PumpError> {
         let mut last = self.status()?;
-        for _ in 0..2 {
-            if last.op_mode != OpMode::Unknown {
+        for _ in 0..3 {
+            last = self.status()?;
+            if last.op_mode != OpMode::Unknown && last.op_mode != OpMode::Standby {
                 break;
             }
-            last = self.status()?;
         }
         Ok(last)
     }
 
-    /// Explicit charge start/stop, mirroring the reference
-    /// `psy_chg_set_charging_enable`.
+    /// Explicit charge start/stop, mirroring Android `psy_chg_set_charging_enable`
+    /// plus Vin/Vbat-aware mode selection (`cp_qc30` style).
     ///
-    /// The reference does three things in this order: disable reverse-current
-    /// protection, request the op mode (switching to charge, standby to stop),
-    /// then read the mode back. It reports what the chip answered instead of
-    /// assuming success - the pump legitimately refuses switching when its
-    /// input is out of range, and that answer is the diagnostic we want.
+    /// Order: disable RCP → near-float soft OV/float/taper → clear latched faults
+    /// → pick mode from Vin **and Vbat** → request mode → settle/read back.
+    /// 2:1 needs `Vin >= 2*Vbat + 250 mV` (and `>= 8 V`); it is never replaced by
+    /// 1:1 bypass at elevated Vin — that would put 8 V+ across the battery.
+    /// When Vin is elevated but short of `2*Vbat + 250 mV`, no mode is requested
+    /// (standby; the caller retries under its own cooldown, not every tick).
     ///
     /// # Errors
     ///
     /// * [`PumpError::NotOpen`] - помпа не открыта.
     /// * [`PumpError::Bus`] - сбой обмена.
-    pub fn set_charging(&mut self, on: bool) -> Result<OpMode, PumpError> {
+    /// * [`PumpError::ModeNotReached`] - chip refused the Vin-appropriate mode.
+    ///
+    /// `post_reset_delay` обязателен: 5-вольтовый путь восстановления делает
+    /// `soft_reset`, после которого POR запрещает любой обмен по I²C до
+    /// [`regs::SOFT_RESET_DELAY_MS`]. Хост-тесты передают пустое замыкание,
+    /// KMDF — `KeDelayExecutionThread`; забыть задержку нельзя, потому что без
+    /// параметра функция не вызывается.
+    pub fn set_charging(
+        &mut self,
+        on: bool,
+        post_reset_delay: &mut dyn FnMut(),
+    ) -> Result<OpMode, PumpError> {
         // Шаг эталона: перед стартом заряда обратная защита выключается.
         self.update(regs::SYS_CTRL, 1 << 2, 0, "disable_reverse_current")?;
         if !on {
@@ -644,12 +680,58 @@ impl<T: RegisterBus> Pump<T> {
             self.state = PumpState::Configured;
             return Ok(status.op_mode);
         }
-        // Запуск заряда: сначала двухкаскадный режим 2:1, при отказе — сквозной 1:1.
-        // Сквозной режим нужен для источника около пяти вольт: двухкаскадному
-        // требуется не менее примерно 8,2 В, и там он недостижим. Эталон включает
-        // сквозной режим тем же полем SYS_CTRL, поэтому отказ 2:1 — не повод
-        // оставлять чип без рабочего режима.
-        match self.enable_switching_or_bypass() {
+
+        let vin = self.read_adc(AdcChannel::Vin).unwrap_or(0);
+        let vbat = u32::try_from(self.read_adc(AdcChannel::Vbat).unwrap_or(0).max(0)).unwrap_or(0);
+        let Some(want) = charge_mode(vin, vbat) else {
+            let _ = self.set_op_mode(OpMode::Standby);
+            return Err(PumpError::ModeNotReached {
+                wanted: OpMode::Standby.code(),
+                raw_status: 0,
+            });
+        };
+
+        // Watchdog status bit also blocks mode until cleared; force WDT off when
+        // the profile disabled it (registry WatchdogEnabled=0).
+        if !self.config.watchdog_enabled {
+            let _ = self.update(regs::TIMER_CTRL, 1 << 7, 0, "watchdog_force_off");
+        }
+
+        // Near-float / FAULT1_VBAT_OV: Android cp_qc30 tapers and hands off to
+        // SMB; on Windows we still need mode 3. Soft-raise V_FLOAT slightly,
+        // mask VBAT_OV (like VIN_OV for QC), clear latch, taper IIN. Never use
+        // 1:1 bypass at elevated Vin even if the battery is near full.
+        self.prepare_near_float_for_charge();
+
+        // Live nabu: FAULT1 VIN_OV latches at QC ~12 V and blocks mode change
+        // (volt_qual). Clear latch; mask VIN_OV for the elevated 2:1 path only.
+        // TA200/5V: FAULT1=0x21 (VFAULTS) blocks bypass — FAULT_CTRL=0x3C alone
+        // leaves SYS_STS=0x22; soft_reset then SYS_CTRL=0x01 → SYS_STS=0x28
+        // (live 603 soak). Mask first; soft-reset retry only on the 5 V path.
+        let _ = self.clear_latched_faults();
+        if want == OpMode::Switching {
+            let _ = self.update(
+                regs::FAULT_CTRL,
+                regs::FAULT_CTRL_DISABLE_VIN_OV,
+                regs::FAULT_CTRL_DISABLE_VIN_OV,
+                "disable_vin_ov_qc",
+            );
+        } else if want == OpMode::Bypass {
+            let _ = self.arm_5v_bypass_fault_mask();
+        }
+
+        let result = match want {
+            OpMode::Switching => self.enable_switching(),
+            OpMode::Bypass => self
+                .enable_bypass()
+                .or_else(|_| self.recover_5v_bypass(post_reset_delay)),
+            OpMode::Standby | OpMode::Unknown => Err(PumpError::ModeNotReached {
+                wanted: want.code(),
+                raw_status: 0,
+            }),
+        };
+
+        match result {
             Ok(mode) => {
                 self.op_mode = mode;
                 self.state = match mode {
@@ -659,12 +741,152 @@ impl<T: RegisterBus> Pump<T> {
                 Ok(mode)
             }
             Err(err) => {
-                // Ни один режим не подтверждён: уводим чип в standby, иначе он
-                // останется в неопределённом состоянии.
-                let _ = self.set_op_mode(OpMode::Standby);
+                // Do not force standby after a partial 5 V bypass arm — that
+                // undoes SYS_CTRL=0x01 before the chip settles (live TA200).
+                if want != OpMode::Bypass {
+                    let _ = self.set_op_mode(OpMode::Standby);
+                }
                 Err(err)
             }
         }
+    }
+
+    /// Mask UV/OV that latch `FAULT1=0x21` on saggy 5 V bricks (TA200).
+    fn arm_5v_bypass_fault_mask(&mut self) -> Result<(), PumpError> {
+        self.update(
+            regs::FAULT_CTRL,
+            regs::FAULT_CTRL_MASK_5V_BYPASS,
+            regs::FAULT_CTRL_MASK_5V_BYPASS,
+            "mask_5v_bypass_faults",
+        )?;
+        self.clear_latched_faults()
+    }
+
+    /// Soft-reset recovery for TA200-class 5 V bypass.
+    ///
+    /// Live sequence: `soft_reset` → **caller delay** → `configure` → remask →
+    /// `SYS_CTRL=0x01`. Never used at elevated Vin (would drop the QC latch).
+    ///
+    /// `post_reset_delay` must sleep ≥ [`regs::SOFT_RESET_DELAY_MS`] before any
+    /// further I²C (POR). It comes from the caller of [`Self::set_charging`]:
+    /// host tests pass a no-op, KMDF sleeps (`KeDelayExecutionThread`); without a
+    /// real delay `configure()` right after `soft_reset` hangs the chip.
+    fn recover_5v_bypass(
+        &mut self,
+        post_reset_delay: &mut dyn FnMut(),
+    ) -> Result<OpMode, PumpError> {
+        let _ = self.soft_reset();
+        post_reset_delay();
+        let _ = self.configure();
+        let vin = self.read_adc(AdcChannel::Vin).unwrap_or(0);
+        let vbat = u32::try_from(self.read_adc(AdcChannel::Vbat).unwrap_or(0).max(0)).unwrap_or(0);
+        if charge_mode(vin, vbat) != Some(OpMode::Bypass) {
+            return Err(PumpError::ModeNotReached {
+                wanted: OpMode::Bypass.code(),
+                raw_status: 0,
+            });
+        }
+        self.prepare_near_float_for_charge();
+        let _ = self.arm_5v_bypass_fault_mask();
+        // Absolute write matches the working userspace FORCE_BYPASS path.
+        self.write(regs::SYS_CTRL, regs::SYS_CTRL_EN_1TO1)?;
+        let status = self.settle_and_read_status()?;
+        if status.op_mode != OpMode::Bypass {
+            return Err(PumpError::ModeNotReached {
+                wanted: OpMode::Bypass.code(),
+                raw_status: status.sys_sts,
+            });
+        }
+        self.state = PumpState::Configured;
+        Ok(status.op_mode)
+    }
+
+    /// Намеренная уставка тапера у верха заряда, мкА.
+    ///
+    /// `Some(min(config.iin_limit_ua, VBAT_TAPER_IIN_UA))`, пока Vbat в полосе
+    /// тапера, иначе `None`. Условие то же, что у
+    /// `prepare_near_float_for_charge`: защёлкнутый `VBAT_OV` и отсев
+    /// артефакта `VBAT ≈ Vin/2` — здесь оно определено **один раз**, чтобы тапер
+    /// и защита не разошлись в трактовке.
+    ///
+    /// Нужна защите: её возврат к профилю (`guard::evaluate`) обязан
+    /// останавливаться на этой уставке, иначе он отменяет намеренное снижение
+    /// тока в окне, где полосы тапера и возврата пересекаются.
+    #[must_use]
+    pub fn taper_setpoint_ua(&self, vbat_uv: u32, vin_uv: u32, ov_latched: bool) -> Option<u32> {
+        if !vbat_near_float_with_vin(vbat_uv, self.config.vbat_float_uv, ov_latched, vin_uv) {
+            return None;
+        }
+        Some(self.config.iin_limit_ua.min(VBAT_TAPER_IIN_UA))
+    }
+
+    /// Soft float / `VBAT_OV` / taper when Vbat is near the Nabu float band.
+    ///
+    /// Matches live recovery (`V_FLOAT` ~4.50 V + latch clear) and Android
+    /// taper-at-`bat_volt_lmt−100`. Does not permanently shrink the profile
+    /// `iin_limit_ua` — only writes `IIN_CTRL` for this attempt.
+    fn prepare_near_float_for_charge(&mut self) {
+        let vbat = self.read_adc(AdcChannel::Vbat).unwrap_or(0);
+        let vbat_uv = u32::try_from(vbat.max(0)).unwrap_or(0);
+        let vin = self.read_adc(AdcChannel::Vin).unwrap_or(0);
+        let vin_uv = u32::try_from(vin.max(0)).unwrap_or(0);
+        let fault1 = self.read(regs::FAULT1_STS).unwrap_or(0);
+        let ov_latched = fault1 & regs::FAULT1_VBAT_OV != 0;
+        let float_uv = self.config.vbat_float_uv;
+        // Reject Vin/2 rail artifact (live: 4780 mV @ Vin 9.6 V while pack ~4.47 V).
+        let Some(tapered) = self.taper_setpoint_ua(vbat_uv, vin_uv, ov_latched) else {
+            return;
+        };
+
+        // Soft OV mask + float headroom only when OV is latched or Vbat is at
+        // the float ceiling (not merely in the early taper band).
+        let at_ceiling = ov_latched || vbat_uv.saturating_add(50_000) >= float_uv;
+        if at_ceiling {
+            let want_float = soft_float_for_vbat(float_uv, vbat_uv);
+            if want_float > float_uv {
+                // Write float without permanently raising the configured profile
+                // beyond the soft max — keep session headroom for retries.
+                let code = encode_vbat_float(want_float);
+                let _ = self.write_verified(regs::V_FLOAT_CTRL, code, "vbat_float_soft");
+            }
+            let _ = self.update(
+                regs::FAULT_CTRL,
+                regs::FAULT_CTRL_DISABLE_VBAT_OV,
+                regs::FAULT_CTRL_DISABLE_VBAT_OV,
+                "disable_vbat_ov_near_float",
+            );
+            let _ = self.clear_latched_faults();
+        }
+
+        if tapered < self.config.iin_limit_ua {
+            // Тапер идёт тем же путём записи, что и `set_iin_limit`, но профиль
+            // (`config.iin_limit_ua`) не трогает: это уставка «на один заход»,
+            // и `configure()` обязан вернуть профильный лимит. Кто именно стоит
+            // в регистре, читает [`Self::applied_iin_ua`] — по нему защита решает
+            // срез, иначе «снижение» подняло бы ток с 1,2 А обратно к 2 А.
+            // Потолок возврата защита берёт из [`Self::taper_setpoint_ua`].
+            let _ = self.write_iin_limit(tapered, "iin_taper_near_float");
+        }
+    }
+
+    /// Pulse `TIMER_CTRL` bit 2 to clear latched fault/status (Android).
+    ///
+    /// # Errors
+    ///
+    /// * [`PumpError::NotOpen`] / [`PumpError::Bus`]
+    pub fn clear_latched_faults(&mut self) -> Result<(), PumpError> {
+        self.update(
+            regs::TIMER_CTRL,
+            regs::TIMER_CTRL_CLEAR_LATCH,
+            regs::TIMER_CTRL_CLEAR_LATCH,
+            "latch_clear_set",
+        )?;
+        self.update(
+            regs::TIMER_CTRL,
+            regs::TIMER_CTRL_CLEAR_LATCH,
+            0,
+            "latch_clear_clr",
+        )
     }
 
     /// Переводит устройство в standby.
@@ -704,10 +926,38 @@ impl<T: RegisterBus> Pump<T> {
     /// * [`PumpError::OutOfRange`] — ток меньше [`regs::IIN_MIN_UA`].
     /// * [`PumpError::Bus`] — сбой шины.
     pub fn set_iin_limit(&mut self, iin_ua: u32) -> Result<u8, PumpError> {
-        let code = encode_iin_limit(iin_ua)?;
-        self.update(regs::IIN_CTRL, 0x7F, code, "iin_limit")?;
+        let code = self.write_iin_limit(iin_ua, "iin_limit")?;
         self.config.iin_limit_ua = iin_ua;
         Ok(code)
+    }
+
+    /// Записывает уставку входного тока в `IIN_CTRL`, не трогая профиль.
+    ///
+    /// Единая точка записи: так уставку ставят и [`Self::set_iin_limit`], и тапер
+    /// у верха заряда. Прочитанный обратно регистр — источник истины о том, что
+    /// реально стоит в чипе (см. [`Self::applied_iin_ua`]).
+    ///
+    /// # Errors
+    ///
+    /// * [`PumpError::OutOfRange`] — ток меньше [`regs::IIN_MIN_UA`].
+    /// * [`PumpError::Bus`] — сбой шины.
+    fn write_iin_limit(&mut self, iin_ua: u32, field: &'static str) -> Result<u8, PumpError> {
+        let code = encode_iin_limit(iin_ua)?;
+        self.update(regs::IIN_CTRL, 0x7F, code, field)?;
+        Ok(code)
+    }
+
+    /// Фактически записанная уставка входного тока, мкА.
+    ///
+    /// Читается из регистра, а не из профиля: `config.iin_limit_ua` — это
+    /// «сколько заказано», и тапер у верха заряда пишет мимо него (1,2 А при
+    /// профиле 2,8 А). Решение о срезе обязано опираться на то, что стоит в чипе,
+    /// иначе «снизить до 2 А» поднимет ток с 1,2 А.
+    ///
+    /// `None` — регистр не прочитан: уставка неизвестна, и решать по току нельзя.
+    #[must_use]
+    pub fn applied_iin_ua(&mut self) -> Option<u32> {
+        self.read_register(regs::IIN_CTRL).ok().map(decode_iin_limit)
     }
 
     /// Обновляет целевое напряжение заряда.
@@ -799,7 +1049,12 @@ impl<T: RegisterBus> Pump<T> {
     /// [`PumpError::Bus`] — сбой шины.
     pub fn soft_reset(&mut self) -> Result<(), PumpError> {
         self.write(regs::LION_CTRL, regs::LION_CTRL_UNLOCK)?;
-        self.update(regs::BC_OP_2, 1 << 0, 1 << 0, "soft_reset")?;
+        // Absolute write, no verify/readback: the soft-reset bit self-clears and
+        // the chip PORs. Live nabu: `update`+`verify_writes` hung the I²C
+        // controller mid-read after BC_OP_2 bit0 (IOCTL WRITE_REG / SET_CHARGE
+        // paths). Caller must wait [`regs::SOFT_RESET_DELAY_MS`] then configure.
+        let current = self.read(regs::BC_OP_2).unwrap_or(0);
+        self.write(regs::BC_OP_2, current | (1 << 0))?;
         self.state = PumpState::Probed;
         self.op_mode = OpMode::Unknown;
         Ok(())
@@ -830,6 +1085,10 @@ impl<T: RegisterBus> Pump<T> {
     pub fn write_register(&mut self, addr: u8, value: u8) -> Result<(), PumpError> {
         if self.state == PumpState::Closed {
             return Err(PumpError::NotOpen);
+        }
+        // Soft-reset via diagnostic WR must not verify (same hang as soft_reset).
+        if addr == regs::BC_OP_2 && value & (1 << 0) != 0 {
+            return self.write(addr, value);
         }
         self.write_verified(addr, value, "diagnostic")
     }
@@ -979,6 +1238,8 @@ fn bus_recoverable(err: &BusError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::guard::{evaluate, GuardAction, GuardLimits};
+    use crate::session::TelemetrySample;
     use crate::testkit::{Fault, MockPumpBus};
 
     #[test]
@@ -1014,7 +1275,7 @@ mod tests {
         // Проверяем ключевые значения, которые обязан записать драйвер.
         assert_eq!(
             pump.bus.reg(regs::V_FLOAT_CTRL),
-            encode_vbat_float(4_440_000)
+            encode_vbat_float(NABU_VBAT_FLOAT_UV)
         );
         assert_eq!(pump.bus.reg(regs::IIN_CTRL) & 0x7F, 40); // 2 А / 50 мА
         assert_eq!(
@@ -1064,6 +1325,7 @@ mod tests {
         let bus = MockPumpBus::new();
         let mut pump = Pump::open(bus, PumpConfig::default()).unwrap();
         pump.configure().unwrap();
+        set_vin_uv(&mut pump, 5_000_000);
         let mode = pump.enable_bypass().unwrap();
         assert_eq!(mode, OpMode::Bypass);
         assert_eq!(pump.bus.reg(regs::SYS_CTRL) & 1, 1);
@@ -1142,10 +1404,12 @@ mod tests {
     }
 
     #[test]
-    fn switching_or_bypass_falls_back_when_chip_refuses_fast_mode() {
+    fn switching_or_bypass_falls_back_only_on_the_five_volt_side() {
+        // 5 В: 2:1 не подтверждается, но 1:1 допустим — режим всё равно включается.
         let bus = MockPumpBus::new();
         let mut pump = Pump::open(bus, PumpConfig::default()).unwrap();
         pump.configure().unwrap();
+        set_vin_uv(&mut pump, 5_000_000);
         // Чип «не слышит» команду 2:1 и всегда отвечает, что он в bypass.
         pump.bus.push_fault(crate::testkit::Fault::StuckSysSts {
             value: regs::SYS_STS_BYPASS_ENABLED,
@@ -1153,12 +1417,30 @@ mod tests {
         assert_eq!(
             pump.enable_switching_or_bypass().unwrap(),
             OpMode::Bypass,
-            "при отказе 2:1 обязан включиться bypass"
+            "на 5 В при отказе 2:1 обязан включиться bypass"
         );
         assert_eq!(
             pump.bus.reg(regs::SYS_CTRL) & regs::SYS_CTRL_EN_1TO1,
             regs::SYS_CTRL_EN_1TO1,
             "в SYS_CTRL должен стоять бит 1:1"
+        );
+
+        // Повышенный Vin: отступление в 1:1 запрещено (это 9 В на батарею),
+        // возвращается ошибка исходного режима, бит 1:1 не выставляется.
+        let bus = MockPumpBus::new();
+        let mut pump = Pump::open(bus, PumpConfig::default()).unwrap();
+        pump.configure().unwrap();
+        set_vin_uv(&mut pump, 9_000_000);
+        set_vbat_uv(&mut pump, 4_275_000);
+        pump.bus.push_fault(crate::testkit::Fault::StuckSysSts {
+            value: regs::SYS_STS_BYPASS_ENABLED,
+        });
+        let err = pump.enable_switching_or_bypass().unwrap_err();
+        assert!(matches!(err, PumpError::ModeNotReached { .. }), "{err:?}");
+        assert_eq!(
+            pump.bus.reg(regs::SYS_CTRL) & regs::SYS_CTRL_EN_1TO1,
+            0,
+            "1:1 при 9 В — перенапряжение на батарее"
         );
     }
 
@@ -1177,6 +1459,319 @@ mod tests {
         );
         // После такого отказа драйвер уводит чип в standby: проверим, что это возможно.
         assert!(pump.standby().is_ok(), "standby должен подтверждаться");
+    }
+
+    /// Pack Vin ADC registers so `read_adc(Vin)` returns approximately `uv`.
+    fn set_vin_uv(pump: &mut Pump<MockPumpBus>, uv: i32) {
+        let units = u16::try_from((uv / 16_000).clamp(0, 1023)).unwrap_or(0);
+        let high = u8::try_from((units / 16) & 0x3F).unwrap_or(0);
+        let low = u8::try_from((units % 16) * 16).unwrap_or(0);
+        let register = AdcChannel::Vin.register();
+        pump.bus_mut().set_reg(register, low);
+        pump.bus_mut().set_reg(register + 1, high);
+    }
+
+    fn set_vbat_uv(pump: &mut Pump<MockPumpBus>, uv: i32) {
+        let units = u16::try_from((uv / 5_000).clamp(0, 1023)).unwrap_or(0);
+        let high = u8::try_from((units / 256) & 0x03).unwrap_or(0);
+        let low = u8::try_from(units % 256).unwrap_or(0);
+        let register = AdcChannel::Vbat.register();
+        pump.bus_mut().set_reg(register, low);
+        pump.bus_mut().set_reg(register + 1, high);
+    }
+
+    #[test]
+    fn set_charging_uses_bypass_at_five_volts() {
+        let bus = MockPumpBus::new();
+        let mut pump = Pump::open(bus, PumpConfig::default()).unwrap();
+        pump.configure().unwrap();
+        set_vin_uv(&mut pump, 5_000_000);
+        assert_eq!(pump.set_charging(true, &mut || {}).unwrap(), OpMode::Bypass);
+    }
+
+    #[test]
+    fn set_charging_5v_soft_resets_when_bypass_blocked() {
+        let bus = MockPumpBus::new();
+        let mut pump = Pump::open(bus, PumpConfig::default()).unwrap();
+        pump.configure().unwrap();
+        set_vin_uv(&mut pump, 5_000_000);
+        pump.bus.set_reg(regs::FAULT1_STS, 0x21);
+        pump.bus.push_fault(crate::testkit::Fault::StuckSysSts {
+            value: regs::SYS_STS_STANDBY | 0x20,
+        });
+        let mut por_delays = 0_u32;
+        assert_eq!(
+            pump.set_charging(true, &mut || por_delays += 1).unwrap(),
+            OpMode::Bypass
+        );
+        assert_eq!(
+            por_delays, 1,
+            "5 V recovery обязан выдержать POR после soft_reset"
+        );
+        assert_eq!(
+            pump.bus.reg(regs::FAULT_CTRL) & regs::FAULT_CTRL_MASK_5V_BYPASS,
+            regs::FAULT_CTRL_MASK_5V_BYPASS,
+            "5 V recovery must keep FAULT_CTRL bypass mask"
+        );
+        assert_eq!(
+            pump.bus.reg(regs::SYS_CTRL) & regs::SYS_CTRL_EN_1TO1,
+            regs::SYS_CTRL_EN_1TO1
+        );
+    }
+
+    #[test]
+    fn set_charging_five_volt_path_does_not_wait_without_soft_reset() {
+        let bus = MockPumpBus::new();
+        let mut pump = Pump::open(bus, PumpConfig::default()).unwrap();
+        pump.configure().unwrap();
+        set_vin_uv(&mut pump, 5_000_000);
+        let mut por_delays = 0_u32;
+        assert_eq!(
+            pump.set_charging(true, &mut || por_delays += 1).unwrap(),
+            OpMode::Bypass
+        );
+        assert_eq!(por_delays, 0, "без soft_reset пауза POR не нужна");
+    }
+
+    #[test]
+    fn enable_bypass_refuses_elevated_vin() {
+        let bus = MockPumpBus::new();
+        let mut pump = Pump::open(bus, PumpConfig::default()).unwrap();
+        pump.configure().unwrap();
+        // F1/F2: единый гейт внутри enable_bypass — 9 В на батарею недопустимы.
+        set_vin_uv(&mut pump, 9_000_000);
+        set_vbat_uv(&mut pump, 4_275_000);
+        let err = pump.enable_bypass().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                PumpError::BypassNeedsFiveVoltVin { vin_uv }
+                    if vin_uv >= crate::encoding::SWITCHING_MIN_VIN_UV
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            pump.bus.reg(regs::SYS_CTRL) & regs::SYS_CTRL_EN_1TO1,
+            0,
+            "1:1 bit must stay clear at 9 V"
+        );
+        // То же на границе 2:1 и на 12 В.
+        for vin in [8_000_000, 12_000_000] {
+            set_vin_uv(&mut pump, vin);
+            assert!(matches!(
+                pump.enable_bypass().unwrap_err(),
+                PumpError::BypassNeedsFiveVoltVin { .. }
+            ));
+        }
+        // В окне обхода режим по-прежнему включается.
+        set_vin_uv(&mut pump, 5_000_000);
+        assert_eq!(pump.enable_bypass().unwrap(), OpMode::Bypass);
+    }
+
+    #[test]
+    fn set_charging_uses_switching_at_nine_volts() {
+        let bus = MockPumpBus::new();
+        let mut pump = Pump::open(bus, PumpConfig::default()).unwrap();
+        pump.configure().unwrap();
+        set_vin_uv(&mut pump, 9_000_000);
+        assert_eq!(pump.set_charging(true, &mut || {}).unwrap(), OpMode::Switching);
+        assert_eq!(
+            pump.bus.reg(regs::FAULT_CTRL) & regs::FAULT_CTRL_DISABLE_VIN_OV,
+            regs::FAULT_CTRL_DISABLE_VIN_OV,
+            "elevated Vin must mask VIN_OV"
+        );
+    }
+
+    #[test]
+    fn set_charging_elevated_vin_without_headroom_stays_in_standby() {
+        let bus = MockPumpBus::new();
+        let mut pump = Pump::open(bus, PumpConfig::default()).unwrap();
+        pump.configure().unwrap();
+        // Живой случай nabu: PD-блок 8,416 В при батарее 4,275 В.
+        // 2:1 требует >= 2*4,275 + 0,25 = 8,8 В и физически не тянет.
+        set_vin_uv(&mut pump, 8_416_000);
+        set_vbat_uv(&mut pump, 4_275_000);
+        let err = pump.set_charging(true, &mut || {}).unwrap_err();
+        assert!(
+            matches!(err, PumpError::ModeNotReached { .. }),
+            "нет запаса по напряжению — режим не запрашивается: {err:?}"
+        );
+        assert_eq!(
+            pump.bus.reg(regs::SYS_CTRL) & regs::SYS_CTRL_EN_1TO1,
+            0,
+            "1:1 при повышенном Vin подал бы 8+ В на батарею"
+        );
+        assert_eq!(
+            pump.status().unwrap().op_mode,
+            OpMode::Standby,
+            "неудачная попытка обязана оставить чип в standby"
+        );
+    }
+
+    #[test]
+    fn set_charging_never_picks_bypass_at_eight_volts() {
+        let bus = MockPumpBus::new();
+        let mut pump = Pump::open(bus, PumpConfig::default()).unwrap();
+        pump.configure().unwrap();
+        // 8,0 В при заряженной батарее (4,4 В): 2:1 не проходит, bypass запрещён.
+        set_vin_uv(&mut pump, 8_000_000);
+        set_vbat_uv(&mut pump, 4_400_000);
+        let err = pump.set_charging(true, &mut || {}).unwrap_err();
+        assert!(matches!(err, PumpError::ModeNotReached { .. }), "{err:?}");
+        assert_eq!(
+            pump.bus.reg(regs::SYS_CTRL) & regs::SYS_CTRL_EN_1TO1,
+            0,
+            "верхняя граница обхода — SWITCHING_MIN_VIN_UV"
+        );
+        // Ниже 8 В bypass снова разрешён.
+        set_vin_uv(&mut pump, 5_000_000);
+        assert_eq!(pump.set_charging(true, &mut || {}).unwrap(), OpMode::Bypass);
+    }
+
+    #[test]
+    fn set_charging_elevated_vin_does_not_fallback_to_bypass() {
+        let bus = MockPumpBus::new();
+        let mut pump = Pump::open(bus, PumpConfig::default()).unwrap();
+        pump.configure().unwrap();
+        set_vin_uv(&mut pump, 12_000_000);
+        pump.bus.push_fault(crate::testkit::Fault::StuckSysSts {
+            value: regs::SYS_STS_STANDBY,
+        });
+        let err = pump.set_charging(true, &mut || {}).unwrap_err();
+        assert!(
+            matches!(err, PumpError::ModeNotReached { .. }),
+            "must not silently bypass at 12 V: {err:?}"
+        );
+        assert_eq!(
+            pump.bus.reg(regs::SYS_CTRL) & regs::SYS_CTRL_EN_1TO1,
+            0,
+            "1:1 bit must stay clear after failed elevated start"
+        );
+    }
+
+    #[test]
+    fn set_charging_near_float_soft_clears_vbat_ov() {
+        let bus = MockPumpBus::new();
+        let mut pump = Pump::open(bus, PumpConfig::default()).unwrap();
+        pump.configure().unwrap();
+        set_vin_uv(&mut pump, 9_600_000);
+        set_vbat_uv(&mut pump, 4_520_000);
+        pump.bus
+            .set_reg(regs::FAULT1_STS, regs::FAULT1_VBAT_OV);
+        assert_eq!(pump.set_charging(true, &mut || {}).unwrap(), OpMode::Switching);
+        assert_eq!(
+            pump.bus.reg(regs::FAULT_CTRL) & regs::FAULT_CTRL_DISABLE_VBAT_OV,
+            regs::FAULT_CTRL_DISABLE_VBAT_OV,
+            "near-float must soft-mask VBAT_OV"
+        );
+        assert_eq!(
+            pump.bus.reg(regs::FAULT_CTRL) & regs::FAULT_CTRL_DISABLE_VIN_OV,
+            regs::FAULT_CTRL_DISABLE_VIN_OV,
+            "elevated Vin must still mask VIN_OV"
+        );
+        let float_code = pump.bus.reg(regs::V_FLOAT_CTRL);
+        assert!(
+            float_code >= encode_vbat_float(crate::encoding::VBAT_FLOAT_SOFT_MAX_UV),
+            "soft float should reach ~4.50 V headroom, got 0x{float_code:02X}"
+        );
+        let iin = pump.bus.reg(regs::IIN_CTRL) & 0x7F;
+        assert!(
+            iin <= encode_iin_limit(crate::encoding::VBAT_TAPER_IIN_UA).unwrap(),
+            "near-float must taper IIN"
+        );
+    }
+
+    #[test]
+    fn near_float_taper_setpoint_is_the_one_the_guard_sees() {
+        // F10: тапер у верха заряда пишет 1,2 А мимо профиля (2,8 А остаётся в
+        // `config`). Защита обязана видеть именно уставку из `IIN_CTRL`: по
+        // профилю она «снижала» бы ток до полосы 2,0 А, то есть поднимала его
+        // с 1,2 А при 44 °C и 4,46 В.
+        let bus = MockPumpBus::new();
+        let mut pump = Pump::open(bus, PumpConfig::for_qc35_class_b()).unwrap();
+        pump.configure().unwrap();
+        set_vin_uv(&mut pump, 9_600_000);
+        set_vbat_uv(&mut pump, 4_460_000);
+        assert_eq!(
+            pump.set_charging(true, &mut || {}).unwrap(),
+            OpMode::Switching
+        );
+
+        let applied = pump.applied_iin_ua().expect("IIN_CTRL читается");
+        assert_eq!(
+            applied, VBAT_TAPER_IIN_UA,
+            "тапер должен был записать 1,2 А в чип"
+        );
+        assert_eq!(
+            pump.config().iin_limit_ua,
+            PumpConfig::for_qc35_class_b().iin_limit_ua,
+            "профиль тапер не трогает — в `config` по-прежнему 2,8 А"
+        );
+        // Помощник — единый источник истины о намеренной уставке: он обязан
+        // вернуть ровно то, что тапер записал в регистр, и молчать вне полосы.
+        assert_eq!(
+            pump.taper_setpoint_ua(4_460_000, 9_600_000, false),
+            Some(VBAT_TAPER_IIN_UA),
+            "намеренная уставка в полосе тапера — 1,2 А"
+        );
+        assert_eq!(
+            pump.taper_setpoint_ua(4_300_000, 9_600_000, false),
+            None,
+            "вне полосы тапера намеренной уставки нет"
+        );
+        assert_eq!(
+            pump.taper_setpoint_ua(4_800_000, 9_600_000, false),
+            None,
+            "артефакт VBAT ≈ Vin/2 тапером не считается"
+        );
+
+        let mut limits = GuardLimits::standard();
+        limits.iin_profile_ua = pump.config().iin_limit_ua;
+        limits.vbat_reduce_uv = crate::encoding::NABU_VBAT_NON_FFC_UV;
+        // Оба условия среза сразу: 44,0 °C ≥ 43,0 °C и 4,46 В ≥ 4,45 В.
+        let sample = TelemetrySample {
+            ts_ms: 1_000,
+            vbat_uv: 4_460_000,
+            vbus_uv: 9_600_000,
+            iin_ua: 1_200_000,
+            die_temp_dc: 440,
+            op_mode: OpMode::Switching,
+            input_present: true,
+            vbat_valid: true,
+            die_temp_valid: true,
+        };
+        assert_eq!(
+            evaluate(
+                &sample,
+                &limits,
+                pump.applied_iin_ua(),
+                pump.taper_setpoint_ua(sample.vbat_uv, sample.vbus_uv, false)
+            ),
+            GuardAction::None,
+            "1,2 А ниже полосы среза: защита не имеет права поднимать ток"
+        );
+        // Тот же отсчёт, но с уставкой профиля (2,8 А) — обычный срез до полосы.
+        assert_eq!(
+            evaluate(&sample, &limits, Some(2_800_000), None),
+            GuardAction::ReduceCurrent {
+                to_ua: 2_000_000,
+                reason: "die_temp_reduce",
+            }
+        );
+    }
+
+    #[test]
+    fn clear_latched_faults_pulses_timer_bit() {
+        let bus = MockPumpBus::new();
+        let mut pump = Pump::open(bus, PumpConfig::default()).unwrap();
+        pump.configure().unwrap();
+        pump.bus.set_reg(regs::TIMER_CTRL, 0xB0);
+        pump.clear_latched_faults().unwrap();
+        assert_eq!(
+            pump.bus.reg(regs::TIMER_CTRL) & regs::TIMER_CTRL_CLEAR_LATCH,
+            0
+        );
+        assert_eq!(pump.bus.reg(regs::TIMER_CTRL) & 0xB0, 0xB0);
     }
 
     #[test]
@@ -1281,6 +1876,26 @@ mod tests {
             !config.apply_parameter("ProtectionProfile", 7),
             "неизвестный профиль отвергается"
         );
+    }
+
+    #[test]
+    fn qc35_profile_enables_vfloat_loop_for_windows() {
+        let bus = MockPumpBus::new();
+        let mut pump = Pump::open(bus, PumpConfig::for_qc35_class_b()).unwrap();
+        pump.configure().unwrap();
+        let regulation = pump.bus.reg(regs::REGULATION_CTRL);
+        assert_eq!(
+            regulation & (1 << 5),
+            0,
+            "Windows PEIC must keep VFLOAT regulation enabled"
+        );
+        assert_eq!(
+            regulation & (1 << 4),
+            0,
+            "Windows PEIC must keep IIN regulation enabled"
+        );
+        assert_ne!(regulation & (1 << 7), 0, "vfloat loop int enabled");
+        assert_ne!(regulation & (1 << 6), 0, "iin loop int enabled");
     }
 
     #[test]

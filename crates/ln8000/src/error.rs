@@ -121,6 +121,14 @@ pub enum PumpError {
         /// Что показывает `SYS_STS`.
         raw_status: u8,
     },
+    /// 1:1 запрещён: вход не в окне обхода (нужно 4,2…8 В).
+    ///
+    /// `EN_1TO1` подаёт вход напрямую на батарею, поэтому при повышенном Vin
+    /// (QC/PD, 9–12 В) режим не включается ни одним путём.
+    BypassNeedsFiveVoltVin {
+        /// Измеренный Vin, мкВ (может быть отрицательным при сбое АЦП).
+        vin_uv: i32,
+    },
     /// Сработал отказ (сторожевой таймер, перенапряжение, перегрев…).
     Fault {
         /// Маска отказа.
@@ -148,6 +156,7 @@ impl PumpError {
             Self::NotOpen => "not_open",
             Self::WrongDeviceId { .. } => "wrong_device_id",
             Self::ModeNotReached { .. } => "mode_not_reached",
+            Self::BypassNeedsFiveVoltVin { .. } => "bypass_needs_five_volt_vin",
             Self::Fault { .. } => "fault",
             Self::OutOfRange { .. } => "out_of_range",
             Self::WatchdogExpired => "watchdog_expired",
@@ -180,6 +189,12 @@ impl fmt::Display for PumpError {
             }
             Self::ModeNotReached { wanted, raw_status } => {
                 write!(f, "режим {wanted} не достигнут, SYS_STS=0x{raw_status:02X}")
+            }
+            Self::BypassNeedsFiveVoltVin { vin_uv } => {
+                write!(
+                    f,
+                    "1:1 bypass запрещён при Vin {vin_uv} мкВ (нужно 4,2…8 В)"
+                )
             }
             Self::Fault { mask, detail } => {
                 write!(f, "отказ (маска 0x{mask:02X}): {detail}")
