@@ -26,7 +26,7 @@ PnpLockDown = 1
 ; Must stay ABOVE tablet-bound oem142 (20.46.10.591). cargo-wdk stampinf
 ; uses STAMPINF_VERSION when set (see deploy/build-arm64.ps1); without it
 ; stampinf -v * stamps wall-clock and can fall below oem142 on AM rebuilds.
-DriverVer   = 09/18/2026,20.47.10.625
+DriverVer   = 09/18/2026,20.47.10.632
 
 [DestinationDirs]
 DefaultDestDir = 13

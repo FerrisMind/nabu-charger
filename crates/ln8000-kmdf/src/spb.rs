@@ -1372,6 +1372,53 @@ pub unsafe fn probe_superuser_apsd(device: WDFDEVICE) -> SuperuserApsdProbe {
 pub const SPMI_SID_USBIN: u8 = 2;
 /// Peri-grant id for USBIN (`0x13` — matches register bank `0x13xx`).
 pub const SPMI_PERI_USBIN: u16 = 0x0013;
+/// Peri-grant id периферии `batt_soc` PM8150B (топливный счётчик, банк `0x40xx`).
+pub const SPMI_PERI_BATT_SOC: u16 = 0x0040;
+/// `BATT_SOC_SUBTYPE`: у PM8150B равен `0x10` (`FG_BATT_SOC_PM8150B`).
+pub const SPMI_REG_BATT_SOC_SUBTYPE: u16 = 0x4005;
+/// `FG_MONOTONIC_SOC` — сырой заряд, 8 бит, `0…255` (255 = 100 %).
+///
+/// Теневая копия значения лежит следом (`+0x0A`); читаются они одним запросом
+/// двух байт, как в `fg_get_msoc_raw`, и обязаны совпадать.
+pub const SPMI_REG_BATT_SOC: u16 = 0x4009;
+/// Ожидаемый subtype периферии `batt_soc` на PM8150B.
+pub const SPMI_BATT_SOC_SUBTYPE_PM8150B: u8 = 0x10;
+
+/// Читает сырой заряд из топливного счётчика PM8150B.
+///
+/// Android берёт то же значение в `fg_get_msoc_raw` (`drivers_power_supply_qcom_fg-util.c`):
+/// читает **два** байта с `FG_MONOTONIC_SOC` и требует их равенства (до пяти
+/// попыток), потому что это теневые регистры одного числа, и расхождение
+/// означает, что счётчик обновляется прямо сейчас. Здесь та же проверка: при
+/// расхождении чтение считается неудачным, а не поводом угадывать — значение
+/// придёт на следующем такте телеметрии.
+///
+/// Subtype читается в том же открытии: по адресу `0x4000` на другой платформе
+/// может оказаться иная периферия, и тогда `0x4009` — не заряд.
+///
+/// # Safety
+///
+/// `PASSIVE_LEVEL`; `device` жив.
+pub unsafe fn read_batt_soc_raw(device: WDFDEVICE) -> Option<u8> {
+    // SAFETY: пассивный уровень, устройство создано.
+    let mut su = unsafe { SuperuserBus::open(device) }.ok()?;
+    su.grant(SPMI_PERI_BATT_SOC).ok()?;
+    let subtype = su.read_u8(SPMI_SID_USBIN, SPMI_REG_BATT_SOC_SUBTYPE).ok()?;
+    if subtype != SPMI_BATT_SOC_SUBTYPE_PM8150B {
+        return None;
+    }
+    let mut cap = [0_u8; 2];
+    su.read_bytes(SPMI_SID_USBIN, SPMI_REG_BATT_SOC, &mut cap)
+        .ok()?;
+    // Вторая ячейка — копия; она читается по `+0x0A`, но `read_bytes` вернул
+    // оба байта одним запросом, потому что регистры идут подряд.
+    if cap[0] != cap[1] {
+        return None;
+    }
+    Some(cap[0])
+}
+
+/// Число символов в пути (префикс + 16 цифр).
 
 /// Кодирует адрес SUPERUSER: `(sid << 16) | reg`.
 #[must_use]

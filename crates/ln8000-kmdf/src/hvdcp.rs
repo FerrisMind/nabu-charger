@@ -36,6 +36,14 @@ pub const REG_APSD_RESULT: u16 = 0x1308;
 /// `QC_CHANGE_STATUS` (USBIN_BASE + 0x09) — HW voltage / continuous bits.
 pub const REG_QC_CHANGE_STATUS: u16 = 0x1309;
 /// `QC_PULSE_COUNT_STATUS` (USBIN_BASE + 0x0A) — HW pulse counter.
+///
+/// **В заголовке smb5 регистра нет** (`smb5-reg.h` его не объявляет; адрес и
+/// маска `QC_PULSE_COUNT_MASK` есть только в `smb-reg.h:472-475`, и читает его
+/// единственный драйвер — `drivers_power_supply_qcom_smb-lib.c:805-830` — под
+/// `PMI8998_SUBTYPE`/`PM660_SUBTYPE`). Читается **только как диагностика**
+/// (`SuQcPulseHw`): ни одно решение по нему не принимается, счёт импульсов ведёт
+/// наш собственный `state.pulse_cnt`. Значение в отчёте не считать числом
+/// импульсов PM8150B.
 pub const REG_QC_PULSE_COUNT: u16 = 0x130A;
 /// Qualcomm peri `INT_LATCHED_CLR` (USBIN_BASE + 0x14).
 pub const REG_INT_LATCHED_CLR: u16 = 0x1314;
@@ -108,8 +116,19 @@ pub const USBIN_ADAPTER_ALLOW_5V_TO_12V: u8 = 0x0C;
 /// `QC_9V_BIT` in `QC_CHANGE_STATUS`.
 pub const BIT_QC_9V: u8 = 1 << 1;
 /// `QC_CONTINUOUS_BIT` in `QC_CHANGE_STATUS`.
+///
+/// **Имя из прошлого поколения.** Бит объявлен только в `smb-reg.h:467`
+/// (`QC_CONTINUOUS_BIT`) и в `smb-reg.h:466` (`QC_5V_TO_9V_REASON_BIT`); в
+/// `smb5-reg.h` блок `QC_CHANGE_STATUS` (`:229-233`) описывает лишь
+/// `QC_12V BIT(2)`, `QC_9V BIT(1)`, `QC_5V BIT(0)` и `QC_2P0_STATUS_MASK`, а
+/// регистра `0x130A` там нет вовсе. Штамп PM8150B идёт по `smb5-reg.h`, поэтому
+/// бит 3 для нас недокументирован. Он остаётся входом маршрутизации осознанно:
+/// импульсный путь для сомнительного результата безопаснее DCP-ветки (импульсы
+/// поднимают реальный QC-блок, а DCP их игнорирует и остаётся на 5 В — решает
+/// живой замер `SuQcPre`/`SuQcChgSt`, а не догадка). Разбирать это как «QC3
+/// подтверждён» нельзя: только как «возможно QC».
 pub const BIT_QC_CONTINUOUS: u8 = 1 << 3;
-/// `QC_5V_TO_9V_REASON_BIT`.
+/// `QC_5V_TO_9V_REASON_BIT`. См. [`BIT_QC_CONTINUOUS`] — тот же источник имён.
 pub const BIT_QC_5V_TO_9V_REASON: u8 = 1 << 4;
 
 /// Raw `USBIN_CURRENT_LIMIT_CFG` for 500 mA (step 50 mA → code 10).
@@ -130,6 +149,26 @@ pub const ICL_RAW_DCP_1P8A: u8 = 36;
 /// path: AFC protocol is **not** implemented on nabu Windows — max power is
 /// bypass at this ICL). Paired with LN8000 `set_iin_limit(2_700_000)`.
 pub const ICL_RAW_5V_2P7A: u8 = 54;
+/// Vendor's DCP input-current vote: 2 A, 50 mA step → raw 40.
+///
+/// `DCP_CURRENT_UA = 2_000_000` (`smb5-lib.h:248`), written to
+/// `USBIN_CURRENT_LIMIT_CFG`. Android never raises VBUS for a plain DCP — it
+/// only votes this current — and the live `0x1370=0x0A` (500 mA, the SDP
+/// number) is what makes a 5 V brick charge slowly on Windows.
+pub const ICL_RAW_DCP_2A: u8 = 40;
+/// Vendor's HVDCP2 (QC 2.0) input-current vote: 1.5 A, 50 mA step → raw 30.
+///
+/// `HVDCP2_CURRENT_UA = 1_500_000` (`smb5-lib.h:227`), voted next to the QC2
+/// `FORCE_9V` write in the kernel's own APSD handler
+/// (`smb5-lib.c:8373-8381`: `smblib_force_vbus_voltage(chg, FORCE_9V_BIT)` then
+/// `vote(chg->usb_icl_votable, SW_ICL_MAX_VOTER, true, HVDCP2_CURRENT_UA)`).
+///
+/// The "we use our own qc2 method" early return at `smb5-lib.c:4143-4146` is the
+/// **userspace** `DP_DM` entry point only — the kernel handler for nabu runs in
+/// the `CONFIG_MACH_XIAOMI_VAYU || CONFIG_MACH_XIAOMI_NABU` arm, which does write
+/// `FORCE_9V`. Without this vote the write happens with no input-current budget,
+/// which is why a QC2 brick could stay at ~5 V with a 500 mA-class limit.
+pub const ICL_RAW_HVDCP2_1P5A: u8 = 30;
 
 const _: () = assert!(ICL_RAW_5V_2P7A >= ICL_RAW_DCP_1P8A);
 const _: () = assert!(ICL_RAW_5V_2P7A <= ICL_RAW_PUMP_3A);
@@ -181,7 +220,16 @@ pub const PULSE_GAP_MS: u32 = 40;
 /// How long to wait for APSD_DONE after rerun (ms).
 pub const APSD_WAIT_MS: u32 = 2_000;
 /// Poll period while waiting for APSD_DONE (ms).
-pub const APSD_POLL_MS: u32 = 50;
+///
+/// Each poll is a synchronous SPMI transaction on the SUPERUSER bus, and the
+/// negotiate holds that bus for the whole wait. At 50 ms (40 polls in the
+/// window) the bus was busy ~80 % of the time: a second, independent user-mode
+/// reader could only open `\Device\Spmi\SUPERUSER` in 21 of 100 attempts
+/// (measured 18.09 on the tablet, two runs, `.627` and `.628` alike), which
+/// starves every other client — including the acceptance instrument that has to
+/// read `0x1307`/`0x1506` for its own verdict. 200 ms still checks ten times
+/// inside the window, which is far more often than APSD needs.
+pub const APSD_POLL_MS: u32 = 200;
 /// Settle after OPTIONS1 enable before APSD rerun (ms).
 pub const ENABLE_SETTLE_MS: u32 = 50;
 
@@ -404,7 +452,7 @@ pub use ln8000::{
     superuser_retry_due, HVDCP_SUPERUSER_RETRY_MAX, HVDCP_SUPERUSER_RETRY_MS,
 };
 // APSD classification is host-tested in `ln8000::hvdcp_policy`.
-use ln8000::{apsd_elevate_path, ApsdElevate};
+use ln8000::{apsd_elevate_path, promote_qc_charger, ApsdElevate};
 
 /// Sleep at PASSIVE_LEVEL for `ms` milliseconds.
 pub(crate) fn sleep_ms(ms: u32) {
@@ -978,8 +1026,23 @@ fn negotiate_on_bus(
         }
     }
 
-    let result = state.apsd_result;
     let qc3_continuous = (pre_qc & BIT_QC_CONTINUOUS) != 0;
+    // Vendor promotion before classification (`smb5-lib.c:610-630`): a result the
+    // PMIC reports as DCP/unknown while `APSD_STATUS` carries `QC_CHARGER_BIT` is
+    // HVDCP2 for Android, not a plain DCP. Without it a QC brick that does not
+    // raise the QC_2P0/QC_3P0 result bits is classified as a DCP and — on a build
+    // that does not elevate DCP — never sees 9 V. Widens only; QC3 is untouched.
+    let promoted = promote_qc_charger(state.apsd_result, state.apsd_status);
+    if promoted != state.apsd_result {
+        mark(device, "ApsdPromote", 1);
+        mark(device, "ApsdPromoted", u32::from(promoted));
+        state.apsd_result = promoted;
+        mark(device, "ApsdResult", u32::from(promoted));
+        mark(device, "SuApsdResult", u32::from(promoted));
+    } else {
+        mark(device, "ApsdPromote", 0);
+    }
+    let result = state.apsd_result;
     // APSD → elevate path (`smb5-lib.c` APSD table). `0x28` (`DCP|QC_2P0`) is
     // HVDCP2 (QC2): `FORCE_9V`, never a "5 V AFC" classification. A brick that
     // stays at ~5 V after FORCE_9V is handled by the post-path retreat to the
@@ -998,16 +1061,29 @@ fn negotiate_on_bus(
             let _ = attempt_qc35_authenticate(device, bus, state, read_vin);
 
             state.phase = HvdcpPhase::Qc3Pulse;
-            // Soft counter drives estimated_vbus only; real Vin comes from ADC post-path.
-            state.pulse_cnt = 0;
+            // Счётчик импульсов общий на весь подъём и **не обнуляется** после
+            // подготовки QC3.5: подготовка уже подняла адаптер в окно 5,5–6,4 В
+            // своими INC, и если начать отсчёт заново, реальных импульсов
+            // окажется больше потолка `MAX_PULSE_CNT` (23 × 200 мВ от 5 В — это
+            // 9,6 В), а оценка `estimated_vbus_uv` будет врать вниз.
             publish_marks(device, state, None);
             let want = pulses_toward_target(vbat_uv);
             mark(device, "HvdcpTarget", target_vbus_uv(vbat_uv));
             mark(device, "HvdcpWantPulses", want);
-            // QC3.5 adapters accept finer 20 mV steps adapter-side, but PMIC INC is
-            // still one continuous step — keep 200 mV QC3 stepping; class/ICL already set.
+            // Подъём замкнут по АЦП насоса, как вендорский raise-loop читает
+            // результат на каждом шаге: импульс → чтение Vin → стоп на цели.
+            // Слепая пачка опасна ровно тем, что после подготовки база уже не
+            // 5 В, и 23 импульса от неё дают ~11 В — выше `PUMP_VIN_TRIM_UV`,
+            // где живой кремний защёлкивает `VIN_OV` и 2:1 после этого не
+            // включается (проверено в комментарии `trim_vin_for_pump`).
+            // Недобор до пола окна добирает `boost_vin_for_pump` после
+            // согласования, поэтому останавливаться рано безопасно.
+            let mut vin_now = read_vin();
             for _ in 0..want {
                 if state.pulse_cnt >= MAX_PULSE_CNT {
+                    break;
+                }
+                if u32::try_from(vin_now.max(0)).unwrap_or(0) >= PUMP_VIN_TARGET_MIN_UV as u32 {
                     break;
                 }
                 if let Err(err) = pulse_inc(bus, state) {
@@ -1018,19 +1094,50 @@ fn negotiate_on_bus(
                 }
                 mark(device, "PulseCnt", state.pulse_cnt);
                 mark(device, "SuPulseCnt", state.pulse_cnt);
+                vin_now = read_vin();
+                if vin_now >= PUMP_VIN_TRIM_UV {
+                    // Защитный потолок: дальше импульсы только защёлкивают VIN_OV.
+                    break;
+                }
             }
+            mark(device, "SuQcEndVin", u32::try_from(vin_now.max(0)).unwrap_or(0));
         }
         ApsdElevate::Force9v => {
-            // QC2 cold-plug / plain DCP: FORCE_9V (smb5: "force 9V for QC2
-            // charger" + HVDCP2_CURRENT_UA). If Vin stays ~5 V, the post-HVDCP
-            // path retreats to the 5 V bypass.
-            state.phase = HvdcpPhase::Qc2Force9v;
-            publish_marks(device, state, None);
-            if let Err(err) = force_9v(bus, state) {
-                state.phase = HvdcpPhase::Failed;
-                safe_force_5v(bus, state);
-                publish_marks(device, state, Some(err));
-                return Err(err);
+            if (result & BIT_QC2) != 0 {
+                // QC2 (0x28): the kernel does write `FORCE_9V` for nabu. The
+                // "we use our own qc2 method" early return (`smb5-lib.c:4143-4146`)
+                // belongs to the **userspace** `DP_DM` entry; the kernel's APSD
+                // handler runs in the VAYU/NABU arm of the same file and does
+                // `smblib_force_vbus_voltage(chg, FORCE_9V_BIT)` followed by an
+                // ICL vote of `HVDCP2_CURRENT_UA` (`smb5-lib.c:8373-8381`).
+                // The write alone never moved live Vin, and the missing vote is
+                // the likely reason: elevation without an input budget leaves the
+                // brick at its own default current class.
+                state.phase = HvdcpPhase::Qc2Force9v;
+                publish_marks(device, state, None);
+                if let Err(err) = force_9v(bus, state) {
+                    state.phase = HvdcpPhase::Failed;
+                    safe_force_5v(bus, state);
+                    publish_marks(device, state, Some(err));
+                    return Err(err);
+                }
+                match ensure_icl_at_least(bus, state, ICL_RAW_HVDCP2_1P5A) {
+                    Ok(icl) => mark(device, "SuQc2Icl", u32::from(icl)),
+                    Err(err) => mark(device, "SuQc2Icl", err.code() as u32),
+                }
+            } else {
+                // Plain DCP (0x08): Android does **not** elevate it — a DCP is a
+                // 5 V source and only receives a current vote
+                // (`DCP_CURRENT_UA` = 2 A, `smb5-lib.h:248`). Our FORCE_9V for
+                // DCP was an experiment; live it never moved Vin and it held the
+                // SUPERUSER bus for the whole settle window. Vote the vendor's
+                // 2 A instead and let the caller's post-path land in the 5 V
+                // high-current route.
+                mark(device, "SuDcpNoElevate", 1);
+                match ensure_icl_at_least(bus, state, ICL_RAW_DCP_2A) {
+                    Ok(icl) => mark(device, "SuDcpIcl", u32::from(icl)),
+                    Err(err) => mark(device, "SuDcpIcl", err.code() as u32),
+                }
             }
         }
         ApsdElevate::Reject => {

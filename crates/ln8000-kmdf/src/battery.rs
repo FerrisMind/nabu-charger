@@ -30,8 +30,24 @@ static mut REGISTRY_PATH: UNICODE_STRING = UNICODE_STRING {
     Buffer: ptr::null_mut(),
 };
 
-/// Last published relative capacity (0–100).
-static mut LAST_PCT: u32 = 100;
+/// Last published relative capacity (0–100) or [`BATTERY_UNKNOWN_CAPACITY`].
+///
+/// Must **not** start at 100. Before the first trustworthy sample the tray and
+/// Settings showed a full battery on a pack Android reported at 12 % — the
+/// value was simply the initialiser, because VBAT is only sampled while
+/// telemetry runs and the OCV map was also feeding it a charging rail.
+static mut LAST_PCT: u32 = BATTERY_UNKNOWN_CAPACITY;
+/// Откуда взялся [`LAST_PCT`] (метка `SocSrc`).
+static mut SOC_SRC: u32 = SOC_SRC_NONE;
+/// Отказов чтения счётчика подряд (метка `SocFail`); успех обнуляет.
+static mut GAUGE_FAILS: u32 = 0;
+
+/// Процент ещё ниоткуда не получен.
+pub const SOC_SRC_NONE: u32 = 0;
+/// Процент прочитан из топливного счётчика PM8150B (`FG_MONOTONIC_SOC`).
+pub const SOC_SRC_GAUGE: u32 = 1;
+/// Процент оценён по напряжению банки (линейная карта, только вне заряда).
+pub const SOC_SRC_VBAT: u32 = 2;
 /// Last VBAT sample (µV) used for SoC.
 static mut LAST_VBAT_UV: u32 = 0;
 /// Last VBUS sample (µV) for AC/charge flags.
@@ -54,6 +70,12 @@ const BATTERY_CHARGING: u32 = 0x0000_0004;
 const BATTERY_CRITICAL: u32 = 0x0000_0008;
 const BATTERY_UNKNOWN_RATE: u32 = 0x8000_0000;
 const BATTERY_UNKNOWN_TIME: u32 = 0xFFFF_FFFF;
+/// Relative capacity is not known (WDK `BATTERY_UNKNOWN_CAPACITY`).
+///
+/// Sent instead of a number when no trustworthy sample exists: the class
+/// driver then shows no percentage rather than a fabricated one. Zero would
+/// mean "empty", which is worse — `0` is a valid reading, "unknown" is not.
+const BATTERY_UNKNOWN_CAPACITY: u32 = 0xFFFF_FFFF;
 
 const WMIREG_ACTION_REGISTER: u32 = 1;
 const WMIREG_ACTION_DEREGISTER: u32 = 2;
@@ -380,16 +402,29 @@ pub unsafe fn unload() {
 
 /// Update cached samples and wake waiting status IRPs.
 ///
+/// Percent is only recomputed from a pack that the charger is **not** driving.
+/// With the adapter online, LN8000's VBAT follows the charge rail (float at
+/// 4.42 V), so the linear OCV map saturates at 100 % on a nearly empty pack —
+/// that is the W11 bug (Windows showed 100 %, Android on the same battery
+/// 12 %). While charging we therefore keep the last offline estimate, and
+/// `BATTERY_UNKNOWN_CAPACITY` if there never was one.
+///
 /// Ignores `vbat_uv == 0` (ADC not ready) so a bad first sample cannot pin SoC at 0%.
 /// Calls [`BatteryClassStatusNotify`] only when `power_state` changes so the
 /// tray/Settings see plug/unplug on the same telemetry tick (not after a later poll).
 pub unsafe fn update_from_telemetry(vbat_uv: u32, vbus_uv: u32, iin_ua: u32) {
     let prev_power = unsafe { LAST_POWER_STATE };
     if vbat_uv > 0 {
-        let pct = soc_percent(vbat_uv);
         unsafe {
             LAST_VBAT_UV = vbat_uv;
-            LAST_PCT = pct;
+        }
+    }
+    // Счётчик достовернее любой оценки: пока он отвечает, напряжение банки в
+    // расчёт не идёт вовсе.
+    if vbat_uv > 0 && unsafe { SOC_SRC } != SOC_SRC_GAUGE && !is_ac_online(vbus_uv, vbat_uv) {
+        unsafe {
+            LAST_PCT = soc_percent(vbat_uv);
+            SOC_SRC = SOC_SRC_VBAT;
         }
     }
     unsafe {
@@ -407,6 +442,48 @@ pub unsafe fn update_from_telemetry(vbat_uv: u32, vbus_uv: u32, iin_ua: u32) {
             let _ = BatteryClassStatusNotify(handle);
         }
     }
+}
+
+/// Публикует процент из топливного счётчика: `raw` — сырое `FG_MONOTONIC_SOC`.
+///
+/// Пересчёт взят у Android дословно (`fg_get_msoc`): `255` — это ровно 100 %,
+/// `0` — ровно 0, а промежуточные `1…254` растягиваются на `1…99`
+/// (`DIV_ROUND_CLOSEST((raw - 1) * 98, 253) + 1`). Линейное `raw * 100 / 255`
+/// расходится с ним уже на краях почти пустой банки: при `raw = 1` выходит 0 %
+/// вместо 1 %, из-за чего Windows показал бы «пусто» на банке, которая в
+/// Android ещё держит процент.
+pub unsafe fn set_gauge_raw(raw: u8) {
+    let pct = if raw == 255 {
+        100
+    } else if raw == 0 {
+        0
+    } else {
+        // SAFETY: значения 1…254 дают максимум 99; 98 * 253 + 126 < u32::MAX.
+        (((u32::from(raw) - 1) * 98 + 126) / 253) + 1
+    };
+    unsafe {
+        LAST_PCT = pct;
+        SOC_SRC = SOC_SRC_GAUGE;
+        GAUGE_FAILS = 0;
+    }
+}
+
+/// Считает неудачные чтения счётчика подряд и возвращает новое число.
+///
+/// Живёт здесь, а не в состоянии драйвера: в такте телеметрии `pump` держит
+/// изменяемую ссылку на состояние, и второй раз её взять нельзя. Счётчик
+/// обнуляется первым же успешным чтением, поэтому ненулевое значение в метке
+/// `SocFail` означает именно серию отказов, а не их накопление за всё время.
+pub unsafe fn note_gauge_failure() -> u32 {
+    unsafe {
+        GAUGE_FAILS = GAUGE_FAILS.saturating_add(1);
+        GAUGE_FAILS
+    }
+}
+
+/// Источник опубликованного процента (метка `SocSrc`).
+pub fn last_soc_source() -> u32 {
+    unsafe { SOC_SRC }
 }
 
 fn soc_percent(vbat_uv: u32) -> u32 {
@@ -463,7 +540,10 @@ fn build_status() -> BatteryStatus {
     } else if !online {
         power |= BATTERY_DISCHARGING;
     }
-    if pct <= 5 {
+    // Critical only on a known value: an unknown capacity is not an empty one,
+    // and flagging it critical puts the pack icon in alarm state on a full
+    // battery that simply has no reading yet.
+    if pct != BATTERY_UNKNOWN_CAPACITY && pct <= 5 {
         power |= BATTERY_CRITICAL;
     }
     unsafe {

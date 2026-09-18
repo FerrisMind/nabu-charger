@@ -32,7 +32,7 @@ mod ioctl;
 mod spb;
 mod spb_abi;
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Код остановки `MANUALLY_INITIATED_CRASH`: «драйвер сам остановил систему».
 ///
@@ -146,6 +146,16 @@ const CHARGE_RETRY_DELTA_UV: u32 = 300_000;
 
 /// Окно наблюдения пика входного тока для метки `MaxIinUa`, мс.
 const IIN_WINDOW_MS: u64 = 5_000;
+
+/// Период опроса топливного счётчика PM8150B, мс.
+///
+/// Счётчик — медленная величина: один сырой шаг это ~0,4 % ёмкости, а одна
+/// транзакция SUPERUSER на этой платформе идёт около двух секунд. Опрос каждые
+/// 250 мс (сборка `.627`) занимал шину почти постоянно: сторонний user-mode
+/// читатель получал `ERROR_GEN_FAILURE` в 79 попытках из 100 (замер 18.09), и
+/// приёмка оставалась без `0x1307`/`0x1506`. Раз в 30 с шина свободна ~94 %,
+/// а индикатору заряда этого хватает с запасом.
+const GAUGE_POLL_MS: u32 = 30_000;
 
 // Короткие числовые коды метки `EngageState` — состояние «есть ли вход и режим».
 /// Входа нет (`Vin` ниже порога присутствия).
@@ -284,6 +294,63 @@ static mut STATE_LOCK: wdk_sys::KMUTEX = unsafe { core::mem::zeroed() };
 /// Мьютекс инициализирован. До инициализации брать его нельзя: нулевая
 /// структура диспетчера — ещё не объект ожидания.
 static STATE_LOCK_READY: AtomicBool = AtomicBool::new(false);
+
+/// Монотонное время последнего опроса топливного счётчика, мс (0 — не было).
+///
+/// Отдельный атомик, а не поле [`DriverState`]: счётчик читается **до** захвата
+/// [`STATE_LOCK`] — транзакция SUPERUSER идёт около двух секунд, и держать на
+/// это время мьютекс значит тормозить и управление зарядом, и `IOCTL_STATUS`,
+/// которым пользуется приёмка. Сравнение с обменом (CAS) заодно не даёт двум
+/// тактам таймера читать шину одновременно.
+static GAUGE_LAST_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Железо подготовлено: счётчик можно опрашивать.
+///
+/// `read_gauge_if_due` вызывается до захвата [`STATE_LOCK`] и потому не защищён
+/// мьютексом от гонки с `evt_release_hardware`; этот флаг и есть та защита.
+static GAUGE_READY: AtomicBool = AtomicBool::new(false);
+
+/// Что дал такт опроса счётчика — три разных исхода, которые нельзя смешивать.
+enum GaugePoll {
+    /// Такт пропущен по расписанию: читать рано.
+    Skipped,
+    /// Сырое значение счётчика.
+    Raw(u8),
+    /// Чтение не удалось: шина занята, счётчик не ответил, копии не совпали.
+    Failed,
+}
+
+/// Читает топливный счётчик не чаще [`GAUGE_POLL_MS`] и только из одного такта.
+///
+/// # Safety
+///
+/// Пассивный уровень; вызывается до захвата [`STATE_LOCK`], состояние не трогает.
+unsafe fn read_gauge_if_due() -> GaugePoll {
+    if !GAUGE_READY.load(Ordering::Acquire) {
+        return GaugePoll::Skipped;
+    }
+    let device = unsafe { DEVICE };
+    if device.is_null() {
+        return GaugePoll::Skipped;
+    }
+    let now = monotonic_ms();
+    let last = GAUGE_LAST_MS.load(Ordering::Acquire);
+    if last != 0 && now.saturating_sub(last) < u64::from(GAUGE_POLL_MS) {
+        return GaugePoll::Skipped;
+    }
+    if GAUGE_LAST_MS
+        .compare_exchange(last, now, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        // Другой такт уже взял это окно себе.
+        return GaugePoll::Skipped;
+    }
+    // SAFETY: `device` жив (проверено выше), уровень пассивный.
+    match unsafe { crate::spb::read_batt_soc_raw(device) } {
+        Some(raw) => GaugePoll::Raw(raw),
+        None => GaugePoll::Failed,
+    }
+}
 
 /// Инициализирует мьютекс состояния. Один раз, из `evt_device_add`.
 unsafe fn init_state_lock() {
@@ -1811,6 +1878,10 @@ unsafe extern "C" fn evt_prepare_hardware(
 
     // 5. Запускаем телеметрию с периодом из реестра (one-shot + re-arm).
     arm_telemetry_timer();
+    // Железо готово: с этого такта счётчик можно опрашивать. Флаг ставится
+    // после шины и до первого тика — `read_gauge_if_due` идёт **до** мьютекса,
+    // то есть не защищён от гонки с `evt_release_hardware`.
+    GAUGE_READY.store(true, Ordering::Release);
 
     mark_stage(device, STAGE_READY, 0);
     wdk_sys::STATUS_SUCCESS
@@ -1939,6 +2010,10 @@ unsafe extern "C" fn evt_release_hardware(
     _device: WDFDEVICE,
     _resources_translated: WDFCMRESLIST,
 ) -> NTSTATUS {
+    // Счётчик больше не опрашиваем: `read_gauge_if_due` идёт до мьютекса и не
+    // увидел бы, что шина вот-вот уйдёт из-под него. Флаг снимается до остановки
+    // таймера, чтобы уже начатое чтение осталось единственным.
+    GAUGE_READY.store(false, Ordering::Release);
     // Мьютекс берём до остановки таймера: `WdfTimerStop` с нулём не ждёт
     // текущий вызов, поэтому он мог бы работать с `STATE` одновременно с нами.
     let _state = lock_state();
@@ -1976,6 +2051,12 @@ unsafe extern "C" fn evt_release_hardware(
 ///
 /// Вызывается WDF из таймера на пассивном уровне.
 unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
+    // Топливный счётчик читается до мьютекса: одна транзакция SUPERUSER идёт
+    // около двух секунд, а под мьютексом стоят и управление зарядом, и
+    // `IOCTL_STATUS`. Пока опрос шёл под мьютексом каждые 250 мс, сторонний
+    // читатель SUPERUSER не мог открыть шину в 79 попытках из 100.
+    // SAFETY: пассивный уровень, состояние не трогаем.
+    let gauge = unsafe { read_gauge_if_due() };
     // Таймер идёт своим контекстом, очередь WDF его не сериализует: шину и
     // `STATE` защищает мьютекс состояния.
     let _state = lock_state();
@@ -2061,6 +2142,59 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
             st.max_iin_ua = sample.iin_ua;
             st.iin_window_start_ms = sample.ts_ms;
         }
+    }
+
+    // Топливный счётчик PM8150B: единственный достоверный источник процента.
+    // Линейная оценка по VBAT на этой банке врала в обе стороны — на
+    // подключённом блоке давала 100 %, а там, где счётчик говорит 6 %, — 25 %.
+    // Само чтение сделано выше, до мьютекса (`read_gauge_if_due`); здесь только
+    // публикация. Отказ ничего не портит: остаётся прежнее значение (а если
+    // счётчик не отвечал ни разу — оценка по банке, `SocSrc=2`). Счётчик отказов
+    // живёт в модуле батареи: здесь `pump` держит изменяемую ссылку на
+    // состояние, и второй раз брать её нельзя.
+    let device = unsafe { DEVICE };
+    if !device.is_null() {
+        match gauge {
+            GaugePoll::Raw(raw) => {
+                unsafe { battery::set_gauge_raw(raw) };
+                mark_device_value(device, "SocRaw", u32::from(raw));
+            }
+            GaugePoll::Failed => {
+                let fails = unsafe { battery::note_gauge_failure() };
+                mark_device_value(device, "SocFail", fails);
+            }
+            GaugePoll::Skipped => {}
+        }
+        mark_device_value(device, "SocSrc", battery::last_soc_source());
+        mark_device_value(device, "BattPct", battery::last_percent());
+        // Возраст последнего удачного чтения: по нему видно, что счётчик не
+        // «залип», а опрашивается редко — раз в `GAUGE_POLL_MS`.
+        let gauge_last = GAUGE_LAST_MS.load(Ordering::Acquire);
+        let age_ms = u32::try_from(sample.ts_ms.saturating_sub(gauge_last)).unwrap_or(u32::MAX);
+        mark_device_value(device, "SocAgeMs", age_ms);
+        mark_device_value(device, "GaugePollMs", GAUGE_POLL_MS);
+        // Сырые байты отказов публикуются как есть: у чипа есть групповой
+        // признак «напряженческих» отказов (`FAULT1` биты 6:0), который вендор
+        // тестирует целиком, а именованных битов в нём только пять. Живой
+        // `FAULT1=0x21` — два безымянных бита этой группы: `has_critical_fault`
+        // о них молчит, а вендорский `volt_qual` говорит «вход негоден». Без
+        // этих марок разница между «нет отказов» и «вход негоден» не видна.
+        mark_device_value(device, "Fault1Sts", u32::from(status.fault1_sts));
+        mark_device_value(device, "Fault2Sts", u32::from(status.fault2_sts));
+        mark_device_value(device, "SysSts", u32::from(status.sys_sts));
+        mark_device_value(device, "SafetySts", u32::from(status.safety_sts));
+        // Вторая ступень вендора считается только при разрешённом заряде;
+        // «разрешён» — это принятый чипом рабочий режим, а не запрошенный.
+        let charging = matches!(status.op_mode, OpMode::Switching | OpMode::Bypass);
+        mark_device_value(device, "VoltQual", u32::from(status.volt_qual(charging)));
+        // Какая стадия 5-вольтового резерва сработала: `1` — чистая запись
+        // (то, что работало 17.09), `2` — POR, `3` — маска отказов. По этой
+        // марке видно, лечится ли блокировка режима снятием защёлки или вход
+        // действительно негоден.
+        mark_device_value(device, "BypassStage", u32::from(pump.bypass_stage()));
+        // `1` — POR-бюджет этого входа уже израсходован: драйвер упёрся в отказ
+        // и ждёт смены блока. По марке видно, что повторные тики не дёргают чип.
+        mark_device_value(device, "BypassPorSpent", u32::from(pump.por_spent()));
     }
 
     // Эпизод перегрева закончился — счётчик отказов 1:1 обнуляется: иначе
