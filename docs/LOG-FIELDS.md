@@ -16,7 +16,7 @@
 |---|---|---|---|
 | `at_ms` | u64 | мс | монотонное время драйвера (`KeQueryInterruptTimePrecise / 10_000`) |
 | `iin_ua` | u32 | мкА | АЦП канал `IIN`, LSB 4.89 мА |
-| `vbat_uv` | u32 | мкВ | АЦП канал `VBAT`, LSB 5 мВ, смещение +1 В |
+| `vbat_uv` | u32 | мкВ | АЦП канал `VBAT`, LSB 5 мВ (Android: без смещения +1 В; `ADC_VBAT_MIN` — порог валидности) |
 | `vin_uv` | u32 | мкВ | АЦП канал `VIN`, LSB 16 мВ |
 | `die_temp_dc` | i32 | 0.1 °C | АЦП канал `DIETEMP`, LSB 0.435 °C, смещение −25 °C |
 | `op_mode` | u8 | — | режим: 1 standby, 2 bypass 1:1, 3 switching 2:1 |
