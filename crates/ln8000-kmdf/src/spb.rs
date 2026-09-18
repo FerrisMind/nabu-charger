@@ -17,8 +17,9 @@
 
 use crate::spb_abi::{
     ATTACH_MAGIC, ATTACH_REPLY_LEN, IOCTL_ATTACH, IOCTL_SPB_EXECUTE_SEQUENCE, IOCTL_SPB_LOCK_CONNECTION,
-    SPB_DIRECTION_FROM_DEVICE, SPB_DIRECTION_NONE, SPB_DIRECTION_TO_DEVICE, SPB_FORMAT_SIMPLE,
-    SpbTransferList, SpbTransferListEntry, entry_init,
+    IOCTL_SPMI_SUPERUSER_GRANT, IOCTL_SPMI_SUPERUSER_READ, IOCTL_SPMI_SUPERUSER_WRITE,
+    SPMI_SUPERUSER_HEADER_LEN, SPB_DIRECTION_FROM_DEVICE, SPB_DIRECTION_NONE,
+    SPB_DIRECTION_TO_DEVICE, SPB_FORMAT_SIMPLE, SpbTransferList, SpbTransferListEntry, entry_init,
 };
 use ln8000::{BusError, RegAddr, RegisterBus};
 use wdk_sys::{
@@ -82,6 +83,10 @@ pub struct SpbBus {
     /// Статус последнего обмена: нужен при разборе отказов на железе,
     /// где отладочный вывод драйвера недоступен.
     last_status: i32,
+    /// Отправка не завершилась, и WDF всё ещё владеет кэшированным запросом.
+    /// Повторная отправка такого запроса — фатальная ошибка WDF, поэтому до
+    /// перезапуска устройства шина отвечает отказом вместо обмена.
+    request_lost: bool,
     /// Как оформлять запрос: см. `VARIANT_*`. Переключается пробой.
     variant: u8,
     /// Вид буфера передач на одну передачу: точная длина 48 байт.
@@ -309,6 +314,7 @@ impl SpbBus {
             peripheral_id,
             name: "spb-i2c",
             last_status: 0,
+            request_lost: false,
             variant: VARIANT_OUTPUT_SIMPLE,
             input_one,
             input_two,
@@ -350,6 +356,35 @@ impl SpbBus {
         resource_hub_path(self.peripheral_id).as_ascii()
     }
 
+    /// Проверяет, что кэшированный запрос можно отправлять снова.
+    ///
+    /// # Errors
+    ///
+    /// `Timeout` — запрос потерян (см. [`Self::send_failed`]).
+    fn cached_request(&self) -> Result<(), BusError> {
+        if self.request_lost {
+            return Err(BusError::timeout(
+                "кэшированный запрос потерян: нужен перезапуск устройства",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Помечает кэшированный запрос потерянным после неудачной отправки.
+    ///
+    /// `WdfRequestSend` вернул `false` при выставленной опции `TIMEOUT` — значит,
+    /// запрос остался у I/O-таргета: он завершится позже либо будет отменён.
+    /// Вызывать на нём `WdfRequestReuse`, а затем отправлять повторно нельзя —
+    /// WDF на это отвечает `WDF_VIOLATION (0x10D)` с `Arg2 = 3` («запрос уже
+    /// отправлен I/O-таргету»). Именно так ядро падало три раза 18.09.
+    /// Запрос освободит сам WDF при удалении устройства, поэтому дальше драйвер
+    /// только отказывает до перезапуска.
+    fn send_failed(&mut self, reason: &'static str) -> BusError {
+        self.request_lost = true;
+        self.last_status = -1;
+        BusError::timeout(reason)
+    }
+
     /// Выполняет одну транзакцию: чтение или запись регистра.
     ///
     /// # Errors
@@ -358,6 +393,7 @@ impl SpbBus {
     /// * `Timeout` — шина не ответила за секунду.
     /// * `Io` — шина вернула отказ.
     pub fn transact(&mut self, addr: RegAddr, value: Option<u8>) -> Result<u8, BusError> {
+        self.cached_request()?;
         // SAFETY: область передач выделена размером TRANSFER_AREA и живёт до
         // удаления устройства; указатели внутри списка ссылаются на неё же.
         unsafe { self.prepare(addr, value)? };
@@ -394,8 +430,9 @@ impl SpbBus {
         options.Flags = (WDF_REQUEST_SEND_OPTION_SYNCHRONOUS | WDF_REQUEST_SEND_OPTION_TIMEOUT) as ULONG;
         options.Timeout = SPB_TIMEOUT_100NS;
 
-        // SAFETY: отправка синхронная, уровень пассивный, повторный вход исключён
-        // последовательной очередью устройства и таймером с автосериализацией.
+        // SAFETY: отправка синхронная, уровень пассивный; от повторного входа
+        // шину защищает мьютекс состояния в `lib.rs` — очередь WDF сериализует
+        // только IOCTL, а таймер телеметрии идёт своим контекстом.
         let sent = unsafe {
             call_unsafe_wdf_function_binding!(
                 WdfRequestSend,
@@ -405,9 +442,7 @@ impl SpbBus {
             )
         };
         if sent == 0 {
-            self.last_status = -1;
-            unsafe { reuse_request(self.request) };
-            return Err(BusError::timeout("шина I²C не ответила"));
+            return Err(self.send_failed("шина I²C не ответила"));
         }
 
         // SAFETY: запрос завершён; читаем статус и значение.
@@ -423,12 +458,86 @@ impl SpbBus {
         Ok(if value.is_none() { byte } else { 0 })
     }
 
+    /// SPMI-транзакция с 16-битным адресом регистра (USBIN / PM8150B).
+    ///
+    /// В отличие от I²C LN8000 (1 байт адреса), SPMI передаёт два байта адреса,
+    /// затем значение. Порядок байт задаётся `big_endian` (по умолчанию BE —
+    /// как в спецификации SPMI; на железе может потребоваться LE).
+    ///
+    /// # Errors
+    ///
+    /// Те же, что у [`Self::transact`].
+    pub fn transact_spmi16(
+        &mut self,
+        addr: u16,
+        value: Option<u8>,
+        big_endian: bool,
+    ) -> Result<u8, BusError> {
+        self.cached_request()?;
+        // SAFETY: буферы созданы в `open`; пассивный уровень.
+        unsafe { self.prepare_spmi16(addr, value, big_endian)? };
+        let status = unsafe {
+            call_unsafe_wdf_function_binding!(
+                WdfIoTargetFormatRequestForIoctl,
+                self.target,
+                self.request,
+                IOCTL_SPB_EXECUTE_SEQUENCE,
+                match self.last_count {
+                    1 => self.input_one,
+                    2 => self.input_two,
+                    _ => self.input_three,
+                },
+                core::ptr::null_mut(),
+                if self.variant >= VARIANT_OUTPUT_MEMORY {
+                    self.output
+                } else {
+                    core::ptr::null_mut()
+                },
+                core::ptr::null_mut(),
+            )
+        };
+        if !nt_ok(status) {
+            return Err(BusError::protocol("SPB отклонил SPMI-последовательность"));
+        }
+
+        let mut options: WDF_REQUEST_SEND_OPTIONS = unsafe { core::mem::zeroed() };
+        options.Size = size_of_ulong::<WDF_REQUEST_SEND_OPTIONS>();
+        options.Flags =
+            (WDF_REQUEST_SEND_OPTION_SYNCHRONOUS | WDF_REQUEST_SEND_OPTION_TIMEOUT) as ULONG;
+        options.Timeout = SPB_TIMEOUT_100NS;
+
+        let sent = unsafe {
+            call_unsafe_wdf_function_binding!(
+                WdfRequestSend,
+                self.request,
+                self.target,
+                &raw mut options,
+            )
+        };
+        if sent == 0 {
+            return Err(self.send_failed("шина SPMI не ответила"));
+        }
+
+        let status = unsafe { call_unsafe_wdf_function_binding!(WdfRequestGetStatus, self.request) };
+        self.last_status = status;
+        // Адрес — два байта; ответ — третий байт буфера данных.
+        let byte = unsafe { core::ptr::read_volatile(self.data.add(2)) };
+        unsafe { reuse_request(self.request) };
+        if !nt_ok(status) {
+            return Err(BusError::io("SPB вернул отказ на SPMI-транзакцию"));
+        }
+        Ok(if value.is_none() { byte } else { 0 })
+    }
+
     /// Пробует выполнить подключение к периферии.
     ///
     /// Эталонный драйвер делает этот шаг до доступа к регистрам: шлёт во входе
     /// восемь байт (магия `0x42696541` плюс четыре байта) и получает 1024 байта
     /// ответа. Возвращает статус запроса; первые слова ответа сохраняются.
     pub fn attach(&mut self) -> i32 {
+        if self.request_lost {
+            return -1;
+        }
         if self.attach_in_ptr.is_null() || self.attach_out_ptr.is_null() {
             return -1;
         }
@@ -468,8 +577,7 @@ impl SpbBus {
             )
         };
         if sent == 0 {
-            self.last_status = -1;
-            unsafe { reuse_request(self.request) };
+            let _ = self.send_failed("I/O-таргет не завершил запрос");
             return -1;
         }
         // SAFETY: запрос завершён; читаем статус и первые слова ответа.
@@ -510,6 +618,9 @@ impl SpbBus {
     /// Нужно, чтобы понять, какие запросы узел вообще поддерживает: по одному
     /// коду запроса на вызов. Статус пишется вызывающим в реестр.
     pub fn probe_ioctl(&mut self, code: u32) -> i32 {
+        if self.request_lost {
+            return -1;
+        }
         // SAFETY: цель и запрос валидны; запрос без буферов.
         let status = unsafe {
             call_unsafe_wdf_function_binding!(
@@ -542,8 +653,7 @@ impl SpbBus {
             )
         };
         if sent == 0 {
-            self.last_status = -1;
-            unsafe { reuse_request(self.request) };
+            let _ = self.send_failed("I/O-таргет не завершил запрос");
             return -1;
         }
         // SAFETY: запрос завершён, читаем его статус.
@@ -559,6 +669,9 @@ impl SpbBus {
     /// настоящее SPB-соединение и дело в оформлении последовательности;
     /// если отказом — цель выбрана неверно.
     pub fn lock_connection(&mut self) -> i32 {
+        if self.request_lost {
+            return -1;
+        }
         // SAFETY: цель и запрос валидны; запрос без буферов.
         let status = unsafe {
             call_unsafe_wdf_function_binding!(
@@ -590,8 +703,7 @@ impl SpbBus {
             )
         };
         if sent == 0 {
-            self.last_status = -1;
-            unsafe { reuse_request(self.request) };
+            let _ = self.send_failed("I/O-таргет не завершил запрос");
             return -1;
         }
         // SAFETY: запрос завершён, читаем его статус.
@@ -599,6 +711,89 @@ impl SpbBus {
         self.last_status = status;
         unsafe { reuse_request(self.request) };
         status
+    }
+
+    /// Заполняет область передач под SPMI-регистр с 16-битным адресом.
+    ///
+    /// # Safety
+    ///
+    /// Область передач выделена размером [`TRANSFER_AREA`]; пассивный уровень.
+    unsafe fn prepare_spmi16(
+        &mut self,
+        addr: u16,
+        value: Option<u8>,
+        big_endian: bool,
+    ) -> Result<(), BusError> {
+        if self.area.is_null() || self.data.is_null() {
+            return Err(BusError::unsupported("буферы SPB не созданы"));
+        }
+        let list = self.area.cast::<SpbTransferList>();
+        let write = value.is_some();
+        let count: u32 = if write { 1 } else { 2 };
+        self.last_count = count;
+        let size_field = SpbTransferList::header_size();
+        // SAFETY: запись заголовка списка в выделенную область.
+        unsafe {
+            (*list).size = u32::try_from(size_field).unwrap_or(0);
+            (*list).reserved = 0;
+            (*list).transfer_count = count;
+        }
+        let format = if self.variant == VARIANT_OUTPUT_NON_PAGED
+            || self.variant == VARIANT_OUTPUT_MEMORY_NON_PAGED
+        {
+            SPB_FORMAT_SIMPLE_NON_PAGED
+        } else {
+            SPB_FORMAT_SIMPLE
+        };
+        let addr_bytes = if big_endian {
+            addr.to_be_bytes()
+        } else {
+            addr.to_le_bytes()
+        };
+        let payload = self.data;
+        let read_target = unsafe { self.data.add(2) };
+        match value {
+            Some(byte) => {
+                // SAFETY: буфер данных ≥ 3 байт; одна передача «адрес + значение».
+                unsafe {
+                    core::ptr::write_volatile(payload, addr_bytes[0]);
+                    core::ptr::write_volatile(payload.add(1), addr_bytes[1]);
+                    core::ptr::write_volatile(payload.add(2), byte);
+                    let entry = core::ptr::addr_of_mut!((*list).transfers[0]);
+                    *entry = Self::entry_with_format(
+                        format,
+                        SPB_DIRECTION_TO_DEVICE,
+                        payload.cast::<core::ffi::c_void>(),
+                        3,
+                    );
+                }
+            }
+            None => {
+                // SAFETY: адрес — 2 байта; вторая передача читает 1 байт.
+                unsafe {
+                    core::ptr::write_volatile(payload, addr_bytes[0]);
+                    core::ptr::write_volatile(payload.add(1), addr_bytes[1]);
+                    let first = core::ptr::addr_of_mut!((*list).transfers[0]);
+                    *first = Self::entry_with_format(
+                        format,
+                        SPB_DIRECTION_TO_DEVICE,
+                        payload.cast::<core::ffi::c_void>(),
+                        2,
+                    );
+                    let second = self
+                        .area
+                        .add(SpbTransferList::header_size())
+                        .cast::<SpbTransferListEntry>();
+                    *second = Self::entry_with_format(
+                        format,
+                        SPB_DIRECTION_FROM_DEVICE,
+                        read_target.cast::<core::ffi::c_void>(),
+                        1,
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Заполняет область передач под чтение или запись регистра.
@@ -717,7 +912,7 @@ impl SpbBus {
     pub unsafe fn close(self) {
         // SAFETY: цель создана в `open`.
         unsafe {
-            let _ = call_unsafe_wdf_function_binding!(WdfIoTargetClose, self.target);
+            call_unsafe_wdf_function_binding!(WdfIoTargetClose, self.target);
         }
     }
 }
@@ -799,6 +994,685 @@ pub fn resource_hub_path(peripheral_id: u64) -> HubPath {
         }
     }
     HubPath { chars }
+}
+
+/// Максимальная длина имени объекта в пробе (в символах).
+pub const PROBE_NAME_CHARS: usize = 64;
+
+/// Совместный доступ: чтение + запись + удаление (`FILE_SHARE_READ|WRITE|DELETE`).
+pub const PROBE_SHARE_ALL: u32 = 0x0000_0007;
+
+/// Проба: открывается ли объект ядра с указанным именем.
+///
+/// Нужна для диагностики: проверяем, есть ли в пространстве имён ядра объект
+/// шины SPMI (например `\Device\Spmi\SUPERUSER`) или символьная ссылка
+/// штатного PMIC/ADC (`\DosDevices\Global\QCOMPMIC`, `\??\QCOM_ADC`).
+/// Из пользовательского режима часть из них не видна, а драйвер открывает их
+/// тем же способом, что и узел ресурсов — по имени через `WdfIoTargetOpenByName`.
+///
+/// Цель после пробы закрывается и удаляется: иначе успешное открытие держало бы
+/// исключающую ссылку на чужой стек (SUPERUSER / ADC).
+///
+/// Имена — только ASCII: буфер заполняется побайтово.
+///
+/// # Safety
+///
+/// Пассивный уровень IRQL, устройство создано и не удаляется.
+pub unsafe fn probe_named_target(device: WDFDEVICE, name: &str, desired_access: u32) -> i32 {
+    // SAFETY: пассивный уровень; делегируем общей пробе с нулевым ShareAccess.
+    unsafe { probe_named_target_ex(device, name, desired_access, 0) }
+}
+
+/// Проба открытия объекта ядра с явной маской совместного доступа.
+///
+/// # Safety
+///
+/// Пассивный уровень IRQL, устройство создано и не удаляется.
+pub unsafe fn probe_named_target_ex(
+    device: WDFDEVICE,
+    name: &str,
+    desired_access: u32,
+    share_access: u32,
+) -> i32 {
+    let mut chars = [0_u16; PROBE_NAME_CHARS];
+    let mut length = 0_usize;
+    for byte in name.bytes() {
+        if let Some(slot) = chars.get_mut(length) {
+            *slot = u16::from(byte);
+            length = length.saturating_add(1);
+        }
+    }
+    let mut io_target: WDFIOTARGET = WDF_NO_HANDLE.cast();
+    // SAFETY: устройство создано; дескриптор — локальная переменная.
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfIoTargetCreate,
+            device,
+            WDF_NO_OBJECT_ATTRIBUTES,
+            &raw mut io_target,
+        )
+    };
+    if !nt_ok(status) {
+        return status;
+    }
+    let bytes = u16::try_from(length.saturating_mul(2)).unwrap_or(0);
+    let mut params: WDF_IO_TARGET_OPEN_PARAMS = unsafe { core::mem::zeroed() };
+    params.Size = size_of_ulong::<WDF_IO_TARGET_OPEN_PARAMS>();
+    params.Type = WdfIoTargetOpenByName;
+    params.TargetDeviceName = UNICODE_STRING {
+        Length: bytes,
+        MaximumLength: bytes,
+        Buffer: chars.as_mut_ptr(),
+    };
+    params.DesiredAccess = desired_access;
+    params.ShareAccess = share_access;
+    params.CreateDisposition = wdk_sys::FILE_OPEN;
+    params.FileAttributes = wdk_sys::FILE_ATTRIBUTE_NORMAL;
+    // Как у qcpmic8150: FILE_NON_DIRECTORY_FILE.
+    params.CreateOptions = 0x0000_0040;
+    // SAFETY: цель создана, параметры заполнены, уровень пассивный.
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(WdfIoTargetOpen, io_target, &raw mut params)
+    };
+    // Всегда закрываем цель: и при успехе (не держим чужой стек), и при отказе
+    // (иначе WdfIoTargetCreate оставляет незакрытый объект).
+    // SAFETY: цель создана выше; пассивный уровень.
+    unsafe {
+        if nt_ok(status) {
+            call_unsafe_wdf_function_binding!(WdfIoTargetClose, io_target);
+        }
+        call_unsafe_wdf_function_binding!(WdfObjectDelete, io_target.cast());
+    }
+    status
+}
+
+/// Результат пробы SUPERUSER: статус открытия и байт APSD (если чтение удалось).
+#[derive(Debug, Clone, Copy)]
+pub struct SuperuserApsdProbe {
+    /// `NTSTATUS` открытия `\Device\Spmi\SUPERUSER`.
+    pub open_status: i32,
+    /// `NTSTATUS` peri-grant `0x13` (или `0xFFFFFFFF`, если open не удался).
+    pub grant_status: i32,
+    /// `NTSTATUS` чтения `0x1307` (или `0xFFFFFFFF`, если open/grant отсёк путь).
+    pub read_status: i32,
+    /// Значение `APSD_STATUS`, если `read_status == 0`.
+    pub value: u8,
+}
+
+/// Открывает `\Device\Spmi\SUPERUSER`, выдаёт peri `0x13`, читает `APSD_STATUS` (`0x1307`).
+///
+/// Слот SUPERUSER ограничен тремя одновременными открытиями (`qcpmic` /
+/// `qcpmicext` / `qcpmgpio`). Если все три заняты, open вернёт `0xC0000001`.
+/// При свободном слоте (после reboot/disable одного клиента) путь работает.
+///
+/// # Safety
+///
+/// Пассивный уровень IRQL, устройство создано и не удаляется.
+pub unsafe fn probe_superuser_apsd(device: WDFDEVICE) -> SuperuserApsdProbe {
+    let mut out = SuperuserApsdProbe {
+        open_status: -1,
+        grant_status: -1_i32,
+        read_status: -1_i32,
+        value: 0,
+    };
+    let mut chars = [0_u16; PROBE_NAME_CHARS];
+    let name = "\\Device\\Spmi\\SUPERUSER";
+    let mut length = 0_usize;
+    for byte in name.bytes() {
+        if let Some(slot) = chars.get_mut(length) {
+            *slot = u16::from(byte);
+            length = length.saturating_add(1);
+        }
+    }
+    let mut io_target: WDFIOTARGET = WDF_NO_HANDLE.cast();
+    // SAFETY: устройство создано; дескриптор локальный.
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfIoTargetCreate,
+            device,
+            WDF_NO_OBJECT_ATTRIBUTES,
+            &raw mut io_target,
+        )
+    };
+    if !nt_ok(status) {
+        out.open_status = status;
+        return out;
+    }
+    let bytes = u16::try_from(length.saturating_mul(2)).unwrap_or(0);
+    let mut params: WDF_IO_TARGET_OPEN_PARAMS = unsafe { core::mem::zeroed() };
+    params.Size = size_of_ulong::<WDF_IO_TARGET_OPEN_PARAMS>();
+    params.Type = WdfIoTargetOpenByName;
+    params.TargetDeviceName = UNICODE_STRING {
+        Length: bytes,
+        MaximumLength: bytes,
+        Buffer: chars.as_mut_ptr(),
+    };
+    // Как qcpmic8150: GENERIC_READ|GENERIC_WRITE, share all, FILE_NON_DIRECTORY_FILE.
+    params.DesiredAccess = 0xC000_0000;
+    params.ShareAccess = PROBE_SHARE_ALL;
+    params.CreateDisposition = wdk_sys::FILE_OPEN;
+    params.FileAttributes = wdk_sys::FILE_ATTRIBUTE_NORMAL;
+    params.CreateOptions = 0x0000_0040;
+    // SAFETY: цель создана, пассивный уровень.
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(WdfIoTargetOpen, io_target, &raw mut params)
+    };
+    out.open_status = status;
+    if !nt_ok(status) {
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, io_target.cast());
+        }
+        return out;
+    }
+
+    // peri-grant: u16 count=1, u16 peri=0x0013
+    let grant = [1_u8, 0, 0x13, 0];
+    let mut request: WDFREQUEST = WDF_NO_HANDLE.cast();
+    let mut in_mem: WDFMEMORY = WDF_NO_HANDLE.cast();
+    let mut in_ptr: *mut core::ffi::c_void = core::ptr::null_mut();
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfRequestCreate,
+            WDF_NO_OBJECT_ATTRIBUTES,
+            io_target,
+            &raw mut request,
+        )
+    };
+    if !nt_ok(status) {
+        out.grant_status = status;
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfIoTargetClose, io_target);
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, io_target.cast());
+        }
+        return out;
+    }
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfMemoryCreate,
+            WDF_NO_OBJECT_ATTRIBUTES,
+            wdk_sys::_POOL_TYPE::NonPagedPool,
+            0,
+            grant.len(),
+            &raw mut in_mem,
+            &raw mut in_ptr,
+        )
+    };
+    if !nt_ok(status) {
+        out.grant_status = status;
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, request.cast());
+            call_unsafe_wdf_function_binding!(WdfIoTargetClose, io_target);
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, io_target.cast());
+        }
+        return out;
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(grant.as_ptr(), in_ptr.cast::<u8>(), grant.len());
+    }
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfIoTargetFormatRequestForIoctl,
+            io_target,
+            request,
+            IOCTL_SPMI_SUPERUSER_GRANT,
+            in_mem,
+            core::ptr::null_mut(),
+            WDF_NO_HANDLE.cast(),
+            core::ptr::null_mut(),
+        )
+    };
+    if nt_ok(status) {
+        let mut options: WDF_REQUEST_SEND_OPTIONS = unsafe { core::mem::zeroed() };
+        options.Size = size_of_ulong::<WDF_REQUEST_SEND_OPTIONS>();
+        options.Flags =
+            (WDF_REQUEST_SEND_OPTION_SYNCHRONOUS | WDF_REQUEST_SEND_OPTION_TIMEOUT) as ULONG;
+        options.Timeout = SPB_TIMEOUT_100NS;
+        let sent = unsafe {
+            call_unsafe_wdf_function_binding!(
+                WdfRequestSend,
+                request,
+                io_target,
+                &raw mut options,
+            )
+        };
+        out.grant_status = if sent == 0 {
+            -1
+        } else {
+            unsafe { call_unsafe_wdf_function_binding!(WdfRequestGetStatus, request) }
+        };
+    } else {
+        out.grant_status = status;
+    }
+    unsafe {
+        call_unsafe_wdf_function_binding!(WdfObjectDelete, in_mem.cast());
+        call_unsafe_wdf_function_binding!(WdfObjectDelete, request.cast());
+    }
+
+    // READ APSD_STATUS: header + 1-byte output. addr_enc = (sid2 << 16) | 0x1307
+    let mut header = [0_u8; SPMI_SUPERUSER_HEADER_LEN];
+    header[4] = 0x07;
+    header[5] = 0x13;
+    header[6] = 0x02;
+    header[7] = 0x00;
+    header[8] = 0x01;
+    let mut request: WDFREQUEST = WDF_NO_HANDLE.cast();
+    let mut in_mem: WDFMEMORY = WDF_NO_HANDLE.cast();
+    let mut out_mem: WDFMEMORY = WDF_NO_HANDLE.cast();
+    let mut in_ptr: *mut core::ffi::c_void = core::ptr::null_mut();
+    let mut out_ptr: *mut core::ffi::c_void = core::ptr::null_mut();
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfRequestCreate,
+            WDF_NO_OBJECT_ATTRIBUTES,
+            io_target,
+            &raw mut request,
+        )
+    };
+    if !nt_ok(status) {
+        out.read_status = status;
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfIoTargetClose, io_target);
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, io_target.cast());
+        }
+        return out;
+    }
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfMemoryCreate,
+            WDF_NO_OBJECT_ATTRIBUTES,
+            wdk_sys::_POOL_TYPE::NonPagedPool,
+            0,
+            header.len(),
+            &raw mut in_mem,
+            &raw mut in_ptr,
+        )
+    };
+    if !nt_ok(status) {
+        out.read_status = status;
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, request.cast());
+            call_unsafe_wdf_function_binding!(WdfIoTargetClose, io_target);
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, io_target.cast());
+        }
+        return out;
+    }
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfMemoryCreate,
+            WDF_NO_OBJECT_ATTRIBUTES,
+            wdk_sys::_POOL_TYPE::NonPagedPool,
+            0,
+            1,
+            &raw mut out_mem,
+            &raw mut out_ptr,
+        )
+    };
+    if !nt_ok(status) {
+        out.read_status = status;
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, in_mem.cast());
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, request.cast());
+            call_unsafe_wdf_function_binding!(WdfIoTargetClose, io_target);
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, io_target.cast());
+        }
+        return out;
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(header.as_ptr(), in_ptr.cast::<u8>(), header.len());
+        core::ptr::write_volatile(out_ptr.cast::<u8>(), 0xFF);
+    }
+    let status = unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfIoTargetFormatRequestForIoctl,
+            io_target,
+            request,
+            IOCTL_SPMI_SUPERUSER_READ,
+            in_mem,
+            core::ptr::null_mut(),
+            out_mem,
+            core::ptr::null_mut(),
+        )
+    };
+    if nt_ok(status) {
+        let mut options: WDF_REQUEST_SEND_OPTIONS = unsafe { core::mem::zeroed() };
+        options.Size = size_of_ulong::<WDF_REQUEST_SEND_OPTIONS>();
+        options.Flags =
+            (WDF_REQUEST_SEND_OPTION_SYNCHRONOUS | WDF_REQUEST_SEND_OPTION_TIMEOUT) as ULONG;
+        options.Timeout = SPB_TIMEOUT_100NS;
+        let sent = unsafe {
+            call_unsafe_wdf_function_binding!(
+                WdfRequestSend,
+                request,
+                io_target,
+                &raw mut options,
+            )
+        };
+        out.read_status = if sent == 0 {
+            -1
+        } else {
+            unsafe { call_unsafe_wdf_function_binding!(WdfRequestGetStatus, request) }
+        };
+        if nt_ok(out.read_status) {
+            out.value = unsafe { core::ptr::read_volatile(out_ptr.cast::<u8>()) };
+        }
+    } else {
+        out.read_status = status;
+    }
+    unsafe {
+        call_unsafe_wdf_function_binding!(WdfObjectDelete, out_mem.cast());
+        call_unsafe_wdf_function_binding!(WdfObjectDelete, in_mem.cast());
+        call_unsafe_wdf_function_binding!(WdfObjectDelete, request.cast());
+        call_unsafe_wdf_function_binding!(WdfIoTargetClose, io_target);
+        call_unsafe_wdf_function_binding!(WdfObjectDelete, io_target.cast());
+    }
+    out
+}
+
+/// SID PM8150B USBIN (charger peripheral on SPMI).
+pub const SPMI_SID_USBIN: u8 = 2;
+/// Peri-grant id for USBIN (`0x13` — matches register bank `0x13xx`).
+pub const SPMI_PERI_USBIN: u16 = 0x0013;
+
+/// Кодирует адрес SUPERUSER: `(sid << 16) | reg`.
+#[must_use]
+pub const fn superuser_addr_enc(sid: u8, reg: u16) -> u32 {
+    ((sid as u32) << 16) | (reg as u32)
+}
+
+/// Сессия `\Device\Spmi\SUPERUSER`: один open → grant → R/W → close.
+///
+/// Слот SUPERUSER ограничен тремя одновременными открытиями. Держим handle
+/// только на время negotiate и закрываем в [`Drop`], чтобы не блокировать
+/// `qcpmic` / `qcpmicext` / `qcpmgpio`.
+#[derive(Debug)]
+pub struct SuperuserBus {
+    target: WDFIOTARGET,
+}
+
+impl SuperuserBus {
+    /// Открывает `\Device\Spmi\SUPERUSER` (share-all, R/W).
+    ///
+    /// # Errors
+    ///
+    /// Возвращает сырой `NTSTATUS` открытия / создания цели.
+    ///
+    /// # Safety
+    ///
+    /// Пассивный уровень IRQL; `device` жив.
+    pub unsafe fn open(device: WDFDEVICE) -> Result<Self, i32> {
+        let mut chars = [0_u16; PROBE_NAME_CHARS];
+        let name = "\\Device\\Spmi\\SUPERUSER";
+        let mut length = 0_usize;
+        for byte in name.bytes() {
+            if let Some(slot) = chars.get_mut(length) {
+                *slot = u16::from(byte);
+                length = length.saturating_add(1);
+            }
+        }
+        let mut io_target: WDFIOTARGET = WDF_NO_HANDLE.cast();
+        // SAFETY: устройство создано; дескриптор локальный.
+        let status = unsafe {
+            call_unsafe_wdf_function_binding!(
+                WdfIoTargetCreate,
+                device,
+                WDF_NO_OBJECT_ATTRIBUTES,
+                &raw mut io_target,
+            )
+        };
+        if !nt_ok(status) {
+            return Err(status);
+        }
+        let bytes = u16::try_from(length.saturating_mul(2)).unwrap_or(0);
+        let mut params: WDF_IO_TARGET_OPEN_PARAMS = unsafe { core::mem::zeroed() };
+        params.Size = size_of_ulong::<WDF_IO_TARGET_OPEN_PARAMS>();
+        params.Type = WdfIoTargetOpenByName;
+        params.TargetDeviceName = UNICODE_STRING {
+            Length: bytes,
+            MaximumLength: bytes,
+            Buffer: chars.as_mut_ptr(),
+        };
+        params.DesiredAccess = 0xC000_0000;
+        params.ShareAccess = PROBE_SHARE_ALL;
+        params.CreateDisposition = wdk_sys::FILE_OPEN;
+        params.FileAttributes = wdk_sys::FILE_ATTRIBUTE_NORMAL;
+        params.CreateOptions = 0x0000_0040;
+        // SAFETY: цель создана, пассивный уровень.
+        let status = unsafe {
+            call_unsafe_wdf_function_binding!(WdfIoTargetOpen, io_target, &raw mut params)
+        };
+        if !nt_ok(status) {
+            unsafe {
+                call_unsafe_wdf_function_binding!(WdfObjectDelete, io_target.cast());
+            }
+            return Err(status);
+        }
+        Ok(Self { target: io_target })
+    }
+
+    /// Peri-grant: `u16 count` + `count × u16` peri ids.
+    ///
+    /// # Errors
+    ///
+    /// Сырой `NTSTATUS` IOCTL grant.
+    pub fn grant(&mut self, peri: u16) -> Result<(), i32> {
+        let mut grant = [0_u8; 4];
+        grant[0] = 1;
+        grant[1] = 0;
+        grant[2] = (peri & 0xFF) as u8;
+        grant[3] = ((peri >> 8) & 0xFF) as u8;
+        self.ioctl_in(IOCTL_SPMI_SUPERUSER_GRANT, &grant)
+    }
+
+    /// Читает один байт: SID + регистр (`addr_enc = (sid<<16)|reg`).
+    ///
+    /// # Errors
+    ///
+    /// Сырой `NTSTATUS` IOCTL read.
+    pub fn read_u8(&mut self, sid: u8, reg: u16) -> Result<u8, i32> {
+        let mut buf = [0_u8; 1];
+        self.read_bytes(sid, reg, &mut buf)?;
+        Ok(buf[0])
+    }
+
+    /// Пишет один байт.
+    ///
+    /// # Errors
+    ///
+    /// Сырой `NTSTATUS` IOCTL write.
+    pub fn write_u8(&mut self, sid: u8, reg: u16, value: u8) -> Result<(), i32> {
+        self.write_bytes(sid, reg, &[value])
+    }
+
+    /// Читает `out.len()` байт начиная с `reg`.
+    ///
+    /// # Errors
+    ///
+    /// Сырой `NTSTATUS` или `STATUS_INVALID_PARAMETER`, если длина 0 / >255.
+    pub fn read_bytes(&mut self, sid: u8, reg: u16, out: &mut [u8]) -> Result<(), i32> {
+        let len = out.len();
+        if len == 0 || len > 255 {
+            return Err(wdk_sys::STATUS_INVALID_PARAMETER);
+        }
+        let mut header = [0_u8; SPMI_SUPERUSER_HEADER_LEN];
+        let enc = superuser_addr_enc(sid, reg);
+        header[4] = (enc & 0xFF) as u8;
+        header[5] = ((enc >> 8) & 0xFF) as u8;
+        header[6] = ((enc >> 16) & 0xFF) as u8;
+        header[7] = ((enc >> 24) & 0xFF) as u8;
+        header[8] = len as u8;
+        self.ioctl_in_out(IOCTL_SPMI_SUPERUSER_READ, &header, out)
+    }
+
+    /// Пишет payload начиная с `reg`.
+    ///
+    /// # Errors
+    ///
+    /// Сырой `NTSTATUS` или `STATUS_INVALID_PARAMETER`, если длина 0 / >255.
+    pub fn write_bytes(&mut self, sid: u8, reg: u16, data: &[u8]) -> Result<(), i32> {
+        let len = data.len();
+        if len == 0 || len > 255 {
+            return Err(wdk_sys::STATUS_INVALID_PARAMETER);
+        }
+        let mut buf = [0_u8; SPMI_SUPERUSER_HEADER_LEN.saturating_add(255)];
+        let enc = superuser_addr_enc(sid, reg);
+        buf[4] = (enc & 0xFF) as u8;
+        buf[5] = ((enc >> 8) & 0xFF) as u8;
+        buf[6] = ((enc >> 16) & 0xFF) as u8;
+        buf[7] = ((enc >> 24) & 0xFF) as u8;
+        buf[8] = len as u8;
+        let total = SPMI_SUPERUSER_HEADER_LEN.saturating_add(len);
+        if let Some(dst) = buf.get_mut(SPMI_SUPERUSER_HEADER_LEN..total) {
+            dst.copy_from_slice(data);
+        }
+        self.ioctl_in(IOCTL_SPMI_SUPERUSER_WRITE, &buf[..total])
+    }
+
+    fn ioctl_in(&mut self, ioctl: u32, input: &[u8]) -> Result<(), i32> {
+        let mut empty = [];
+        self.ioctl_in_out(ioctl, input, &mut empty)
+    }
+
+    fn ioctl_in_out(&mut self, ioctl: u32, input: &[u8], output: &mut [u8]) -> Result<(), i32> {
+        let mut request: WDFREQUEST = WDF_NO_HANDLE.cast();
+        let mut in_mem: WDFMEMORY = WDF_NO_HANDLE.cast();
+        let mut out_mem: WDFMEMORY = WDF_NO_HANDLE.cast();
+        let mut in_ptr: *mut core::ffi::c_void = core::ptr::null_mut();
+        let mut out_ptr: *mut core::ffi::c_void = core::ptr::null_mut();
+
+        // SAFETY: цель открыта; пассивный уровень.
+        let status = unsafe {
+            call_unsafe_wdf_function_binding!(
+                WdfRequestCreate,
+                WDF_NO_OBJECT_ATTRIBUTES,
+                self.target,
+                &raw mut request,
+            )
+        };
+        if !nt_ok(status) {
+            return Err(status);
+        }
+
+        let status = unsafe {
+            call_unsafe_wdf_function_binding!(
+                WdfMemoryCreate,
+                WDF_NO_OBJECT_ATTRIBUTES,
+                wdk_sys::_POOL_TYPE::NonPagedPool,
+                0,
+                input.len(),
+                &raw mut in_mem,
+                &raw mut in_ptr,
+            )
+        };
+        if !nt_ok(status) {
+            unsafe {
+                call_unsafe_wdf_function_binding!(WdfObjectDelete, request.cast());
+            }
+            return Err(status);
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(input.as_ptr(), in_ptr.cast::<u8>(), input.len());
+        }
+
+        let out_handle = if output.is_empty() {
+            WDF_NO_HANDLE.cast()
+        } else {
+            let status = unsafe {
+                call_unsafe_wdf_function_binding!(
+                    WdfMemoryCreate,
+                    WDF_NO_OBJECT_ATTRIBUTES,
+                    wdk_sys::_POOL_TYPE::NonPagedPool,
+                    0,
+                    output.len(),
+                    &raw mut out_mem,
+                    &raw mut out_ptr,
+                )
+            };
+            if !nt_ok(status) {
+                unsafe {
+                    call_unsafe_wdf_function_binding!(WdfObjectDelete, in_mem.cast());
+                    call_unsafe_wdf_function_binding!(WdfObjectDelete, request.cast());
+                }
+                return Err(status);
+            }
+            unsafe {
+                core::ptr::write_bytes(out_ptr.cast::<u8>(), 0xFF, output.len());
+            }
+            out_mem
+        };
+
+        let status = unsafe {
+            call_unsafe_wdf_function_binding!(
+                WdfIoTargetFormatRequestForIoctl,
+                self.target,
+                request,
+                ioctl,
+                in_mem,
+                core::ptr::null_mut(),
+                out_handle,
+                core::ptr::null_mut(),
+            )
+        };
+        let result = if nt_ok(status) {
+            let mut options: WDF_REQUEST_SEND_OPTIONS = unsafe { core::mem::zeroed() };
+            options.Size = size_of_ulong::<WDF_REQUEST_SEND_OPTIONS>();
+            options.Flags =
+                (WDF_REQUEST_SEND_OPTION_SYNCHRONOUS | WDF_REQUEST_SEND_OPTION_TIMEOUT) as ULONG;
+            options.Timeout = SPB_TIMEOUT_100NS;
+            let sent = unsafe {
+                call_unsafe_wdf_function_binding!(
+                    WdfRequestSend,
+                    request,
+                    self.target,
+                    &raw mut options,
+                )
+            };
+            if sent == 0 {
+                Err(-1)
+            } else {
+                let st =
+                    unsafe { call_unsafe_wdf_function_binding!(WdfRequestGetStatus, request) };
+                if nt_ok(st) {
+                    if !output.is_empty() && !out_ptr.is_null() {
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                out_ptr.cast::<u8>(),
+                                output.as_mut_ptr(),
+                                output.len(),
+                            );
+                        }
+                    }
+                    Ok(())
+                } else {
+                    Err(st)
+                }
+            }
+        } else {
+            Err(status)
+        };
+
+        unsafe {
+            if !output.is_empty() {
+                call_unsafe_wdf_function_binding!(WdfObjectDelete, out_mem.cast());
+            }
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, in_mem.cast());
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, request.cast());
+        }
+        result
+    }
+}
+
+impl Drop for SuperuserBus {
+    fn drop(&mut self) {
+        if self.target.is_null() {
+            return;
+        }
+        // SAFETY: цель создана в `open`; вызывается на пассивном уровне (negotiate).
+        unsafe {
+            call_unsafe_wdf_function_binding!(WdfIoTargetClose, self.target);
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, self.target.cast());
+        }
+        self.target = WDF_NO_HANDLE.cast();
+    }
 }
 
 /// Число символов в пути (префикс + 16 цифр).

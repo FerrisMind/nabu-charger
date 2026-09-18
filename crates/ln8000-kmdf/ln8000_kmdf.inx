@@ -15,11 +15,18 @@
 
 [Version]
 Signature   = "$WINDOWS NT$"
-Class       = Battery
-ClassGuid   = {72631e54-78a4-11d0-bcf7-00aa00b7b32a}
+; Charge pump is NOT a battery device. Class=Battery made Windows treat
+; PEIC as a second battery that never implements BATTERY_* IOCTLs, so
+; Settings / Win32_Battery disappear (qcbattminiclass alone is not enough).
+; Match stock qcpmicEIC: System class.
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
 Provider    = %ProviderString%
 PnpLockDown = 1
-DriverVer   = 09/17/2026,0.2.2.0
+; Must stay ABOVE tablet-bound oem142 (20.46.10.591). cargo-wdk stampinf
+; uses STAMPINF_VERSION when set (see deploy/build-arm64.ps1); without it
+; stampinf -v * stamps wall-clock and can fall below oem142 on AM rebuilds.
+DriverVer   = 09/18/2026,20.47.10.625
 
 [DestinationDirs]
 DefaultDestDir = 13
@@ -63,8 +70,10 @@ ServiceBinary  = %13%\ln8000_kmdf.sys
 
 [Ln8000_Device.NT$ARCH$.HW]
 HKR, Parameters, IinLimitUa,      %REG_DWORD%, 2000000
-HKR, Parameters, VbatFloatUv,     %REG_DWORD%, 4440000
-HKR, Parameters, VacOvpUv,        %REG_DWORD%, 9500000
+; FFC fv-max (qcom,fv-max-uv, dtbo-03) = 4.47 V; non-FFC (qcom,non-fcc-fv-max-uv)
+; = 4.45 V is the guard taper threshold. 4.42 V is only the QC3 loop limit.
+HKR, Parameters, VbatFloatUv,     %REG_DWORD%, 4470000
+HKR, Parameters, VacOvpUv,        %REG_DWORD%, 13000000
 ; protection thresholds (tenths of degC) and currents (uA):
 HKR, Parameters, TempReduceDc,    %REG_DWORD%, 430
 HKR, Parameters, TempBypassDc,    %REG_DWORD%, 480
@@ -72,13 +81,16 @@ HKR, Parameters, TempStopDc,      %REG_DWORD%, 550
 HKR, Parameters, IinMaxUa,        %REG_DWORD%, 3500000
 HKR, Parameters, IinTargetUa,     %REG_DWORD%, 2000000
 HKR, Parameters, IinFloorUa,      %REG_DWORD%, 500000
-HKR, Parameters, VbatReduceUv,    %REG_DWORD%, 4420000
-HKR, Parameters, TelemetryMs,     %REG_DWORD%, 1000
+HKR, Parameters, VbatReduceUv,    %REG_DWORD%, 4450000
+HKR, Parameters, TelemetryMs,     %REG_DWORD%, 250
 HKR, Parameters, BusRetryCount,   %REG_DWORD%, 2
 HKR, Parameters, NtcAlarmCfg,     %REG_DWORD%, 226
 HKR, Parameters, WatchdogEnabled, %REG_DWORD%, 0
-; 0 = pump protections as in the tablet Device Tree, 1 = loops enabled
-HKR, Parameters, ProtectionProfile, %REG_DWORD%, 0
+; 0 = pump protections as in the tablet Device Tree, 1 = loops enabled.
+; Под Windows батарею ведёт не SMB5, а сам насос: при 0 (как в DTS) напряжение
+; ограничивает только аппаратный VBAT_OV ~ V_FLOAT*1.02, и чистая установка
+; молча теряла петли V_FLOAT/IIN. Поэтому умолчание — 1.
+HKR, Parameters, ProtectionProfile, %REG_DWORD%, 1
 
 ; ================= strings =================
 

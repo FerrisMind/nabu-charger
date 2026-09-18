@@ -323,7 +323,6 @@ dependencies = [
  "wdk",
  "wdk-alloc",
  "wdk-build",
- "wdk-panic",
  "wdk-sys",
 ]
 
@@ -766,12 +765,6 @@ dependencies = [
  "serde_json",
  "syn 2.0.119",
 ]
-
-[[package]]
-name = "wdk-panic"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e594cced255434b29bfca586a74653985281377ff4e36b8cfa58fd4c4c63073a"
 
 [[package]]
 name = "wdk-sys"

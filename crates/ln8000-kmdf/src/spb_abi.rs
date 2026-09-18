@@ -78,6 +78,22 @@ pub const IOCTL_SPB_MULTI_SPI_TRANSFER: u32 = 0x0004_1818;
 /// узлу до доступа к регистрам (`0x32C004` из разбора `qcpmicEIC8150.sys`).
 pub const IOCTL_ATTACH: u32 = 0x0032_C004;
 
+/// SPMI SUPERUSER: чтение байт (`CTL_CODE(0x85B5, 0x903, METHOD_BUFFERED, ANY)`).
+pub const IOCTL_SPMI_SUPERUSER_READ: u32 = 0x85B5_240C;
+
+/// SPMI SUPERUSER: запись байт.
+pub const IOCTL_SPMI_SUPERUSER_WRITE: u32 = 0x85B5_2410;
+
+/// SPMI SUPERUSER: битовая операция (длина 1).
+#[allow(dead_code)]
+pub const IOCTL_SPMI_SUPERUSER_BITOP: u32 = 0x85B5_2414;
+
+/// SPMI SUPERUSER: grant списка периферий (`u16 count` + `count × u16`).
+pub const IOCTL_SPMI_SUPERUSER_GRANT: u32 = 0x85B5_2418;
+
+/// Длина заголовка R/W SUPERUSER: `{u32 flags, u32 addr_enc, u32 len}`.
+pub const SPMI_SUPERUSER_HEADER_LEN: usize = 12;
+
 /// Магия во входе запроса подключения (`0x42696541` — `AeiB`).
 pub const ATTACH_MAGIC: u32 = 0x4269_6541;
 

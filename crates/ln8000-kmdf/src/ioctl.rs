@@ -36,6 +36,20 @@ pub const IOCTL_LN8000_GET_SAMPLES: u32 = ctl_code(0x816, 0, 0);
 /// never fails silently: the caller sees the raw `SYS_STS`.
 pub const IOCTL_LN8000_SET_CHARGE: u32 = ctl_code(0x817, 0, 0);
 
+/// `error_code` для отказа включить 1:1 вне окна обхода.
+///
+/// Отдельный код (не `-4`): это не отказ чипа, а запрет политики — 1:1 подаёт
+/// вход напрямую на батарею, поэтому при `Vin >= 8 В` (или ниже 4,2 В) режим не
+/// включается ни через `SET_MODE`, ни автоматикой.
+pub const ERR_BYPASS_VIN_OUT_OF_WINDOW: i32 = -20;
+
+/// Run HVDCP / QC negotiate (SUPERUSER preferred; Usbin RH secondary).
+///
+/// On stock ACPI (`UsbinConn=0`) opens `\Device\Spmi\SUPERUSER`, grants peri
+/// `0x13`, enables `0x1362`, reruns APSD, then QC2 FORCE_9V or QC3 pulses.
+/// Returns `error_code = -10` only when **both** SUPERUSER and Usbin RH fail.
+pub const IOCTL_LN8000_RUN_HVDCP: u32 = ctl_code(0x818, 0, 0);
+
 /// Идентификатор структуры состояния.
 pub const LN8000_STATUS_MAGIC: u32 = 0x4C4E_3830; // "LN80"
 
@@ -120,6 +134,11 @@ pub struct Ln8000LimitsRequest {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Ln8000ModeRequest {
     /// Желаемый режим (1 — standby, 2 — bypass, 3 — switching).
+    ///
+    /// `2` включается только в окне обхода (`Vin` 4,2…8 В): при повышенном
+    /// напряжении возвращается `error_code = -20`
+    /// ([`ERR_BYPASS_VIN_OUT_OF_WINDOW`]), потому что 1:1 подаёт вход прямо на
+    /// батарею.
     pub mode: u8,
     /// Фактический режим после переключения.
     pub applied_mode: u8,
@@ -203,4 +222,26 @@ pub struct Ln8000SamplesRequest {
     pub available: u32,
     /// Первый отсчёт в буфере (идут подряд).
     pub first: Ln8000Sample,
+}
+
+/// Запрос [`IOCTL_LN8000_RUN_HVDCP`].
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Ln8000HvdcpRequest {
+    /// 1 = run negotiate; 0 = report last soft state only (no bus).
+    pub command: u8,
+    /// Last APSD_STATUS after a run.
+    pub apsd_status: u8,
+    /// Last APSD_RESULT after a run.
+    pub apsd_result: u8,
+    /// Soft pulse count.
+    pub pulse_cnt: u8,
+    /// Machine phase code (`HvdcpPhase`).
+    pub phase: u32,
+    /// Target VBUS (µV), `2*VBAT+200mV`.
+    pub target_vbus_uv: u32,
+    /// Estimated adapter VBUS from soft pulse count (µV).
+    pub estimated_vbus_uv: u32,
+    /// 0 = ok; -10 = no SUPERUSER+Usbin; -11 open fail; -12 SPMI; -13 APSD timeout; -14 not QC.
+    pub error_code: i32,
 }

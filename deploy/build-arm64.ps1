@@ -38,6 +38,13 @@ $targets = @(
 
 if (-not $env:LIBCLANG_PATH) { $env:LIBCLANG_PATH = 'C:\Program Files\LLVM\bin' }
 
+# Outrank tablet oem142 (20.46.10.591). Without STAMPINF_VERSION, cargo-wdk
+# passes stampinf -v * (wall-clock) which can stamp below oem142 on AM builds.
+if (-not $env:STAMPINF_VERSION) {
+  $env:STAMPINF_VERSION = '20.47.10.625'
+}
+Write-Host ("STAMPINF_VERSION=" + $env:STAMPINF_VERSION) -ForegroundColor DarkGray
+
 $built = @()
 foreach ($t in $targets) {
   $cratePath = Join-Path $RepoRoot $t.Crate
