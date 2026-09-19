@@ -2468,7 +2468,7 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
         die_temp_dc: temp,
         op_mode: status.op_mode,
         input_present: !status.has_critical_fault() && vbus_uv > 0 && !phantom_input,
-        vbat_valid: vbat_read.is_ok(),
+        vbat_valid: ln8000::encoding::vbat_reading_usable(vbat_read.is_ok(), vbat_uv),
         die_temp_valid: temp_read.is_ok(),
     };
     st.telemetry.push(sample);
@@ -2493,7 +2493,9 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
         mark_device_value(device, "SuIin", sample.iin_ua);
         mark_device_value(device, "SuMode", u32::from(status.op_mode.code()));
         // Битовая маска достоверности каналов (0 — все прочитаны): в дампе
-        // отказ чтения больше не выглядит как настоящий ноль.
+        // отказ чтения больше не выглядит как настоящий ноль. Бит 0 покрывает и
+        // гибернацию АЦП: уснувший чип читается успешно, но отдаёт ноль, а ноль
+        // вольт на живой банке невозможен (`encoding::vbat_reading_usable`).
         // бит 0 — VBAT, бит 1 — DieTemp, бит 2 — Iin, бит 3 — Vin.
         mark_device_value(
             device,

@@ -276,6 +276,22 @@ pub const fn vbat_tracks_converter_rail(vbat_uv: u32, vin_uv: u32) -> bool {
     vin_is_doubled_vbat(vbat_uv, vin_uv)
 }
 
+/// Пригоден ли отсчёт VBAT к решениям о токе.
+///
+/// Ноль вольт на живой банке невозможен, а АЦП LN8000 уходит в автогибернацию
+/// через 4 с покоя: шаг 9 инициализации пишет `ADC_CTRL` биты 5:7 = `AutoHibernate`
+/// с задержкой `Sec4`, после чего регистры `ADC01..ADC09` читаются **успешно**, но
+/// содержат `0x00` во всех каналах. Поэтому `is_ok()` на таком такте означает
+/// «регистр ответил», а не «канал жив», и ноль обязан считаться недостоверным.
+///
+/// Живой замер 19.09 (кабель отключён, `ADC_CTRL = 0x1C` = AutoHibernate):
+/// `vbat = 0`, `AdcValid = 0` — то есть марка рапортовала «все каналы прочитаны»,
+/// а сторож [`crate::guard`] принимал решения о токе по несуществующему напряжению.
+#[must_use]
+pub const fn vbat_reading_usable(read_ok: bool, vbat_uv: u32) -> bool {
+    read_ok && vbat_uv > 0
+}
+
 /// True when Vbat is in the Android taper / OV-risk band relative to float.
 ///
 /// Pass `vin_uv` when known: if VBAT is glued to `Vin/2`, this returns `false`
@@ -822,5 +838,21 @@ mod tests {
         assert_eq!(AdcHibernateDelay::Sec4.code(), 3);
         assert_eq!(AdcMode::Shutdown.code(), 2);
         assert_eq!(AdcMode::AutoHibernate.code(), 0);
+    }
+
+    #[test]
+    fn hibernated_adc_zero_is_not_a_usable_vbat_reading() {
+        // Живой замер 19.09, кабель отключён: `ADC_CTRL = 0x1C`. Биты 5:7 = 0 =
+        // `AutoHibernate`, биты 3:4 = 3 = `Sec4` — то есть ровно то, что пишет
+        // шаг 9 инициализации. Через четыре секунды покоя `ADC01..ADC09` читаются
+        // успешно и содержат `0x00`.
+        assert_eq!(0x1Cu8 >> 5, AdcMode::AutoHibernate.code());
+        assert_eq!((0x1Cu8 >> 3) & 0x03, AdcHibernateDelay::Sec4.code());
+        // Успешно прочитанный ноль — всё равно не отсчёт банки.
+        assert!(!vbat_reading_usable(true, 0));
+        assert!(vbat_reading_usable(true, 4_400_000));
+        // Отказ чтения недостоверен при любом значении.
+        assert!(!vbat_reading_usable(false, 4_400_000));
+        assert!(!vbat_reading_usable(false, 0));
     }
 }
