@@ -145,6 +145,118 @@ const CHARGE_RETRY_MS: u64 = 30_000;
 /// Изменение входа, при котором попытка повторяется сразу, мкВ.
 const CHARGE_RETRY_DELTA_UV: u32 = 300_000;
 
+/// Пол между попытками «по изменению входа», мс.
+///
+/// Сам по себе [`CHARGE_RETRY_DELTA_UV`] темпа не ограничивает: на пяти­вольтовом
+/// входе `recover_5v_bypass` делает POR, POR перезапускает детект входа, и шина
+/// ходит пилой в пол-вольта. Каждый зуб — «вход изменился» и новая попытка.
+/// Живой замер 19.09 14:45 (MDY-08-EI после потери QC-уровня): Vin 4,27↔4,83 В,
+/// `ChargeAttemptN` 198→346 за 3,5 мин (1,6 попытки/с), `FAULT1 = 0x21`, ток —
+/// пол АЦП. Пол в пять секунд оставляет быстрый повтор осмысленным (QC поднял
+/// шину — перерешаем сразу), но снимает шторм: POR тяжёл, а защёлка VFAULT после
+/// него всё равно возвращается, пока вход не поднят.
+const CHARGE_RETRY_FAST_MS: u64 = 5_000;
+
+/// Первая выдержка повторного разгона HVDCP, мс.
+///
+/// Согласование идёт только по автостарту и по фронту входа
+/// ([`hvdcp::should_renegotiate_on_input_edge`]), поэтому потерянный QC-уровень
+/// сам не возвращается: блок откатился на 5 В, обход 1:1 закрыт защёлкой — и
+/// шина стоит на пяти вольтах до переподключения. Живой замер 19.09 14:45:
+/// `ac=1`, `chg=0`, mode 1, 39 мА, `LastEnableErr = -4`, `FAULT1 = 0x21`.
+/// Здесь мы повторяем то, что делает переподключение, не дожидаясь оператора.
+const RE_ELEVATE_FIRST_MS: u64 = 60_000;
+
+/// Предел выдержки повторного разгона, мс.
+///
+/// На честном пяти­вольтовом источнике (DCP-зарядник, порт без QC) разгон
+/// бесполезен, а стоит транзакций SPMI и сброса детекта входа, поэтому каждая
+/// неудача удваивает выдержку до этого предела.
+const RE_ELEVATE_BACKOFF_MAX_MS: u64 = 300_000;
+
+/// Банка, выше которой повторный разгон не нужен, мкВ.
+///
+/// У верха заряда ток и так ограничен тапером, а лишний сброс входа на
+/// заполненной банке мешает дозаряду.
+const RE_ELEVATE_MAX_VBAT_UV: u32 = 4_350_000;
+
+/// Шаг поля FCC бака (buck) SMB5 PM8150B, мкА на разряд.
+///
+/// `.step_u` параметра PM8150B в вендорной шапке
+/// (`drivers_power_supply_qcom_qpnp-smb5.c:128-134`: `min_u = 0`,
+/// `max_u = 8 000 000`, `step_u = 50 000`); там же и регистр —
+/// `CHGR_FAST_CHARGE_CURRENT_CFG_REG`. Живой замер 19.09 дал `ChgrFccRaw = 30`,
+/// то есть 1,50 А, — это и есть заводской предел бака на нашем планшете.
+const FCC_STEP_UA: u32 = 50_000;
+
+/// Предел FCC бака, который драйвер ставит, пока насос несёт ток, мкА.
+///
+/// Живой замер 19.09 (сборка .652, MDY-08-EI): `ChgrFccRaw = 30` — бак упёрт в
+/// 1,5 А, которые оставила прошивка, при `FgIbatUa` ≈ 2,9 А и `SysStsRaw =
+/// 0x04` (насос в 2:1 без петель `IIN_LOOP`/`VFLOAT_LOOP`, то есть отдаёт
+/// сколько дают). Бак — вторая зарядная ветка платформы, её потолок вендорный
+/// DT планшета задаёт равным 5,9 А (`qcom,fcc-max-ua = <5900000>`,
+/// `arch/arm64/boot/dts/qcom/xiaomi/overlay/nabu/nabu-sm8150.dtsi:68`), и Android
+/// поднимает FCC, когда активен насос.
+///
+/// Берём 2,5 А, а не 5,9 А: канала температуры банки, которому можно верить, у
+/// драйвера пока нет, а это первая сборка, которая вообще трогает ток банки.
+/// Ступень 1,5 → 2,5 А снимает заводской потолок бака, оставаясь ниже и
+/// вендорного максимума, и той суммы, которую уже видел живой замер.
+const FCC_PUMP_UA: u32 = 2_500_000;
+
+/// Уставка одноразовой пробы записи FCC бака, мкА.
+///
+/// Проба нужна потому, что путь записи в CHGR до сих пор не исполнялся ни разу:
+/// живой замер 19.09 — 92 % банки, 4,375 В, `ChgrFccRaw = 30` — лежит выше ворот
+/// политики, а насос при этом тока не несёт, то есть ни одно условие подъёма не
+/// выполняется и вопрос «принимает ли периферия CHGR запись вообще» остаётся без
+/// ответа. Снаружи его не решить: `\Device\Spmi\SUPERUSER` — имя уровня ядра, у
+/// него нет пользовательской символической ссылки, и открытие из user mode
+/// возвращает `STATUS_OBJECT_PATH_NOT_FOUND`; драйвер — единственный путь к шине,
+/// поэтому и проба живёт в драйвере.
+///
+/// 1,00 А (сырое 20) — строго ниже заводского значения на этой плате (30, то есть
+/// 1,50 А), и это не осторожность, а требование к пробе: вниз ошибка безопасна
+/// (такая уставка не может поднять ток в банку), вверх — нет. На 92 % бак ведёт
+/// тапер и отдаёт куда меньше ампера, так что на доли секунды, пока уставка
+/// стоит, она не ограничивает перенос; заводское возвращается в том же такте.
+const FCC_PROBE_UA: u32 = 1_000_000;
+
+/// Грация перед возвратом FCC к исходному значению после остановки насоса, мс.
+///
+/// Насос гаснет на тактах петли QC3 (шаг шины, тапер, отказ режима), и
+/// мгновенная реакция на каждый такой такт означала бы запись в SPMI по
+/// несколько раз в минуту. Две минуты держат поднятый предел через короткие
+/// перерывы переноса и всё равно возвращают исходное раньше, чем оператор
+/// успел бы снять журнал.
+const FCC_RESTORE_GRACE_MS: u64 = 120_000;
+
+/// Потолок записи FCC: выше него драйвер не пишет ни при каких условиях, мкА.
+///
+/// Ниже вендорного `qcom,fcc-max-ua` (5,9 А) с запасом. 3 А — это шестьдесят
+/// разрядов 8-битного поля; дальше начинается область, где цена ошибки в шаге
+/// выше выигрыша от снятого потолка.
+const FCC_WRITE_MAX_UA: u32 = 3_000_000;
+
+/// Сырое значение FCC для уставки в мкА.
+///
+/// Единственное место, которое знает кодирование регистра `0x1061`, — и для
+/// подъёма, и для возврата: исходный байт возвращается в микроамперы и снова
+/// проходит через эту функцию, так что потолок [`FCC_WRITE_MAX_UA`] нельзя
+/// обойти другой дорогой. Деление насыщающее: уставка выше поля должна
+/// упереться в потолок, а не обрезаться по модулю 256 — обрезанное значение
+/// записало бы в чип ток **меньше** задуманного.
+const fn raw_for(ua: u32) -> u8 {
+    let raw = ua / FCC_STEP_UA;
+    let cap = FCC_WRITE_MAX_UA / FCC_STEP_UA;
+    if raw > cap {
+        cap as u8
+    } else {
+        raw as u8
+    }
+}
+
 /// Минимальный выигрыш отклонения шины от цели, считающийся прогрессом, мкВ.
 ///
 /// Меньше шага QC3 (200 мВ) с запасом: 50 мВ отделяет настоящий сдвиг от
@@ -265,6 +377,45 @@ struct DriverState {
     window_best_err_uv: u32,
     /// Коррекций без прогресса подряд в текущем эпизоде.
     window_stall_n: u32,
+    /// Сколько раз повторяли разгон HVDCP без переподключения.
+    re_elevate_attempts: u32,
+    /// Монотонный срок следующего повторного разгона, мс (0 — не запланирован).
+    re_elevate_next_ms: u64,
+    /// Текущая выдержка повторного разгона, мс.
+    re_elevate_backoff_ms: u64,
+    /// Монотонное время последней публикации регистров PM8150B (`Chgr*`), мс.
+    ///
+    /// Ноль — снимок ещё не публиковался. Отметка ставится и при отказе чтения
+    /// (`ChgrErr=1`), иначе недоступная периферия тянула бы шину на каждом такте
+    /// телеметрии. Период — [`GAUGE_POLL_MS`]: снимок идёт по той же шине SPMI и
+    /// через тот же слот SUPERUSER, что и опрос счётчика.
+    last_chgr_mark_ms: u64,
+    /// FCC бака, который стоял в `0x1061` до нашей первой записи, 50 мА/разряд.
+    ///
+    /// Ноль — значение ещё не захвачено: живой замер 19.09 дал 30 (1,50 А), так
+    /// что настоящий ноль в регистре эту роль выполнять не может, зато ноль в
+    /// этой роли означает «возвращать нечего» — и поднимать предел тогда нельзя
+    /// (вернуть банк к исходному было бы нечем), и уж точно нельзя возвращать
+    /// ноль, который запретил бы заряд баку совсем.
+    fcc_boot_raw: u8,
+    /// Поднят ли FCC бака нашим пределом [`FCC_PUMP_UA`].
+    fcc_raised: bool,
+    /// Монотонный срок возврата FCC к [`Self::fcc_boot_raw`], мс.
+    ///
+    /// Ноль — возврат не запланирован. Срок ставится в тот такт, когда перенос
+    /// пропал, и снимается, если насос снова взялся за ток: короткие перерывы
+    /// переноса не должны дёргать регистр туда-обратно.
+    fcc_restore_at_ms: u64,
+    /// Выполнена ли одноразовая проба записи FCC ([`FCC_PROBE_UA`]).
+    ///
+    /// Один раз за загрузку драйвера: проба проверяет, принимает ли периферия
+    /// CHGR запись, а этот ответ за загрузку не меняется. Флаг ставится при любом
+    /// исходе — и при отказе записи, и когда заводское значение уже не выше пробы:
+    /// повторять молчаливый отказ на каждом такте незачем, а в журнале исход
+    /// остаётся (`ChgrProbeOk`). Не ставится только тогда, когда проба вообще не
+    /// могла идти: сорванный снимок SPMI, критичный отказ чипа или снимок ещё ни
+    /// разу не удался (`fcc_boot_raw == 0`).
+    fcc_probe_done: bool,
 }
 
 // SAFETY: см. инварианты выше — доступ сериализован WDF.
@@ -300,6 +451,14 @@ impl DriverState {
             last_window_nudge_ms: 0,
             window_best_err_uv: u32::MAX,
             window_stall_n: 0,
+            re_elevate_attempts: 0,
+            re_elevate_next_ms: 0,
+            re_elevate_backoff_ms: 0,
+            last_chgr_mark_ms: 0,
+            fcc_boot_raw: 0,
+            fcc_raised: false,
+            fcc_restore_at_ms: 0,
+            fcc_probe_done: false,
         }
     }
 }
@@ -2096,6 +2255,49 @@ unsafe extern "C" fn evt_release_hardware(
     wdk_sys::STATUS_SUCCESS
 }
 
+/// Пишет FCC бака SMB5 и публикует исход записи; `true` — в регистре
+/// действительно оказалось запрошенное значение.
+///
+/// Отдельная функция, потому что путей записи два (подъём и возврат), а
+/// проверка одна: сравнение с обратным чтением. Запись без сверки повторяла бы
+/// историю с `BypassPorSpent` — молчаливый отказ выглядел бы как успех.
+/// `ChgrFccErr` снимается нулём на успехе, иначе прошлая неудача висела бы в
+/// журнале до перезагрузки.
+///
+/// # Safety
+///
+/// `PASSIVE_LEVEL`; `device` жив.
+unsafe fn write_fcc_and_publish(device: WDFDEVICE, want: u8) -> bool {
+    // SAFETY: пассивный уровень; `device` жив (проверяет вызывающий).
+    match unsafe { crate::spb::write_fcc_raw(device, want) } {
+        Some(written) => {
+            mark_device_value(device, "ChgrFccSet", u32::from(written));
+            if written == want {
+                mark_device_value(device, "ChgrFccErr", 0);
+                println!(
+                    "ln8000-kmdf: FCC бака = {} x 50 мА = {} мА",
+                    written,
+                    u32::from(written).saturating_mul(50)
+                );
+                true
+            } else {
+                // Чип принял запись, но оставил своё: уставка выше его текущего
+                // потолка (тапер, JEITA) или периферия не выдана.
+                mark_device_value(device, "ChgrFccErr", 1);
+                println!(
+                    "ln8000-kmdf: FCC бака не встал: просили {want}, в регистре {written}"
+                );
+                false
+            }
+        }
+        None => {
+            mark_device_value(device, "ChgrFccErr", 1);
+            println!("ln8000-kmdf: запись FCC бака (0x1061 = {want}) не прошла");
+            false
+        }
+    }
+}
+
 /// Периодический сбор телеметрии, журналирование и защита.
 ///
 /// # Safety
@@ -2112,7 +2314,7 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
     // `STATE` защищает мьютекс состояния.
     let _state = lock_state();
     // Pump borrow must end before HVDCP reopen (retry / re-plug).
-    let (want_replug, want_retry) = {
+    let (want_replug, want_retry, want_reelevate) = {
     // SAFETY: доступ сериализован WDF (автоматическая сериализация таймера).
     let st = unsafe { state() };
     let Some(pump) = st.pump.as_mut() else {
@@ -2209,6 +2411,12 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
     // счётчик не отвечал ни разу — оценка по банке, `SocSrc=2`). Счётчик отказов
     // живёт в модуле батареи: здесь `pump` держит изменяемую ссылку на
     // состояние, и второй раз брать её нельзя.
+    // «Насос несёт ток»: активный 2:1 и перенос выше пола АЦП. Предикат поднят
+    // сюда, к публикации марок, потому что по нему же решается судьба FCC бака
+    // (ниже): поднимать предел бака имеет смысл, только пока насос реально
+    // переносит. Выбор режима ниже использует ту же величину.
+    let pump_alive = status.op_mode == OpMode::Switching
+        && sample.iin_ua > hvdcp::IIN_DEAD_FLOOR_UA;
     let device = unsafe { DEVICE };
     if !device.is_null() {
         match gauge {
@@ -2248,6 +2456,11 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
         mark_device_value(device, "Fault1Sts", u32::from(status.fault1_sts));
         mark_device_value(device, "Fault2Sts", u32::from(status.fault2_sts));
         mark_device_value(device, "SysSts", u32::from(status.sys_sts));
+        // Тот же байт под вторым именем: в декодированном `OpMode` не видны
+        // биты петель — bit7 `IIN_LOOP` и bit6 `VFLOAT_LOOP`, — а именно они
+        // говорят, упёрся ли насос в предел тока входа или уже в потолок
+        // напряжения, и висит ли он без петли вовсе.
+        mark_device_value(device, "SysStsRaw", u32::from(status.sys_sts));
         mark_device_value(device, "SafetySts", u32::from(status.safety_sts));
         // Вторая ступень вендора считается только при разрешённом заряде;
         // «разрешён» — это принятый чипом рабочий режим, а не запрошенный.
@@ -2261,6 +2474,195 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
         // `1` — POR-бюджет этого входа уже израсходован: драйвер упёрся в отказ
         // и ждёт смены блока. По марке видно, что повторные тики не дёргают чип.
         mark_device_value(device, "BypassPorSpent", u32::from(pump.por_spent()));
+
+        // Вторая зарядная ветка платформы — бак (buck) SMB5 (PM8150B) — и ток
+        // банки из топливного счётчика. До этих марок было не видно ни FCC,
+        // который оставила прошивка, ни реального тока в банку: насос меряет
+        // только свой вход, а 2:1 сам по себе не говорит, куда ушёл перенос.
+        // Раз в `GAUGE_POLL_MS`: снимок — это открытие SUPERUSER, три grant,
+        // семь однобайтовых чтений и две пары регистров тока, и на каждом такте
+        // телеметрии (250 мс) такая нагрузка на шину недопустима — при опросе
+        // счётчика раз в 250 мс сторонний читатель SUPERUSER получал отказ в
+        // 79 попытках из 100 (замер 18.09).
+        // Отказ чтения не тонет в нулях: он виден по `ChgrErr`, а сами значения
+        // тогда `0xFFFFFFFF`. Для `FgIbatUa` это значение недостижимо: разряд
+        // весит 488 мкА, и тока в 1 мкА счётчик выдать не может.
+        if st.last_chgr_mark_ms == 0
+            || sample.ts_ms.saturating_sub(st.last_chgr_mark_ms) >= u64::from(GAUGE_POLL_MS)
+        {
+            // Отметка ставится и при отказе: иначе недоступная периферия
+            // опрашивалась бы на каждом такте.
+            st.last_chgr_mark_ms = sample.ts_ms;
+            // SAFETY: пассивный уровень; `device` жив (проверено выше).
+            match unsafe { crate::spb::read_charge_regs(device) } {
+                Some(regs) => {
+                    // Заводское значение FCC захватывается один раз: возвращать
+                    // после насоса нужно именно его. Сырой ноль означает «ещё не
+                    // захвачено», а не «ноль ампер», — на этой плате прошивка
+                    // оставляет 30 (живой замер 19.09), и по нулю в этой роли
+                    // видно, что поднимать предел нельзя: вернуть банк к
+                    // исходному было бы нечем (см. `DriverState::fcc_boot_raw`).
+                    if st.fcc_boot_raw == 0 {
+                        st.fcc_boot_raw = regs.fcc_raw;
+                    }
+                    mark_device_value(device, "ChgrFccRaw", u32::from(regs.fcc_raw));
+                    mark_device_value(device, "ChgrEn", u32::from(regs.charge_enable));
+                    mark_device_value(device, "ChgrInhibit", u32::from(regs.inhibit));
+                    mark_device_value(device, "ChgrStatus", u32::from(regs.chgr_status));
+                    mark_device_value(device, "ChgrFvRaw", u32::from(regs.fv_raw));
+                    mark_device_value(device, "ChgrIclRaw", u32::from(regs.icl_raw));
+                    mark_device_value(device, "ChgrAllow", u32::from(regs.usbin_allow));
+                    mark_device_value(device, "FgIbatUa", regs.ibatt_ua);
+                    mark_device_value(device, "ChgrErr", 0);
+
+                    // Одноразовая проба записи FCC бака — единственный способ
+                    // узнать, принимает ли периферия CHGR запись вообще. Живой
+                    // замер 19.09 (92 % банки, 4,375 В, `ChgrFccRaw = 30`) лежит
+                    // выше ворот политики ниже (`RE_ELEVATE_MAX_VBAT_UV`, 4,35 В),
+                    // а насос тока не несёт: ни одно условие подъёма не выполняется,
+                    // и путь записи не исполнится ни разу. Молчаливый отказ
+                    // периферии выглядел бы тогда как «предел подняли, а ток не
+                    // вырос». Снаружи это не проверить: `\Device\Spmi\SUPERUSER` —
+                    // имя уровня ядра, пользовательской символической ссылки у него
+                    // нет, и открытие из user mode даёт `STATUS_OBJECT_PATH_NOT_FOUND`.
+                    //
+                    // Проба идёт строго вниз — [`FCC_PROBE_UA`] (сырое 20) против
+                    // заводского 30 — и сразу возвращает заводское: понижение
+                    // предела не может поднять ток в банку, а на 92 % бак ведёт
+                    // тапер, и на доли секунды, пока уставка стоит, она не
+                    // ограничивает перенос. Исход остаётся в журнале
+                    // (`ChgrProbeWrote`/`ChgrProbeRestored`/`ChgrProbeOk`/`ChgrProbeErr`),
+                    // а флаг [`DriverState::fcc_probe_done`] снимает повтор: отказ
+                    // записи не должен повторяться на каждом такте.
+                    //
+                    // Один такт — одно перо: если регистром распоряжается политика
+                    // (предел уже поднят или будет поднят ниже по коду), проба
+                    // уступает и только отмечает это. Сорванный снимок SPMI сюда не
+                    // доходит вовсе — весь блок живёт в ветке успешного
+                    // `read_charge_regs`, — а критичный отказ чипа не тратит
+                    // одноразовый шанс: в перегретый или перенапряжённый чип не
+                    // пишет ни проба, ни политика.
+                    if !st.fcc_probe_done
+                        && st.fcc_boot_raw != 0
+                        && !status.has_critical_fault()
+                    {
+                        // Политика держит регистр, если насос несёт ток ниже ворот
+                        // или предел уже поднят её рукой — тогда проба не имеет
+                        // права писать: её запись затёрла бы подъём.
+                        let policy_owns = st.fcc_raised
+                            || (pump_alive && sample.vbat_uv < RE_ELEVATE_MAX_VBAT_UV);
+                        // Потолок [`FCC_WRITE_MAX_UA`] применён внутри `raw_for`.
+                        let probe_raw = raw_for(FCC_PROBE_UA);
+                        if policy_owns {
+                            mark_device_value(device, "ChgrProbeOk", 3);
+                            st.fcc_probe_done = true;
+                        } else if probe_raw >= st.fcc_boot_raw {
+                            // Зажим пробы сделан пропуском, а не `min`: уставка,
+                            // равная заводской, ничего не доказывает, а выше
+                            // заводской проба не имеет права быть ни при каких
+                            // условиях.
+                            mark_device_value(device, "ChgrProbeOk", 2);
+                            st.fcc_probe_done = true;
+                        } else {
+                            // SAFETY: пассивный уровень; `device` жив.
+                            let wrote = unsafe { crate::spb::write_fcc_raw(device, probe_raw) };
+                            // Возврат пишется даже если проба вернула `None`: запись
+                            // могла лечь в регистр и не прочитаться обратно, а
+                            // заводское значение в регистре нужно в любом случае.
+                            // SAFETY: пассивный уровень; `device` жив.
+                            let restored =
+                                unsafe { crate::spb::write_fcc_raw(device, st.fcc_boot_raw) };
+                            // Обратное чтение отдаётся в журнал как есть, а
+                            // недоступное — `0xFFFFFFFF`, как и у остальных марок
+                            // SMB5: значения этого байта такой величины не достигают.
+                            let wrote_marks = wrote.map_or(u32::MAX, u32::from);
+                            let restored_marks = restored.map_or(u32::MAX, u32::from);
+                            // `ChgrProbeErr` — сорвалась любая из двух записей
+                            // (открытие сессии, grant, сама запись или обратное
+                            // чтение); ноль означает, что обе прошли целиком.
+                            let probe_err = u32::from(wrote.is_none() || restored.is_none());
+                            // `ChgrProbeOk`: `1` — обратное чтение вернуло ровно
+                            // запрошенное (20), `0` — чип оставил своё или запись
+                            // не прошла вовсе.
+                            let probe_ok = u32::from(wrote == Some(probe_raw));
+                            mark_device_value(device, "ChgrProbeWrote", wrote_marks);
+                            mark_device_value(device, "ChgrProbeRestored", restored_marks);
+                            mark_device_value(device, "ChgrProbeErr", probe_err);
+                            mark_device_value(device, "ChgrProbeOk", probe_ok);
+                            // Ни `fcc_boot_raw`, ни `fcc_raised` проба не трогает:
+                            // заводское остаётся тем, что прочитано при захвате, и
+                            // политика вернёт его как обычно. Сорванный возврат
+                            // оставляет регистр на 20 — ниже заводского, то есть
+                            // безопасно, и первая же удачная запись политики вернёт
+                            // его к 30.
+                            st.fcc_probe_done = true;
+                        }
+                    }
+                }
+                None => {
+                    for name in [
+                        "ChgrFccRaw",
+                        "ChgrEn",
+                        "ChgrInhibit",
+                        "ChgrStatus",
+                        "ChgrFvRaw",
+                        "ChgrIclRaw",
+                        "ChgrAllow",
+                        "FgIbatUa",
+                    ] {
+                        mark_device_value(device, name, 0xFFFF_FFFF);
+                    }
+                    mark_device_value(device, "ChgrErr", 1);
+                }
+            }
+
+            // Предел бака (buck) SMB5. Пока насос несёт ток, бак — вторая
+            // половина переноса, и его заводские 1,5 А (`ChgrFccRaw = 30`)
+            // душат то, что платформа умеет: живой замер 19.09 дал 2,9 А в
+            // банку при этом пределе. Вендорный DT разрешает 5,9 А, мы идём
+            // ступенью [`FCC_PUMP_UA`] и только на живом 2:1 — поднятый на
+            // пяти вольтах или на полке предел висел бы, когда насос уже не
+            // переносит, и мешал бы следующему решению платформы.
+            //
+            // Возврат — через [`FCC_RESTORE_GRACE_MS`] после потери переноса,
+            // и только если исходное значение захвачено. Критичный отказ чипа
+            // останавливает обе записи: поднимать ток в банку, когда чип
+            // сообщает о перегреве или перенапряжении, нельзя.
+            if !status.has_critical_fault() {
+                if pump_alive {
+                    // Насос снова взялся за ток — запланированный возврат снимаем.
+                    st.fcc_restore_at_ms = 0;
+                    if !st.fcc_raised
+                        && st.fcc_boot_raw != 0
+                        && sample.vbat_uv < RE_ELEVATE_MAX_VBAT_UV
+                    {
+                        // Потолок [`FCC_WRITE_MAX_UA`] применён внутри `raw_for`.
+                        let want = raw_for(FCC_PUMP_UA);
+                        // SAFETY: пассивный уровень; `device` жив.
+                        if unsafe { write_fcc_and_publish(device, want) } {
+                            st.fcc_raised = true;
+                        }
+                    }
+                } else if st.fcc_raised {
+                    if st.fcc_restore_at_ms == 0 {
+                        st.fcc_restore_at_ms =
+                            sample.ts_ms.saturating_add(FCC_RESTORE_GRACE_MS);
+                    } else if sample.ts_ms >= st.fcc_restore_at_ms {
+                        // Возврат идёт через то же кодирование, что и подъём:
+                        // исходный байт переводится в микроамперы и обратно,
+                        // поэтому потолок [`FCC_WRITE_MAX_UA`] действует и
+                        // здесь (для 30 это тождество — живой замер дал 1,5 А).
+                        let want =
+                            raw_for(u32::from(st.fcc_boot_raw).saturating_mul(FCC_STEP_UA));
+                        // SAFETY: пассивный уровень; `device` жив.
+                        if unsafe { write_fcc_and_publish(device, want) } {
+                            st.fcc_raised = false;
+                            st.fcc_restore_at_ms = 0;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // Эпизод перегрева закончился — счётчик отказов 1:1 обнуляется: иначе
@@ -2363,8 +2765,6 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
     // 19.09 11:28 на MDY-11-EP: mode 1→3→1 при 0,42 А, `ChargeAttemptN` +1 на
     // каждый разрыв). Липкое решение держится на абсолютном поле 2:1 (8,0 В):
     // просадка — это следствие нагрузки, а не потеря способности переносить.
-    let pump_alive = status.op_mode == OpMode::Switching
-        && sample.iin_ua > hvdcp::IIN_DEAD_FLOOR_UA;
     let desired = if pump_alive && vbus_uv >= u32::try_from(SWITCHING_MIN_VIN_UV).unwrap_or(0) {
         Some(OpMode::Switching)
     } else {
@@ -2497,6 +2897,39 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
         st.window_best_err_uv = u32::MAX;
         st.window_stall_n = 0;
     }
+    // Пятивольтовый режим без переноса — состояние, в котором согласованием
+    // владеет повторный разгон HVDCP (ниже, `want_reelevate`), а не быстрый
+    // повтор решения о режиме. Оба предиката подняты сюда, к двум своим
+    // потребителям, одним местом: ниже по ним решается и то, молчит ли быстрый
+    // повтор (`changed`), и то, входит ли в разгон сам разгон.
+    let five_v_regime =
+        vbus_uv >= u32::try_from(ln8000::encoding::CHARGE_MIN_VIN_UV).unwrap_or(0)
+            && vbus_uv < u32::try_from(hvdcp::FIVE_V_STAY_MAX_UV).unwrap_or(0);
+    // Один отсчёт не доказывает, что переноса нет: пол АЦП — 39,1 мА, а у
+    // верха заряда банка берёт 0,1–0,5 А, и мгновенный замер ложится на пол
+    // между импульсами тока. Вторая опора, как и у `dead` выше, — пик за окно
+    // `IIN_WINDOW_MS`: перенос живой, если выше пола хотя бы одна величина.
+    let bypass_carrying = status.op_mode == OpMode::Bypass
+        && (sample.iin_ua > hvdcp::IIN_DEAD_FLOOR_UA
+            || st.max_iin_ua > hvdcp::IIN_DEAD_FLOOR_UA);
+    // Условия, при которых повторный разгон HVDCP владеет согласованием: вход
+    // есть, шина в пятивольтовом режиме, обход не несёт ток, насос не работает,
+    // банка ниже ворот разгона. Пока они держатся, быстрый повтор «по изменению
+    // входа» молчит (см. `changed` ниже): в этом состоянии изменение входа —
+    // это зуб пилы, которую создаёт наш же POR, и повтор шёл бы мимо выдержки
+    // разгона. Живой замер 19.09 (вход просел к 4,5–5 В): `ChargeAttemptN`
+    // 5→86 за 14,5 мин, то есть полное согласование (APSD ~2 с + `FORCE_9V`
+    // до 5 с — около 7 с под мьютексом состояния на попытку) каждые ~10 с.
+    // Выдержка разгона (60 с с удвоением до 300 с) и есть правильный темп для
+    // этого состояния: она ставится именно как «повторить то, что делает
+    // переподключение», а не «долбить POR каждые пять секунд».
+    let reelevate_owns_negotiation = sample.input_present
+        && vbat_read.is_ok()
+        && iin_read.is_ok()
+        && five_v_regime
+        && !bypass_carrying
+        && !pump_alive
+        && vbat_uv < RE_ELEVATE_MAX_VBAT_UV;
     // Обход снят ради подъёма шины: `desired` посчитан по старому Vin, поэтому
     // в этом такте режим не перерешаем — следующий такт (250 мс) прочтёт шину
     // заново и выберет 2:1, если импульс довёл её до полосы переноса.
@@ -2506,7 +2939,22 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
     } else if desired.is_some() && !action.is_change() && !left_bypass_for_walk {
         let now = monotonic_ms();
         let cooled = now.saturating_sub(st.last_charge_attempt_ms) >= CHARGE_RETRY_MS;
-        let changed = st.last_attempt_vbus_uv.abs_diff(vbus_uv) >= CHARGE_RETRY_DELTA_UV;
+        // Изменение входа ускоряет повтор, но не отменяет пол: иначе пила входа,
+        // которую сам же POR и создаёт, гонит попытки каждые ~0,6 с
+        // (см. [`CHARGE_RETRY_FAST_MS`]).
+        //
+        // В пятивольтовом режиме без переноса быстрый повтор молчит
+        // (`reelevate_owns_negotiation` выше): там согласованием владеет
+        // повторный разгон со своей выдержкой, а смена входа — это зуб пилы от
+        // нашего же POR, а не новый уровень QC. За границей этого состояния
+        // (шина ушла выше 6 В, обход повёз ток, банка у верха) условие ложно, и
+        // повтор работает как раньше. Кулдаун `cooled` и мгновенный `upgrade`
+        // не тронуты: 30-секундный повтор остаётся страховкой отказа решения о
+        // режиме, а `upgrade` возможен только при повышенном Vin, где условие
+        // разгона ложно.
+        let changed = st.last_attempt_vbus_uv.abs_diff(vbus_uv) >= CHARGE_RETRY_DELTA_UV
+            && now.saturating_sub(st.last_charge_attempt_ms) >= CHARGE_RETRY_FAST_MS
+            && !reelevate_owns_negotiation;
         // Апгрейд bypass → 2:1 делаем сразу (QC поднял Vin). standby/unknown —
         // это отказ, и повтор идёт не чаще кулдауна, а не каждый такт.
         let upgrade = matches!(
@@ -2642,8 +3090,37 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
         now,
         st.hvdcp_retry_next_ms,
     );
+    // Пятивольтовый режим без переноса. Согласование видит вход только по
+    // фронту, поэтому потерянный QC-уровень (блок откатился на 5 В, защёлка
+    // VFAULT закрыла обход 1:1) не возвращается сам — шина стоит на 5 В до
+    // переподключения. Здесь решение принимается, а сам разгон идёт после
+    // освобождения `pump` (он переоткрывает шину). Условие входа — то же
+    // `reelevate_owns_negotiation`, которым выше заглушён быстрый повтор: у
+    // состояния один хозяин, и его выдержка — его темп.
+    let mut want_reelevate = false;
+    if reelevate_owns_negotiation {
+        if st.re_elevate_next_ms == 0 {
+            st.re_elevate_next_ms = now.saturating_add(RE_ELEVATE_FIRST_MS);
+        } else if now >= st.re_elevate_next_ms {
+            st.re_elevate_attempts = st.re_elevate_attempts.saturating_add(1);
+            st.re_elevate_backoff_ms = if st.re_elevate_backoff_ms == 0 {
+                RE_ELEVATE_FIRST_MS
+            } else {
+                st.re_elevate_backoff_ms
+                    .saturating_mul(2)
+                    .min(RE_ELEVATE_BACKOFF_MAX_MS)
+            };
+            st.re_elevate_next_ms = now.saturating_add(st.re_elevate_backoff_ms);
+            want_reelevate = true;
+        }
+    } else if st.re_elevate_next_ms != 0 || st.re_elevate_attempts != 0 {
+        // Шина поднялась или 5 В реально заряжает — эпизод закрыт.
+        st.re_elevate_next_ms = 0;
+        st.re_elevate_attempts = 0;
+        st.re_elevate_backoff_ms = 0;
+    }
     st.last_input_present = input_now;
-    (want_replug, want_retry)
+    (want_replug, want_retry, want_reelevate)
     };
 
     // SAFETY: DEVICE set in device_add; null after release_hardware.
@@ -2681,6 +3158,17 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
         if code == 0 {
             arm_hvdcp_input_edge(device);
         }
+    } else if want_reelevate {
+        // SAFETY: timer serialized with prepare/IOCTL; `pump` отпущен выше.
+        let st = unsafe { state() };
+        mark_device_value(device, "ReElevateN", st.re_elevate_attempts);
+        println!(
+            "ln8000-kmdf: 5 V без переноса — повторный разгон HVDCP #{} (выдержка {} мс)",
+            st.re_elevate_attempts, st.re_elevate_backoff_ms
+        );
+        let code = run_hvdcp_and_land(device);
+        schedule_or_clear_superuser_retry(device, code);
+        arm_hvdcp_input_edge(device);
     }
 
     arm_telemetry_timer();

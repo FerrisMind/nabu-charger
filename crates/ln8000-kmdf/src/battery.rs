@@ -38,6 +38,16 @@ static mut REGISTRY_PATH: UNICODE_STRING = UNICODE_STRING {
 /// value was simply the initialiser, because VBAT is only sampled while
 /// telemetry runs and the OCV map was also feeding it a charging rail.
 static mut LAST_PCT: u32 = BATTERY_UNKNOWN_CAPACITY;
+/// Процент, о котором класс уже уведомлён ([`BATTERY_UNKNOWN_CAPACITY`] до первого).
+///
+/// Windows перечитывает батарею по нашему [`BatteryClassStatusNotify`], а не по
+/// собственному расписанию. Пока уведомление шло только на смену `power_state`,
+/// индикатор в разряде стоял на месте: живой замер 19.09 13:35–13:45 (блок
+/// отключён) — счётчик драйвера прошёл 162 → 158 (63 → 62 %), а
+/// `GetSystemPowerStatus` все восемь минут показывал 64, то есть значение,
+/// снятое на прошлом уведомлении; обновлялось оно лишь после перезагрузки в
+/// Android и обратно. Поэтому уведомляем и на смену процента.
+static mut NOTIFIED_PCT: u32 = BATTERY_UNKNOWN_CAPACITY;
 /// Откуда взялся [`LAST_PCT`] (метка `SocSrc`).
 static mut SOC_SRC: u32 = SOC_SRC_NONE;
 /// Отказов чтения счётчика подряд (метка `SocFail`); успех обнуляет.
@@ -410,8 +420,10 @@ pub unsafe fn unload() {
 /// nor fires [`BatteryClassStatusNotify`].
 ///
 /// Ignores `vbat_uv == 0` (ADC not ready) so a bad first sample cannot pin SoC at 0%.
-/// Calls [`BatteryClassStatusNotify`] only when `power_state` changes so the
-/// tray/Settings see plug/unplug on the same telemetry tick (not after a later poll).
+/// Calls [`BatteryClassStatusNotify`] when `power_state` **or** the published
+/// percentage changes, so the tray/Settings see plug/unplug on the same telemetry
+/// tick (not after a later poll) and keep counting down while discharging — the
+/// class driver re-reads the miniport on our notification, not on its own timer.
 ///
 /// `iin_peak_ua` — пик Iin за окно наблюдения (`DriverState::max_iin_ua`), а не
 /// мгновенный отсчёт: на такте QC3-импульса или перехода режима Iin лежит на полу
@@ -456,12 +468,19 @@ pub unsafe fn update_from_telemetry(
         let _ = build_status();
     }
     let new_power = unsafe { LAST_POWER_STATE };
-    if new_power == prev_power {
+    let new_pct = unsafe { LAST_PCT };
+    // Смена процента — такой же повод перечитать батарею, как смена питания:
+    // в разряде `power_state` постоянен, и без этого условия индикатор замирал
+    // (см. [`NOTIFIED_PCT`]). Сравнение идёт с **уведомлённым** значением, а не
+    // с предыдущим [`LAST_PCT`]: если класс ещё не подключён, уведомление
+    // повторится на следующем такте, а не потеряется.
+    if new_power == prev_power && new_pct == unsafe { NOTIFIED_PCT } {
         return;
     }
     let handle = unsafe { CLASS_HANDLE };
     if !handle.is_null() {
         unsafe {
+            NOTIFIED_PCT = new_pct;
             let _ = BatteryClassStatusNotify(handle);
         }
     }

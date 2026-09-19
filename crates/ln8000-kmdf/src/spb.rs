@@ -1418,6 +1418,252 @@ pub unsafe fn read_batt_soc_raw(device: WDFDEVICE) -> Option<u8> {
     Some(cap[0])
 }
 
+/// Peri-grant id периферии CHGR (`0x10` — банк `0x10xx`).
+///
+/// Значение не выведено из адреса, а взято из вендорного DT nabu
+/// (`android_kernel_xiaomi_nabu/arch/arm64/boot/dts/qcom/pm8150b.dtsi:190-191`):
+/// узел `qcom,chgr@1000`, `reg = <0x1000 0x100>`. Тот же базовый адрес в шапке
+/// карты регистров SMB5 — `drivers_power_supply_qcom_smb5-reg.h:18`
+/// (`CHGR_BASE 0x1000`).
+pub const SPMI_PERI_CHGR: u16 = 0x0010;
+
+/// Peri-grant id периферии `batt_info` (`0x41` — банк `0x41xx`).
+///
+/// Ток банки лежит не в `batt_soc` (`0x4000`, откуда драйвер берёт процент), а
+/// в соседней периферии `batt_info`: в том же DT `qcom,fg-batt-info@4100` с
+/// `reg = <0x4100 0x100>` (там же, строки 413-415), а вендорный разбор
+/// присваивает базовый адрес по subtype периферии —
+/// `android_kernel_xiaomi_nabu/drivers/power/supply/qcom/qpnp-fg-gen4.c:6704-6705`
+/// (`case FG_BATT_INFO_PM8150B: fg->batt_info_base = base;`).
+pub const SPMI_PERI_BATT_INFO: u16 = 0x0041;
+
+/// `CHGR_FAST_CHARGE_CURRENT_CFG_REG` — FCC бака (buck) SMB5, 50 мА/разряд.
+///
+/// Адрес: `drivers_power_supply_qcom_smb5-reg.h:79` (`CHGR_BASE + 0x61`). Шаг и
+/// потолок — параметры PM8150B из `drivers_power_supply_qcom_qpnp-smb5.c:128-134`
+/// (`.min_u = 0`, `.max_u = 8 000 000`, `.step_u = 50 000`), то есть сырое
+/// `0x14` = 1,00 А.
+pub const SPMI_REG_CHGR_FCC: u16 = 0x1061;
+
+/// `CHARGING_ENABLE_CMD_REG`, бит 0 — команда «заряд разрешён»
+/// (`drivers_power_supply_qcom_smb5-reg.h:67-68`).
+pub const SPMI_REG_CHGR_CHARGING_ENABLE: u16 = 0x1042;
+
+/// `CHGR_CFG2_REG`, бит 0 `CHARGER_INHIBIT_BIT` — аппаратный запрет заряда
+/// (`drivers_power_supply_qcom_smb5-reg.h:73-77`).
+pub const SPMI_REG_CHGR_CFG2: u16 = 0x1051;
+
+/// `BATTERY_CHARGER_STATUS_1_REG`, биты `[2:0]` — фаза заряда
+/// (`drivers_power_supply_qcom_smb5-reg.h:36-45`).
+pub const SPMI_REG_CHGR_STATUS_1: u16 = 0x1006;
+
+/// `CHGR_FLOAT_VOLTAGE_CFG_REG` — напряжение окончания заряда, 10 мВ/разряд от
+/// 3,6 В (`drivers_power_supply_qcom_smb5-reg.h:95`; шаг —
+/// `drivers_power_supply_qcom_qpnp-smb5.c:136-141`).
+pub const SPMI_REG_CHGR_FLOAT_VOLTAGE: u16 = 0x1070;
+
+/// `USBIN_CURRENT_LIMIT_CFG_REG` — предел входного тока USBIN, 50 мА/разряд
+/// (`drivers_power_supply_qcom_smb5-reg.h:322`; шаг —
+/// `drivers_power_supply_qcom_qpnp-smb5.c:143-148`).
+pub const SPMI_REG_USBIN_ICL: u16 = 0x1370;
+
+/// `USBIN_ADAPTER_ALLOW_CFG_REG` — какие напряжения разрешены адаптеру
+/// (`drivers_power_supply_qcom_smb5-reg.h:285`).
+pub const SPMI_REG_USBIN_ADAPTER_ALLOW: u16 = 0x1360;
+
+/// `BATT_INFO_IBATT_LSB` — младший байт тока банки (16 бит, LE, знак — бит 15).
+///
+/// Смещение задано в `drivers_power_supply_qcom_fg-reg.h:250-251`
+/// (`batt_info_base + 0xA2`/`+0xA3`); базовый адрес этой периферии на nabu —
+/// `0x4100` (см. [`SPMI_PERI_BATT_INFO`]).
+pub const SPMI_REG_FG_IBATT_LSB: u16 = 0x41A2;
+
+/// Теневая копия того же тока (`BATT_INFO_IBATT_LSB_CP`,
+/// `drivers_power_supply_qcom_fg-reg.h:261`).
+///
+/// Вендор читает обе пары и требует их равенства
+/// (`drivers_power_supply_qcom_fg-util.c:1005-1027`, сравнение на `:1020`):
+/// пара обновляется счётчиком целиком, и расхождение означает, что чтение
+/// попало внутрь обновления.
+pub const SPMI_REG_FG_IBATT_LSB_CP: u16 = 0x41A8;
+
+/// Числитель шага тока банки: `I[мкА] = raw * 488281 / 1000`.
+///
+/// Взято из вендорного декодера `drivers_power_supply_qcom_fg-util.c:997-998`
+/// (`BATT_CURRENT_NUMR 488281`, `BATT_CURRENT_DENR 1000`) и его применения там
+/// же на `:1036-1037` (`sign_extend32(temp, 15)`, затем
+/// `temp * BATT_CURRENT_NUMR / BATT_CURRENT_DENR`); результат идёт прямо в
+/// `POWER_SUPPLY_PROP_CURRENT_NOW`
+/// (`android_kernel_xiaomi_nabu/drivers/power/supply/qcom/qpnp-fg-gen4.c:5190-5191`),
+/// а эта величина в power_supply — микроамперы. Итого 1/2048 А на разряд.
+pub const FG_IBATT_NUMER: i32 = 488_281;
+
+/// Знаменатель шага тока банки (`BATT_CURRENT_DENR`,
+/// `drivers_power_supply_qcom_fg-util.c:998`).
+pub const FG_IBATT_DENOM: i32 = 1_000;
+
+/// Снимок регистров SMB5 (PM8150B) и тока банки — для диагностики `Chgr*`/`FgIbatUa`.
+///
+/// Поля — сырые байты как они лежат в SPMI: декодирование оставлено разбору
+/// журнала, потому что шаги и смещения у каждой величины свои (см. константы
+/// выше), а цена ошибки в декодере выше пользы.
+#[derive(Debug, Clone, Copy)]
+pub struct ChargeRegs {
+    /// FCC бака (`0x1061`), 50 мА/разряд.
+    pub fcc_raw: u8,
+    /// Команда «заряд разрешён» (`0x1042`), бит 0.
+    pub charge_enable: u8,
+    /// Аппаратный запрет заряда (`0x1051`), бит 0.
+    pub inhibit: u8,
+    /// Фаза заряда (`0x1006`), биты `[2:0]`.
+    pub chgr_status: u8,
+    /// Напряжение окончания заряда (`0x1070`), 10 мВ/разряд от 3,6 В.
+    pub fv_raw: u8,
+    /// Предел входного тока USBIN (`0x1370`), 50 мА/разряд.
+    pub icl_raw: u8,
+    /// Разрешённые адаптеру напряжения (`0x1360`).
+    pub usbin_allow: u8,
+    /// Ток банки из топливного счётчика, мкА. Знак — как у вендора (бит 15
+    /// сырого значения): **отрицательный — ток в банку (заряд)**, положительный —
+    /// разряд. В этой `u32` отрицательная величина лежит дополнительным кодом,
+    /// поэтому потребителю нужен модуль, а не само число:
+    /// `(ibatt_ua as i32).unsigned_abs()`.
+    ///
+    /// Так же читает знак вендор: `qcom/smb5-lib.c` (ветка 16.0) считает банку
+    /// заряжающейся при `ibat < -450 mA`, а `ti/cp_qc30.c` перед употреблением
+    /// меняет знак тока счётчика. На живом планшете поле отрицательно именно
+    /// тогда, когда банка достоверно заряжается, — «минус — это заряд».
+    pub ibatt_ua: u32,
+}
+
+/// Читает регистры SMB5 (PM8150B) и ток банки из топливного счётчика.
+///
+/// # Зачем
+///
+/// На живом планшете насос держит 2:1 при входе ~8,6 В и ~0,55 А, то есть
+/// переносит в узел ~1,1 А, а заряд банки растёт так, будто туда приходит
+/// около 2 А. Вторая зарядная ветка платформы — бак (buck) SMB5 (PM8150B) —
+/// драйвером не настраивается: её FCC остался таким, каким его оставила
+/// прошивка, и до сих пор был невидим. Тока банки у LN8000 нет вовсе — его
+/// меряет только топливный счётчик PM8150B. Обе величины читаются по SPMI тем
+/// же путём, каким драйвер берёт процент ([`read_batt_soc_raw`]), и это
+/// единственный способ отличить «насос отдаёт ток в банку» от «ток уходит в бак
+/// SMB5».
+///
+/// # Что делает
+///
+/// Одна сессия SUPERUSER: открытие, три grant (CHGR, USBIN, `batt_info`), чтение
+/// регистров, закрытие в [`Drop`]. Ни одной записи. Любой отказ чтения —
+/// `None`: частично заполненный снимок выглядел бы как валидный, а по нему
+/// потом принимают решения.
+///
+/// # Safety
+///
+/// `PASSIVE_LEVEL`; `device` жив.
+pub unsafe fn read_charge_regs(device: WDFDEVICE) -> Option<ChargeRegs> {
+    // SAFETY: пассивный уровень, устройство создано.
+    let mut su = unsafe { SuperuserBus::open(device) }.ok()?;
+    su.grant(SPMI_PERI_CHGR).ok()?;
+    su.grant(SPMI_PERI_USBIN).ok()?;
+    su.grant(SPMI_PERI_BATT_INFO).ok()?;
+    let fcc_raw = su.read_u8(SPMI_SID_USBIN, SPMI_REG_CHGR_FCC).ok()?;
+    let charge_enable = su
+        .read_u8(SPMI_SID_USBIN, SPMI_REG_CHGR_CHARGING_ENABLE)
+        .ok()?;
+    let inhibit = su.read_u8(SPMI_SID_USBIN, SPMI_REG_CHGR_CFG2).ok()?;
+    let chgr_status = su.read_u8(SPMI_SID_USBIN, SPMI_REG_CHGR_STATUS_1).ok()?;
+    let fv_raw = su
+        .read_u8(SPMI_SID_USBIN, SPMI_REG_CHGR_FLOAT_VOLTAGE)
+        .ok()?;
+    let icl_raw = su.read_u8(SPMI_SID_USBIN, SPMI_REG_USBIN_ICL).ok()?;
+    let usbin_allow = su
+        .read_u8(SPMI_SID_USBIN, SPMI_REG_USBIN_ADAPTER_ALLOW)
+        .ok()?;
+    let mut ibatt = [0_u8; 2];
+    su.read_bytes(SPMI_SID_USBIN, SPMI_REG_FG_IBATT_LSB, &mut ibatt)
+        .ok()?;
+    let mut ibatt_cp = [0_u8; 2];
+    su.read_bytes(SPMI_SID_USBIN, SPMI_REG_FG_IBATT_LSB_CP, &mut ibatt_cp)
+        .ok()?;
+    // Как в `read_batt_soc_raw` и в `fg_get_battery_current`: расхождение пары и
+    // копии — не повод угадывать, значение придёт на следующем такте.
+    if ibatt != ibatt_cp {
+        return None;
+    }
+    // Младший байт лежит в 0x41A2, старший в 0x41A3 (`temp = buf[1] << 8 | buf[0]`
+    // в `drivers_power_supply_qcom_fg-util.c:1033`), знак — бит 15 (там же, `:1036`).
+    let raw = i32::from(i16::from_le_bytes(ibatt));
+    // Произведение считаем в `i64`: 32767 разрядов это 16 А, и в `i32` оно не
+    // влезает — насыщающее умножение здесь дало бы неверный ток на разряде.
+    let micro_ua = i64::from(raw) * i64::from(FG_IBATT_NUMER) / i64::from(FG_IBATT_DENOM);
+    Some(ChargeRegs {
+        fcc_raw,
+        charge_enable,
+        inhibit,
+        chgr_status,
+        fv_raw,
+        icl_raw,
+        usbin_allow,
+        // Отрицательный ток сохраняет знак: марка `u32` несёт его дополнительным кодом.
+        ibatt_ua: (micro_ua as i32) as u32,
+    })
+}
+
+/// Пишет FCC бака (buck) SMB5 (PM8150B) и возвращает то, что **прочитано
+/// обратно** из регистра `0x1061`.
+///
+/// # Зачем
+///
+/// Живой замер 19.09 (сборка .652, MDY-08-EI): `ChgrFccRaw = 30`, то есть
+/// 1,50 А — столько оставила прошивка, наш драйвер этот регистр не писал ни
+/// разу; при этом `FgIbatUa` ≈ 2,9 А, `SysStsRaw = 0x04` (насос в 2:1 без
+/// петель `IIN_LOOP`/`VFLOAT_LOOP`, то есть отдаёт сколько дают). Бак
+/// PM8150B — вторая зарядная ветка платформы, и его 1,5 А лежат далеко ниже
+/// того, что разрешает вендорный DT планшета: `qcom,fcc-max-ua = <5900000>`
+/// (`arch/arm64/boot/dts/qcom/xiaomi/overlay/nabu/nabu-sm8150.dtsi:68`).
+/// Поднять FCC — это ровно то, что делает Android, когда работает насос, и
+/// единственный регистр, который наш драйвер вообще имеет право писать (см.
+/// [`SPMI_PERI_CHGR`]).
+///
+/// # Почему без read-modify-write
+///
+/// Весь байт регистра и есть поле FCC: у
+/// `CHGR_FAST_CHARGE_CURRENT_CFG_REG` (`drivers_power_supply_qcom_smb5-reg.h:79`)
+/// в шапке вендора не объявлено ни маски, ни бита — ср. соседний
+/// `CHGR_CFG2_REG` там же, где `CHARGER_INHIBIT_BIT` есть. Писатель вендора
+/// кладёт в регистр ровно `(val_u - min_u) / step_u` одним байтом
+/// (`drivers_power_supply_qcom_smb-lib.c:353-373`, `smblib_write` принимает
+/// `u8`), и параметр PM8150B
+/// задаёт для этого поля `min_u = 0` (`qpnp-smb5.c:128-134`). Читать старое
+/// значение перед записью нечего: чужих битов в регистре нет.
+///
+/// # Что делает
+///
+/// Одна сессия SUPERUSER: открытие, grant CHGR, запись, обратное чтение,
+/// закрытие в [`Drop`]. Обратное чтение — не формальность: IOCTL записи может
+/// завершиться успехом, а регистр остаться прежним (периферия не выдана, чип
+/// в сбросе), и молчаливая неудача выглядела бы как поднятый предел.
+/// Возвращается прочитанное, а не запрошенное, чтобы вызывающий видел, что
+/// действительно стоит в регистре.
+///
+/// # Errors
+///
+/// `None` — не прошло открытие, grant, запись или обратное чтение. Частичного
+/// успеха нет: не прочитали обратно — считаем, что записи не было.
+///
+/// # Safety
+///
+/// `PASSIVE_LEVEL`; `device` жив.
+pub unsafe fn write_fcc_raw(device: WDFDEVICE, raw: u8) -> Option<u8> {
+    // SAFETY: пассивный уровень, устройство создано.
+    let mut su = unsafe { SuperuserBus::open(device) }.ok()?;
+    // Регистр лежит в банке `0x10xx`, поэтому выдаётся только CHGR: USBIN и
+    // `batt_info` этой записи не касаются.
+    su.grant(SPMI_PERI_CHGR).ok()?;
+    su.write_u8(SPMI_SID_USBIN, SPMI_REG_CHGR_FCC, raw).ok()?;
+    su.read_u8(SPMI_SID_USBIN, SPMI_REG_CHGR_FCC).ok()
+}
+
 /// Число символов в пути (префикс + 16 цифр).
 
 /// Кодирует адрес SUPERUSER: `(sid << 16) | reg`.
