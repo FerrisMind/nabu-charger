@@ -246,16 +246,34 @@ pub const VBAT_VIN_HALF_SLACK_UV: u32 = 80_000;
 /// (QC3/PD) меняет вход на вольты и открывает новый бюджет.
 pub const POR_VIN_TOLERANCE_UV: u32 = 200_000;
 
-/// True when VBAT tracks `Vin/2` (switch-cap rail), not a credible pack reading.
+/// True when `Vin` is the converter's own `2 · VBAT` reflection, not an adapter.
+///
+/// Отличие от [`vbat_tracks_converter_rail`] — нет порога 8 В: отражение
+/// масштабируется вместе с банкой, и на разряженной банке (2,1–4,0 В) попадает
+/// в 4,2–8,0 В, то есть ровно в ту полосу, где `vbat_tracks_converter_rail`
+/// молчит, а [`crate::battery_policy::online_raw`] решает судьбу `POWER_ON_LINE`.
+///
+/// Живой случай 19.09: кабель отключён, `Vin = 8 800 000`, `VBAT = 4 400 000`
+/// (ровно вдвое), ток на полу АЦП 39 мА, режим Standby — и трей показывал
+/// «подключён», пока пак разряжался.
 #[must_use]
-pub const fn vbat_tracks_converter_rail(vbat_uv: u32, vin_uv: u32) -> bool {
-    if vin_uv < SWITCHING_MIN_VIN_UV as u32 {
+pub const fn vin_is_doubled_vbat(vbat_uv: u32, vin_uv: u32) -> bool {
+    if vbat_uv == 0 {
         return false;
     }
     let half = vin_uv / 2;
     let lo = half.saturating_sub(VBAT_VIN_HALF_SLACK_UV);
     let hi = half.saturating_add(VBAT_VIN_HALF_SLACK_UV);
     vbat_uv >= lo && vbat_uv <= hi
+}
+
+/// True when VBAT tracks `Vin/2` (switch-cap rail), not a credible pack reading.
+#[must_use]
+pub const fn vbat_tracks_converter_rail(vbat_uv: u32, vin_uv: u32) -> bool {
+    if vin_uv < SWITCHING_MIN_VIN_UV as u32 {
+        return false;
+    }
+    vin_is_doubled_vbat(vbat_uv, vin_uv)
 }
 
 /// True when Vbat is in the Android taper / OV-risk band relative to float.

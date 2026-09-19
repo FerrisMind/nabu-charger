@@ -434,6 +434,7 @@ pub unsafe fn update_from_telemetry(
     vbus_uv: u32,
     iin_ua: u32,
     iin_peak_ua: u32,
+    vac_unplug: bool,
     now_ms: u64,
 ) {
     let prev_power = unsafe { LAST_POWER_STATE };
@@ -444,7 +445,7 @@ pub unsafe fn update_from_telemetry(
     }
     // Счётчик достовернее любой оценки: пока он отвечает, напряжение банки в
     // расчёт не идёт вовсе.
-    let raw_online = battery_policy::online_raw(vbus_uv, vbat_uv, iin_ua);
+    let raw_online = battery_policy::online_raw(vbus_uv, vbat_uv, iin_ua, vac_unplug);
     if vbat_uv > 0 && unsafe { SOC_SRC } != SOC_SRC_GAUGE && !raw_online {
         unsafe {
             LAST_PCT = soc_percent(vbat_uv);

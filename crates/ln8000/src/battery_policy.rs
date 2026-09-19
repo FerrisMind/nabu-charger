@@ -12,6 +12,8 @@
 //! transitions). `DISCHARGING` is derived from the held online value, so a
 //! one-tick dropout never shows "discharging".
 
+use crate::encoding::vin_is_doubled_vbat;
+
 /// Once AC is online, keep reporting online until the raw predicate has been
 /// false continuously for this long (ms).
 pub const ONLINE_HOLD_MS: u64 = 8_000;
@@ -143,12 +145,33 @@ pub const VBUS_ELEVATED_UV: u32 = 6_000_000;
 /// Current into the pack can only come from an adapter, so `Iin` at/above the
 /// charging floor is adapter evidence on its own. Unplugged input reads the
 /// 39 mA ADC floor, far below [`IIN_CHARGING_UA`], so the old guard still holds.
+///
+/// `vac_unplug` — `FAULT1` бит 4 (`LN8000_MASK_VAC_UNPLUG_STS`, вендорский
+/// `ln8000_charger.h:62`). Вендор отвечает **этим битом** на вопрос «есть ли
+/// VBUS» (`POWER_SUPPLY_PROP_TI_VBUS_PRESENT` → `!vac_unplug`,
+/// `ln8000_charger.c:948`), то есть признак отключения приходит от железа, а не
+/// выводится из АЦП. Живой замер 19.09 при отключённом кабеле: `FAULT1 = 0x30`
+/// (бит 4 выставлен), `Vin = 8,80 В` при банке `4,40 В`, ток 39 мА.
+///
+/// Порядок проверок принципиален. Ток идёт первым: он перебивает и защёлку
+/// `VAC_UNPLUG`, и «удвоенную» шину — если в банку течёт 2 А, блок есть, чем бы
+/// ни выглядел `Vin`. Дальше отсекается отражение банки через шину
+/// преобразователя: без кабеля узел `VIN` не нагружен, и АЦП читает ровно
+/// `2 · VBAT`. Это отражение масштабируется вместе с банкой, поэтому проверка
+/// обязана стоять **до** ветки `Vin ≥ 6 В`, которая иначе принимает его
+/// безусловно.
 #[must_use]
-pub const fn online_raw(vbus_uv: u32, vbat_uv: u32, iin_ua: u32) -> bool {
-    if vbus_uv >= VBUS_ELEVATED_UV {
+pub const fn online_raw(vbus_uv: u32, vbat_uv: u32, iin_ua: u32, vac_unplug: bool) -> bool {
+    if vbus_uv >= VBUS_CHARGING_MIN_UV && iin_ua >= IIN_CHARGING_UA {
         return true;
     }
-    if vbus_uv >= VBUS_CHARGING_MIN_UV && iin_ua >= IIN_CHARGING_UA {
+    if vac_unplug {
+        return false;
+    }
+    if vbus_uv >= VBUS_ONLINE_UV && vin_is_doubled_vbat(vbat_uv, vbus_uv) {
+        return false;
+    }
+    if vbus_uv >= VBUS_ELEVATED_UV {
         return true;
     }
     if vbus_uv < VBUS_ONLINE_UV {
@@ -305,35 +328,59 @@ mod tests {
     fn sagging_five_volt_rail_with_current_is_online() {
         // Live 18.09 acceptance: 2.06 A into the pack at Vin 4.384 V. The old
         // 4.6 V floor called this "on battery" while it charged.
-        assert!(online_raw(4_384_000, 4_300_000, 2_063_580));
+        assert!(online_raw(4_384_000, 4_300_000, 2_063_580, false));
         // Same rail, current tapered to the ADC floor: back to the Vin rules.
-        assert!(!online_raw(4_384_000, 4_300_000, IIN_FLOOR_UA));
+        assert!(!online_raw(4_384_000, 4_300_000, IIN_FLOOR_UA, false));
         // A dead bus cannot deliver current.
-        assert!(!online_raw(0, 4_300_000, 2_000_000));
+        assert!(!online_raw(0, 4_300_000, 2_000_000, false));
         // Below the bypass floor: not an adapter even with a suspicious sample.
-        assert!(!online_raw(3_900_000, 3_800_000, 2_000_000));
+        assert!(!online_raw(3_900_000, 3_800_000, 2_000_000, false));
     }
 
     #[test]
     fn unplugged_bypass_is_not_online() {
         // Unplugged, LN8000 Vin tracks VBAT in bypass and input reads the floor.
-        assert!(!online_raw(4_250_000, 4_250_000, IIN_FLOOR_UA));
-        assert!(!online_raw(4_384_000, 4_380_000, IIN_FLOOR_UA));
+        assert!(!online_raw(4_250_000, 4_250_000, IIN_FLOOR_UA, false));
+        assert!(!online_raw(4_384_000, 4_380_000, IIN_FLOOR_UA, false));
     }
 
     #[test]
-    fn elevated_rail_is_always_online() {
+    fn elevated_rail_is_online_unless_it_is_the_pack_reflection() {
         // 2:1 charge-pump band, 1.9 A: elevated rail, no Vin/VBAT comparison.
-        assert!(online_raw(9_088_000, 4_400_000, 1_887_000));
+        assert!(online_raw(9_088_000, 4_400_000, 1_887_000, false));
         // Elevated rail even with a dead current sample.
-        assert!(online_raw(9_000_000, 4_400_000, IIN_FLOOR_UA));
+        assert!(online_raw(9_000_000, 4_400_000, IIN_FLOOR_UA, false));
+    }
+
+    #[test]
+    fn unplugged_elevated_rail_is_not_online() {
+        // Живой замер 19.09 при отключённом кабеле: узел VIN не нагружен, и АЦП
+        // читает ровно 2 · VBAT. Раньше эта ветка возвращала `true` безусловно,
+        // и трей показывал «подключён», пока пак разряжался.
+        assert!(!online_raw(8_800_000, 4_400_000, IIN_FLOOR_UA, false));
+        // Отражение масштабируется вместе с банкой: на разряженной банке оно
+        // попадает в 4,2–8,0 В, ниже порога «поднятой шины» 6 В.
+        assert!(!online_raw(7_600_000, 3_800_000, IIN_FLOOR_UA, false));
+        assert!(!online_raw(5_000_000, 2_500_000, IIN_FLOOR_UA, false));
+        // Ток перебивает отражение: 2 А в банку при 9 В — это блок, а не шина.
+        assert!(online_raw(8_800_000, 4_400_000, 2_000_000, false));
+    }
+
+    #[test]
+    fn hardware_unplug_flag_is_a_veto_until_current_flows() {
+        // `FAULT1` бит 4 выставлен железом — блок отключён. АЦП при этом ещё
+        // может показывать остаточную шину.
+        assert!(!online_raw(9_400_000, 4_400_000, IIN_FLOOR_UA, true));
+        // Улика сильнее защёлки: если в банку течёт ток, блок есть, и устаревший
+        // бит не имеет права гасить `POWER_ON_LINE`.
+        assert!(online_raw(9_400_000, 4_400_000, 2_000_000, true));
     }
 
     #[test]
     fn idle_five_volt_adapter_is_online() {
         // Floating 5 V brick, pack full, no current: still AC (VIN > VBAT+200 mV).
-        assert!(online_raw(5_000_000, 4_300_000, 0));
+        assert!(online_raw(5_000_000, 4_300_000, 0, false));
         // And exactly at the VBAT guard: 4.6 V against a 4.45 V pack is AC.
-        assert!(online_raw(4_600_000, 4_300_000, 0));
+        assert!(online_raw(4_600_000, 4_300_000, 0, false));
     }
 }
