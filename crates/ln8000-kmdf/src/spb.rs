@@ -1487,6 +1487,36 @@ pub const SPMI_REG_FG_IBATT_LSB: u16 = 0x41A2;
 /// попало внутрь обновления.
 pub const SPMI_REG_FG_IBATT_LSB_CP: u16 = 0x41A8;
 
+/// `BATT_INFO_VBATT_LSB` — младший байт напряжения банки (16 бит, LE,
+/// беззнаковое).
+///
+/// Смещение задано в `drivers_power_supply_qcom_fg-reg.h:246-247`
+/// (`batt_info_base + 0xA0`/`+0xA1`), та же периферия `0x4100`, что и у тока.
+pub const SPMI_REG_FG_VBATT_LSB: u16 = 0x41A0;
+
+/// Теневая копия того же напряжения (`BATT_INFO_VBATT_LSB_CP`,
+/// `drivers_power_supply_qcom_fg-reg.h:259-260`, `batt_info_base + 0xA6`).
+///
+/// Проверено по шапке: адрес совпадает с тем, что читает вендор в
+/// `drivers_power_supply_qcom_fg-util.c:1057`, и относится к той же паре
+/// v2.0+, что и [`SPMI_REG_FG_IBATT_LSB_CP`]. Условие равенства — там же
+/// на `:1064`, и оно ровно то же, что у тока.
+pub const SPMI_REG_FG_VBATT_LSB_CP: u16 = 0x41A6;
+
+/// Числитель шага напряжения банки: `V[мкВ] = raw * 122070 / 1000`.
+///
+/// Взято из вендорного декодера `drivers_power_supply_qcom_fg-util.c:1041-1042`
+/// (`BATT_VOLTAGE_NUMR 122070`, `BATT_VOLTAGE_DENR 1000`) и его применения там
+/// же на `:1079`; результат идёт прямо в `POWER_SUPPLY_PROP_VOLTAGE_NOW`
+/// (`drivers_power_supply_qcom_qpnp-fg-gen4.c:5184-5188`), а эта величина в
+/// power_supply — микровольты (там же `:5131`, `vbatt_uv/1000` — милливольты).
+/// Итого 122,07 мкВ на разряд, около 8 мВ на весь диапазон банки.
+pub const FG_VBATT_NUMER: u32 = 122_070;
+
+/// Знаменатель шага напряжения банки (`BATT_VOLTAGE_DENR`,
+/// `drivers_power_supply_qcom_fg-util.c:1042`).
+pub const FG_VBATT_DENOM: u32 = 1_000;
+
 /// Числитель шага тока банки: `I[мкА] = raw * 488281 / 1000`.
 ///
 /// Взято из вендорного декодера `drivers_power_supply_qcom_fg-util.c:997-998`
@@ -1534,6 +1564,20 @@ pub struct ChargeRegs {
     /// меняет знак тока счётчика. На живом планшете поле отрицательно именно
     /// тогда, когда банка достоверно заряжается, — «минус — это заряд».
     pub ibatt_ua: u32,
+    /// Напряжение банки из топливного счётчика PM8150B, мкВ. **Беззнаковое**:
+    /// знака у этой пары нет, в отличие от тока.
+    ///
+    /// Это независимый от LN8000 отсчёт банки. Нужен он потому, что
+    /// [`ChargeRegs`] — единственное место, где видно, чему равно `vbat` на
+    /// самом деле: `AdcChannel::Vbat` у LN8000 во время 2:1 меряет середину
+    /// шины преобразователя (≈ Vin/2), а не банку, — а от `vbat` считается вся
+    /// полоса переноса (см. `ln8000::encoding::window_target_uv`). Ошибка в
+    /// `vbat` сдвигает полосу вдвое.
+    ///
+    /// Разряд весит 122,07 мкВ, и в `u32` полный диапазон 16 бит (0…65535)
+    /// помещается с запасом — в отличие от тока, отрицательных значений здесь
+    /// не бывает, поэтому дополнительного кода не нужно.
+    pub fg_vbatt_uv: u32,
 }
 
 /// Читает регистры SMB5 (PM8150B) и ток банки из топливного счётчика.
@@ -1590,6 +1634,32 @@ pub unsafe fn read_charge_regs(device: WDFDEVICE) -> Option<ChargeRegs> {
     if ibatt != ibatt_cp {
         return None;
     }
+    // Напряжение банки — из той же периферии и той же сессией: у вендора обе
+    // величины читаются одним и тем же циклом с одной и той же проверкой тени
+    // (`drivers_power_supply_qcom_fg-util.c:1005-1027` для тока и `:1049-1071`
+    // для напряжения). Порядок байт и отсутствие знака — по `:1077`
+    // (`temp = buf[1] << 8 | buf[0]`), ветка `PMI8998_V1_REV_WA` (`:1073`) к
+    // nabu не относится: на PM8150B флаг не выставляется вовсе — в
+    // `qpnp-fg-gen4.c` он не упоминается, а ставит его только `qpnp-fg-gen3.c`
+    // для `PMI8998_SUBTYPE`.
+    let mut vbatt = [0_u8; 2];
+    su.read_bytes(SPMI_SID_USBIN, SPMI_REG_FG_VBATT_LSB, &mut vbatt)
+        .ok()?;
+    let mut vbatt_cp = [0_u8; 2];
+    su.read_bytes(SPMI_SID_USBIN, SPMI_REG_FG_VBATT_LSB_CP, &mut vbatt_cp)
+        .ok()?;
+    // Та же цена расхождения, что и у тока: снимок неполон, значит его нет.
+    if vbatt != vbatt_cp {
+        return None;
+    }
+    // Младший байт лежит в 0x41A0, старший в 0x41A1 (`temp = buf[1] << 8 | buf[0]`
+    // в `drivers_power_supply_qcom_fg-util.c:1077`); знака нет — вендор здесь
+    // `sign_extend32` не зовёт, в отличие от тока (`:1036`).
+    let raw_v = u32::from(u16::from_le_bytes(vbatt));
+    // Произведение считаем в `u64`: 65535 разрядов это 8,0 В в микровольтах,
+    // и в `u32` оно не влезает — насыщающее умножение дало бы неверное
+    // напряжение на верхнем разряде.
+    let micro_uv = u64::from(raw_v) * u64::from(FG_VBATT_NUMER) / u64::from(FG_VBATT_DENOM);
     // Младший байт лежит в 0x41A2, старший в 0x41A3 (`temp = buf[1] << 8 | buf[0]`
     // в `drivers_power_supply_qcom_fg-util.c:1033`), знак — бит 15 (там же, `:1036`).
     let raw = i32::from(i16::from_le_bytes(ibatt));
@@ -1606,6 +1676,8 @@ pub unsafe fn read_charge_regs(device: WDFDEVICE) -> Option<ChargeRegs> {
         usbin_allow,
         // Отрицательный ток сохраняет знак: марка `u32` несёт его дополнительным кодом.
         ibatt_ua: (micro_ua as i32) as u32,
+        // Напряжение банки знака не имеет и в дополнительный код не переводится.
+        fg_vbatt_uv: micro_uv as u32,
     })
 }
 

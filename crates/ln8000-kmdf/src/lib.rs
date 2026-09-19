@@ -189,21 +189,37 @@ const RE_ELEVATE_MAX_VBAT_UV: u32 = 4_350_000;
 /// то есть 1,50 А, — это и есть заводской предел бака на нашем планшете.
 const FCC_STEP_UA: u32 = 50_000;
 
-/// Предел FCC бака, который драйвер ставит, пока насос несёт ток, мкА.
+/// Имя параметра реестра, которым включается политика FCC бака: сырое значение
+/// поля FCC регистра `0x1061` (50 мА на разряд), которое драйвер ставит, пока
+/// насос несёт ток.
 ///
-/// Живой замер 19.09 (сборка .652, MDY-08-EI): `ChgrFccRaw = 30` — бак упёрт в
-/// 1,5 А, которые оставила прошивка, при `FgIbatUa` ≈ 2,9 А и `SysStsRaw =
-/// 0x04` (насос в 2:1 без петель `IIN_LOOP`/`VFLOAT_LOOP`, то есть отдаёт
-/// сколько дают). Бак — вторая зарядная ветка платформы, её потолок вендорный
-/// DT планшета задаёт равным 5,9 А (`qcom,fcc-max-ua = <5900000>`,
-/// `arch/arm64/boot/dts/qcom/xiaomi/overlay/nabu/nabu-sm8150.dtsi:68`), и Android
-/// поднимает FCC, когда активен насос.
+/// Параметра нет или он равен нулю — политики нет вовсе: регистр за загрузку не
+/// трогается ни разу. Это умолчание и вместе с тем поведение сборки `.652`, с
+/// которой снят базовый замер. Значение `N > 0` включает подъём до сырого `N`;
+/// потолок [`FCC_WRITE_MAX_UA`] применяет [`raw_for`], и другой дорогой его не
+/// обойти.
 ///
-/// Берём 2,5 А, а не 5,9 А: канала температуры банки, которому можно верить, у
-/// драйвера пока нет, а это первая сборка, которая вообще трогает ток банки.
-/// Ступень 1,5 → 2,5 А снимает заводской потолок бака, оставаясь ниже и
-/// вендорного максимума, и той суммы, которую уже видел живой замер.
-const FCC_PUMP_UA: u32 = 2_500_000;
+/// Ручка появилась не из осторожности, а из живого замера 19.09, который
+/// опрокинул исходное предположение. Сборка `.655` поднимала предел бака до
+/// 2,5 А (`FccRaw = 50`) на том основании, что заводские 1,5 А (`ChgrFccRaw =
+/// 30`, `FgIbatUa` ≈ 2,9 А, `SysStsRaw = 0x04`) душат перенос, — и скорость
+/// заряда банки упала вдвое: 0,409 %/мин на `.652` без подъёма против
+/// 0,249 %/мин на `.655`, а доля тактов в режиме 2:1 — с 85 % (34 отсчёта из
+/// 40) до 39 % (13 из 33). Механизм виден в том же замере: перенос делит
+/// восемнадцать ватт адаптера между насосом и баком, и разрешённые баку 2,5 А
+/// этот бюджет вычерпывают — адаптер теряет поднятый уровень QC3 (`FAULT1 =
+/// 0x21` защёлкивается, `SuMode` падает до 1, шина 4,5 В), после чего насос
+/// сваливается на пяти­вольтовый путь, где банка получает около 0,7 А. Предел
+/// при этом работает: пока насос удерживает 2:1, ток в банку доходит до
+/// −2,5…−3,2 А, то есть вредит не он, а исчерпанный бюджет конкретного блока,
+/// и на другом адаптере ответ может быть обратным. Проверяется это только
+/// A/B на железе, а он не должен стоить пересборки: значение и стало
+/// параметром. Верхняя граница вендорного DT планшета — 5,9 А
+/// (`qcom,fcc-max-ua = <5900000>`,
+/// `arch/arm64/boot/dts/qcom/xiaomi/overlay/nabu/nabu-sm8150.dtsi:68`), но
+/// канала температуры банки, которому можно верить, у драйвера нет, поэтому
+/// потолок записи оставлен ниже — на [`FCC_WRITE_MAX_UA`].
+const FCC_POLICY_VALUE_NAME: &str = "FccRaw";
 
 /// Уставка одноразовой пробы записи FCC бака, мкА.
 ///
@@ -390,6 +406,20 @@ struct DriverState {
     /// телеметрии. Период — [`GAUGE_POLL_MS`]: снимок идёт по той же шине SPMI и
     /// через тот же слот SUPERUSER, что и опрос счётчика.
     last_chgr_mark_ms: u64,
+    /// Сырое FCC из параметра [`FCC_POLICY_VALUE_NAME`] — то, до чего политика
+    /// поднимает предел бака, пока насос несёт ток. Ноль — политика выключена,
+    /// и тогда регистр `0x1061` не трогает никто.
+    ///
+    /// Читается один раз при старте устройства ([`read_parameters`]), потому что
+    /// это ручка A/B между загрузками, а не уставка на ходу; марка `FccCfgRaw`
+    /// публикует применённое значение, чтобы режим был виден со стороны планшета.
+    /// Захват [`Self::fcc_boot_raw`] от этой ручки не зависит и идёт всегда — он
+    /// нужен и сам по себе, как диагностика (`ChgrFccRaw`). Отсюда и известная
+    /// ловушка: если прошлая загрузка оставила регистр поднятым, следующая
+    /// захватит поднятое как «заводское», и вернуть банк будет некуда. Увидеть
+    /// это можно только по паре марок — `FccCfgRaw` (что просили) и `ChgrFccRaw`
+    /// (что реально стоит), — и потому обе публикуются всегда, включая ноль.
+    fcc_cfg_raw: u32,
     /// FCC бака, который стоял в `0x1061` до нашей первой записи, 50 мА/разряд.
     ///
     /// Ноль — значение ещё не захвачено: живой замер 19.09 дал 30 (1,50 А), так
@@ -398,7 +428,8 @@ struct DriverState {
     /// (вернуть банк к исходному было бы нечем), и уж точно нельзя возвращать
     /// ноль, который запретил бы заряд баку совсем.
     fcc_boot_raw: u8,
-    /// Поднят ли FCC бака нашим пределом [`FCC_PUMP_UA`].
+    /// Поднят ли FCC бака политикой (`FccRaw`): только тогда [`Self::fcc_boot_raw`]
+    /// возвращается через [`FCC_RESTORE_GRACE_MS`].
     fcc_raised: bool,
     /// Монотонный срок возврата FCC к [`Self::fcc_boot_raw`], мс.
     ///
@@ -455,6 +486,7 @@ impl DriverState {
             re_elevate_next_ms: 0,
             re_elevate_backoff_ms: 0,
             last_chgr_mark_ms: 0,
+            fcc_cfg_raw: 0,
             fcc_boot_raw: 0,
             fcc_raised: false,
             fcc_restore_at_ms: 0,
@@ -670,6 +702,9 @@ struct DriverParams {
     config: PumpConfig,
     limits: GuardLimits,
     telemetry_ms: u32,
+    /// Сырое значение FCC из параметра [`FCC_POLICY_VALUE_NAME`] (0 — политика
+    /// выключена: и когда параметра нет, и когда он равен нулю).
+    fcc_raw: u32,
 }
 
 /// Заполняет буфер символами строки и возвращает длину.
@@ -1265,6 +1300,9 @@ unsafe fn read_parameters(device: WDFDEVICE) -> DriverParams {
     // уставкой (защита, ICL сессии) и «профильное» значение теряется.
     limits.iin_profile_ua = config.iin_limit_ua;
     let mut telemetry_ms = 250_u32;
+    // Применённое значение `FccRaw`: `0` — параметра нет или он ноль, то есть
+    // политика FCC выключена и регистр `0x1061` за загрузку не трогается.
+    let mut fcc_raw = 0_u32;
     // Применённое значение `ProtectionProfile`: `None` — параметра в реестре нет
     // и остаётся профиль кода (`for_qc35_class_b`, петли включены).
     let mut protection_profile: Option<u32> = None;
@@ -1283,11 +1321,16 @@ unsafe fn read_parameters(device: WDFDEVICE) -> DriverParams {
     };
     if status < 0 {
         println!("ln8000-kmdf: ключ устройства не открылся ({status:#010X}); беру профиль по умолчанию");
+        // Политики FCC в этом исходе нет по построению (параметр не прочитан),
+        // но марка публикуется и здесь: иначе отсутствие `FccCfgRaw` в дампе
+        // было бы неотличимо от «драйвер до этих марок не дошёл».
+        mark_device_value(device, "FccCfgRaw", 0);
         mark_profile(device, &config, protection_profile);
         return DriverParams {
             config,
             limits,
             telemetry_ms,
+            fcc_raw,
         };
     }
 
@@ -1317,11 +1360,13 @@ unsafe fn read_parameters(device: WDFDEVICE) -> DriverParams {
         unsafe {
             call_unsafe_wdf_function_binding!(WdfRegistryClose, device_key);
         }
+        mark_device_value(device, "FccCfgRaw", 0);
         mark_profile(device, &config, protection_profile);
         return DriverParams {
             config,
             limits,
             telemetry_ms,
+            fcc_raw,
         };
     }
 
@@ -1359,7 +1404,41 @@ unsafe fn read_parameters(device: WDFDEVICE) -> DriverParams {
         }
     }
 
-    // Пороги защиты: если набор получится несогласованным, значение отклоняется.
+    // Политика FCC бака: `FccRaw` — сырое значение поля FCC регистра `0x1061`,
+    // которое драйвер ставит, пока насос несёт ток. О том, почему это параметр,
+    // а не константа, и что показал живой замер, — в [`FCC_POLICY_VALUE_NAME`].
+    // Границ у значения нет намеренно: любое `N > 0` значит «поднимать до N
+    // разрядов», потолок [`FCC_WRITE_MAX_UA`] применяет `raw_for`, поэтому
+    // завышенное N упрётся в потолок, а не обрежется по модулю поля.
+    // SAFETY: ключ Parameters открыт на чтение.
+    if let Some(raw) = unsafe { query_ulong(params_key, FCC_POLICY_VALUE_NAME) } {
+        fcc_raw = raw;
+    }
+    // Марка публикуется и нулём: по ней в дампе видно, какая ветка политики
+    // работает, и её же нужно смотреть рядом с `ChgrFccRaw`, когда встаёт вопрос
+    // о заводском значении регистра (см. `DriverState::fcc_cfg_raw`).
+    mark_device_value(device, "FccCfgRaw", fcc_raw);
+    if fcc_raw == 0 {
+        println!("ln8000-kmdf: политика FCC бака выключена (FccRaw не задан или равен нулю)");
+    } else {
+        println!(
+            "ln8000-kmdf: политика FCC бака включена: FccRaw = {fcc_raw} ({} мА, потолок {} мА)",
+            fcc_raw.saturating_mul(FCC_STEP_UA / 1000),
+            FCC_WRITE_MAX_UA / 1000
+        );
+    }
+
+    // Пороги защиты приходят набором, и порядок порогов проверяется **один раз
+    // в конце**: `apply_parameter` проверяет согласованность после каждого
+    // значения, поэтому набор, меняющий сразу несколько порогов, не применялся
+    // никогда — первое же значение сравнивалось с ещё не обновлёнными соседями.
+    // Живой случай 19.09: `TempReduceDc=600` отвергался против старого
+    // `TempBypassDc=480` при любом порядке, и защита оставалась на 43,0/48,0 °C,
+    // то есть ниже температуры покоя кристалла (46,1 °C).
+    //
+    // Снимок `before` нужен, чтобы отвергнутый набор не оставил пороги
+    // частично обновлёнными: либо весь набор, либо прежний.
+    let before = limits;
     for name in [
         "TempReduceDc",
         "TempBypassDc",
@@ -1371,10 +1450,17 @@ unsafe fn read_parameters(device: WDFDEVICE) -> DriverParams {
     ] {
         // SAFETY: ключ Parameters открыт на чтение.
         if let Some(value) = unsafe { query_ulong(params_key, name) } {
-            if !limits.apply_parameter(name, value) {
-                println!("ln8000-kmdf: порог {name} = {value} отклонён, остаётся прежний");
+            if !limits.apply_parameter_lenient(name, value) {
+                println!("ln8000-kmdf: порог {name} = {value} отклонён (вне диапазона)");
             }
         }
+    }
+    if !limits.validate() {
+        println!(
+            "ln8000-kmdf: набор порогов несогласован ({} / {} / {}); беру прежний",
+            limits.temp_reduce_dc, limits.temp_bypass_dc, limits.temp_stop_dc
+        );
+        limits = before;
     }
 
     println!(
@@ -1405,6 +1491,7 @@ unsafe fn read_parameters(device: WDFDEVICE) -> DriverParams {
         config,
         limits,
         telemetry_ms,
+        fcc_raw,
     }
 }
 
@@ -2032,6 +2119,7 @@ unsafe extern "C" fn evt_prepare_hardware(
     mark_device_value(device, "PumpOpen", 1);
     st.pump = Some(pump);
     st.telemetry_ms = params.telemetry_ms;
+    st.fcc_cfg_raw = params.fcc_raw;
     st.limits = guard_limits;
 
     // 4b. Autostart HVDCP via SUPERUSER (Usbin RH secondary if overlay present).
@@ -2047,6 +2135,7 @@ unsafe extern "C" fn evt_prepare_hardware(
         let mut vbat = 0i32;
         let mut vbus = 0i32;
         let mut iin = 0i32;
+        let mut vac_unplug = false;
         // First ADC right after HVDCP can return 0; retry — a zero sample must
         // not pin tray SoC at 0% (see battery::update_from_telemetry).
         for _ in 0..3 {
@@ -2054,6 +2143,12 @@ unsafe extern "C" fn evt_prepare_hardware(
                 vbat = pump.read_adc(AdcChannel::Vbat).unwrap_or_default();
                 vbus = pump.read_adc(AdcChannel::Vin).unwrap_or_default();
                 iin = pump.read_adc(AdcChannel::Iin).unwrap_or_default();
+                // Тот же аппаратный признак, что и в такте телеметрии: без него
+                // отражение `2 · VBAT` после отключения блока снова сошло бы за
+                // живой вход на этом пути публикации.
+                vac_unplug = pump
+                    .read_register(ln8000::regs::FAULT1_STS)
+                    .is_ok_and(|f1| f1 & ln8000::regs::FAULT1_VAC_UNPLUG != 0);
             }
             if vbat > 0 {
                 break;
@@ -2067,6 +2162,7 @@ unsafe extern "C" fn evt_prepare_hardware(
                 // Окно пика ещё не начато: единственный отсчёт и есть пик.
                 st.max_iin_ua
                     .max(u32::try_from(iin.max(0)).unwrap_or(0)),
+                vac_unplug,
                 monotonic_ms(),
             );
         }
@@ -2347,14 +2443,31 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
     let iin = iin_read.unwrap_or_default();
     let temp = temp_read.unwrap_or_default();
 
+    let vbat_uv = u32::try_from(vbat.max(0)).unwrap_or(0);
+    let vbus_uv = u32::try_from(vbus.max(0)).unwrap_or(0);
+    let iin_ua = u32::try_from(iin.max(0)).unwrap_or(0);
+    // `FAULT1` бит 4 (`LN8000_MASK_VAC_UNPLUG_STS`, вендорский
+    // `ln8000_charger.h:62`): железо само сообщает, что блок отключён. Вендор
+    // отвечает этим битом на вопрос «есть ли VBUS» (`POWER_SUPPLY_PROP_TI_VBUS_PRESENT`
+    // в `ln8000_charger.c`), поэтому признак не нужно выводить из АЦП.
+    let vac_unplug = status.fault1_sts & ln8000::regs::FAULT1_VAC_UNPLUG != 0;
+    // При отключённом кабеле узел VIN не нагружен, и АЦП читает `2 · VBAT`
+    // (живой замер 19.09: `Vin = 8,80 В` при банке `4,40 В`, ток на полу).
+    // По сырому `vbus > 0` такой вход выглядел живым, а от этого признака
+    // зависят защита, сессии и HVDCP. Ток и активный режим перебивают: они
+    // означают, что вход действительно работает.
+    let phantom_input = iin_ua < hvdcp::IIN_DEAD_FLOOR_UA
+        && status.op_mode != OpMode::Switching
+        && status.op_mode != OpMode::Bypass
+        && (vac_unplug || ln8000::encoding::vin_is_doubled_vbat(vbat_uv, vbus_uv));
     let sample = TelemetrySample {
         ts_ms: monotonic_ms(),
-        vbat_uv: u32::try_from(vbat.max(0)).unwrap_or(0),
-        vbus_uv: u32::try_from(vbus.max(0)).unwrap_or(0),
-        iin_ua: u32::try_from(iin.max(0)).unwrap_or(0),
+        vbat_uv,
+        vbus_uv,
+        iin_ua,
         die_temp_dc: temp,
         op_mode: status.op_mode,
-        input_present: !status.has_critical_fault() && vbus > 0,
+        input_present: !status.has_critical_fault() && vbus_uv > 0 && !phantom_input,
         vbat_valid: vbat_read.is_ok(),
         die_temp_valid: temp_read.is_ok(),
     };
@@ -2367,6 +2480,7 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
             sample.vbus_uv,
             sample.iin_ua,
             st.max_iin_ua,
+            vac_unplug,
             sample.ts_ms,
         );
     }
@@ -2480,7 +2594,8 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
         // который оставила прошивка, ни реального тока в банку: насос меряет
         // только свой вход, а 2:1 сам по себе не говорит, куда ушёл перенос.
         // Раз в `GAUGE_POLL_MS`: снимок — это открытие SUPERUSER, три grant,
-        // семь однобайтовых чтений и две пары регистров тока, и на каждом такте
+        // семь однобайтовых чтений и три пары регистров (ток и напряжение
+        // банки), и на каждом такте
         // телеметрии (250 мс) такая нагрузка на шину недопустима — при опросе
         // счётчика раз в 250 мс сторонний читатель SUPERUSER получал отказ в
         // 79 попытках из 100 (замер 18.09).
@@ -2513,6 +2628,35 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
                     mark_device_value(device, "ChgrIclRaw", u32::from(regs.icl_raw));
                     mark_device_value(device, "ChgrAllow", u32::from(regs.usbin_allow));
                     mark_device_value(device, "FgIbatUa", regs.ibatt_ua);
+                    // Два напряжения банки рядом, в одном снимке, — это и есть
+                    // смысл сборки: их расхождение проверяет гипотезу, что
+                    // `vbat` у нас не тот.
+                    //
+                    // Полоса переноса 2:1 считается от `vbat`
+                    // (`ln8000::encoding::window_target_uv`: `2·vbat + {200,300,400} мВ`),
+                    // поэтому ошибка в `vbat` двигает всю полосу. Живой замер
+                    // 19.09: шина стоит на 8,672 В, `SuMode = 3`, `SysStsRaw =
+                    // 0x04`, а вход берёт всего 0,787 А — при том, что тот же
+                    // блок на 9,136 В отдавал 1,25 А. Вывод «мы на полу полосы»
+                    // сделан по числу, взятому с `AdcChannel::Vbat`, а у самого
+                    // LN8000 есть оговорка (см. комментарий у `BattVbat` выше,
+                    // строка про 2:1): во время 2:1 этот канал читает середину
+                    // шины преобразователя (≈ Vin/2), а не банку. Если так, то
+                    // `vbat` занижен примерно вдвое, `2·vbat` тоже, и полоса
+                    // посчитана не там, где стоит шина.
+                    //
+                    // `FgVbattMv` — независимый отсчёт: топливный счётчик
+                    // PM8150B, пара `0x41A0`/`0x41A6`, тот же путь SPMI, что и
+                    // у тока банки, никак не связанный с ADC насоса.
+                    // `VbatAdcMv` — то самое число, от которого считается
+                    // полоса (`sample.vbat_uv / 1000`; под именем `BattVbat` оно
+                    // публикуется выше и остаётся на месте — здесь оно повторено
+                    // затем, чтобы оба отсчёта читались из одной записи журнала
+                    // и не разъезжались по тактам). Сходятся — гипотеза снята;
+                    // расходятся вдвое — полоса считается от середины шины, и
+                    // двигать её нужно по `FgVbattMv`.
+                    mark_device_value(device, "FgVbattMv", regs.fg_vbatt_uv / 1000);
+                    mark_device_value(device, "VbatAdcMv", sample.vbat_uv / 1000);
                     mark_device_value(device, "ChgrErr", 0);
 
                     // Одноразовая проба записи FCC бака — единственный способ
@@ -2548,7 +2692,14 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
                     {
                         // Политика держит регистр, если насос несёт ток ниже ворот
                         // или предел уже поднят её рукой — тогда проба не имеет
-                        // права писать: её запись затёрла бы подъём.
+                        // права писать: её запись затёрла бы подъём. Пара условий
+                        // здесь ровно та же, что у самого подъёма ниже, поэтому
+                        // «включена и ждёт» политика пробу не пропускает: без
+                        // `fcc_raised` её удерживает второе слагаемое. Выключенная
+                        // политика (`FccRaw` не задан или 0) держать регистр не
+                        // может, но уступать всё равно приходится — второе
+                        // слагаемое не знает про параметр, и проба дождётся первого
+                        // такта, где насос не несёт ток или банка выше ворот.
                         let policy_owns = st.fcc_raised
                             || (pump_alive && sample.vbat_uv < RE_ELEVATE_MAX_VBAT_UV);
                         // Потолок [`FCC_WRITE_MAX_UA`] применён внутри `raw_for`.
@@ -2609,35 +2760,61 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
                         "ChgrIclRaw",
                         "ChgrAllow",
                         "FgIbatUa",
+                        "FgVbattMv",
                     ] {
                         mark_device_value(device, name, 0xFFFF_FFFF);
                     }
+                    // `VbatAdcMv` сюда не входит намеренно: он не из сорванного
+                    // чтения SPMI, а из ADC насоса, который живёт на своём такте
+                    // (`sample.vbat_uv`, та же величина, что и `BattVbat` выше).
+                    // Отправить его в сентинел значило бы соврать про ADC, а
+                    // ноль выглядел бы как настоящее измерение. Сентинел у
+                    // `FgVbattMv` недостижим и по величине: 65535 разрядов по
+                    // 122,07 мкВ — это 8 001 мВ, потолок банки, а не 4,29·10⁹.
+                    mark_device_value(device, "VbatAdcMv", sample.vbat_uv / 1000);
                     mark_device_value(device, "ChgrErr", 1);
                 }
             }
 
-            // Предел бака (buck) SMB5. Пока насос несёт ток, бак — вторая
-            // половина переноса, и его заводские 1,5 А (`ChgrFccRaw = 30`)
-            // душат то, что платформа умеет: живой замер 19.09 дал 2,9 А в
-            // банку при этом пределе. Вендорный DT разрешает 5,9 А, мы идём
-            // ступенью [`FCC_PUMP_UA`] и только на живом 2:1 — поднятый на
-            // пяти вольтах или на полке предел висел бы, когда насос уже не
-            // переносит, и мешал бы следующему решению платформы.
+            // Предел бака (buck) SMB5 — вторая половина переноса, и заводские
+            // 1,5 А (`ChgrFccRaw = 30`) душат то, что платформа умеет: живой
+            // замер 19.09 дал 2,9 А в банку при этом пределе. Но подъём этого
+            // предела — не улучшение по умолчанию, а гипотеза, которую тот же
+            // замер опрокинул: сборка `.655` с подъёмом до 2,5 А дала вдвое
+            // меньший темп заряда банки (0,249 %/мин против 0,409 %/мин на
+            // `.652`) и втрое реже удержанный 2:1 (39 % против 85 %), потому
+            // что разрешённые баку амперы вычерпывают восемнадцать ватт
+            // адаптера и роняют его уровень QC3 (`FAULT1 = 0x21`, `SuMode = 1`,
+            // шина 4,5 В); механизм разобран в [`FCC_POLICY_VALUE_NAME`].
+            // Поэтому пишет политика только тогда, когда её включили параметром
+            // `FccRaw`: без параметра и при нуле регистр `0x1061` не трогает
+            // никто, и это умолчание воспроизводит `.652` — там подъёма не было.
+            // Захват `fcc_boot_raw` выше от политики не зависит: он нужен и как
+            // диагностика, а по паре `FccCfgRaw`/`ChgrFccRaw` видна ловушка с
+            // поднятым прошлой загрузкой «заводским» значением.
             //
-            // Возврат — через [`FCC_RESTORE_GRACE_MS`] после потери переноса,
-            // и только если исходное значение захвачено. Критичный отказ чипа
-            // останавливает обе записи: поднимать ток в банку, когда чип
-            // сообщает о перегреве или перенапряжении, нельзя.
+            // Подъём идёт только на живом 2:1 и ниже ворот
+            // [`RE_ELEVATE_MAX_VBAT_UV`]: поднятый на пяти вольтах или на полке
+            // предел висел бы, когда насос уже не переносит, и мешал бы
+            // следующему решению платформы. Возврат — через
+            // [`FCC_RESTORE_GRACE_MS`] после потери переноса, и только если
+            // исходное значение захвачено. Критичный отказ чипа останавливает
+            // обе записи: поднимать ток в банку, когда чип сообщает о перегреве
+            // или перенапряжении, нельзя.
             if !status.has_critical_fault() {
                 if pump_alive {
                     // Насос снова взялся за ток — запланированный возврат снимаем.
                     st.fcc_restore_at_ms = 0;
-                    if !st.fcc_raised
+                    if st.fcc_cfg_raw != 0
+                        && !st.fcc_raised
                         && st.fcc_boot_raw != 0
                         && sample.vbat_uv < RE_ELEVATE_MAX_VBAT_UV
                     {
-                        // Потолок [`FCC_WRITE_MAX_UA`] применён внутри `raw_for`.
-                        let want = raw_for(FCC_PUMP_UA);
+                        // `FccRaw` — сырое значение поля, а не микроамперы: в
+                        // микроамперы его переводит только эта строка, а потолок
+                        // [`FCC_WRITE_MAX_UA`] применяет `raw_for`, так что
+                        // обойти потолок другой дорогой нельзя.
+                        let want = raw_for(st.fcc_cfg_raw.saturating_mul(FCC_STEP_UA));
                         // SAFETY: пассивный уровень; `device` жив.
                         if unsafe { write_fcc_and_publish(device, want) } {
                             st.fcc_raised = true;
@@ -3574,6 +3751,7 @@ unsafe fn handle_get_status(request: WDFREQUEST) {
                 status.vbus_uv,
                 status.iin_ua,
                 st.max_iin_ua,
+                status.fault1_sts & ln8000::regs::FAULT1_VAC_UNPLUG != 0,
                 monotonic_ms(),
             );
         }
