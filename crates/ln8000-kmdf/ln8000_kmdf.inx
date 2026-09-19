@@ -26,7 +26,7 @@ PnpLockDown = 1
 ; Must stay ABOVE tablet-bound oem142 (20.46.10.591). cargo-wdk stampinf
 ; uses STAMPINF_VERSION when set (see deploy/build-arm64.ps1); without it
 ; stampinf -v * stamps wall-clock and can fall below oem142 on AM rebuilds.
-DriverVer   = 09/18/2026,20.47.10.636
+DriverVer   = 09/19/2026,20.47.10.659
 
 [DestinationDirs]
 DefaultDestDir = 13
@@ -75,9 +75,15 @@ HKR, Parameters, IinLimitUa,      %REG_DWORD%, 2000000
 HKR, Parameters, VbatFloatUv,     %REG_DWORD%, 4470000
 HKR, Parameters, VacOvpUv,        %REG_DWORD%, 13000000
 ; protection thresholds (tenths of degC) and currents (uA):
-HKR, Parameters, TempReduceDc,    %REG_DWORD%, 430
-HKR, Parameters, TempBypassDc,    %REG_DWORD%, 480
-HKR, Parameters, TempStopDc,      %REG_DWORD%, 550
+; Пороги обязаны лежать выше температуры покоя кристалла этой платы: живой
+; замер 19.09 на .657 — 43,5-46,1 °C в простое (насос в standby) и 50,8 °C под
+; нагрузкой 2:1. Прежние 430/480/550 были ниже покоя, срез срабатывал
+; постоянно, а возврат (порог минус гистерезис 3,0 °C) был недостижим: предел
+; входного тока уходил на IinFloorUa и оставался там навсегда (живой
+; IIN_CTRL = 10, то есть 500 мА, при профиле 2,7 А).
+HKR, Parameters, TempReduceDc,    %REG_DWORD%, 550
+HKR, Parameters, TempBypassDc,    %REG_DWORD%, 600
+HKR, Parameters, TempStopDc,      %REG_DWORD%, 650
 HKR, Parameters, IinMaxUa,        %REG_DWORD%, 3500000
 HKR, Parameters, IinTargetUa,     %REG_DWORD%, 2000000
 HKR, Parameters, IinFloorUa,      %REG_DWORD%, 500000

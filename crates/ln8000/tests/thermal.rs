@@ -7,9 +7,10 @@
 //! Уход в 1:1 разрешает только Vin в окне обхода: на повышенном входе защита
 //! снижает ток, а затем останавливает заряд (проверяется отдельным сценарием).
 //!
-//! Значения температур выбраны с запасом от порогов, чтобы тест не зависел от
-//! округления при кодировании: 39.8 °C — норма, 44.1 °C — снижение тока,
-//! 48.9 °C — уровень обхода/останова, 55.9 °C — останов.
+//! Ступени берутся от порогов профиля (`GuardLimits::standard`), а не зашиты
+//! числами: пороги обязаны лежать выше температуры покоя кристалла этой платы
+//! (живой замер 19.09 — 46,1 °C в простое), и зашитые значения разъезжались с
+//! ними молча.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -21,7 +22,7 @@
 use ln8000::testkit::MockPumpBus;
 use ln8000::{
     AdcChannel, BypassResolution, GuardAction, GuardLimits, OpMode, Pump, PumpConfig,
-    TelemetrySample, evaluate, regs, resolve_bypass,
+    TEMP_REDUCE_HYST_DC, TelemetrySample, evaluate, regs, resolve_bypass,
 };
 
 /// Записывает температуру кристалла в регистры АЦП так, как это сделал бы чип.
@@ -92,7 +93,14 @@ fn thermal_ramp_on_elevated_vin_never_uses_bypass() {
     limits.iin_profile_ua = target_before;
 
     // Температура растёт: норма → снижение тока → отказ 1:1 (снижение) → останов.
-    let ramp = [398, 441, 489, 559];
+    // Ступени выводятся из порогов профиля: зашитые числа разъезжались с ними
+    // молча (пороги подняты над температурой покоя кристалла — 46,1 °C).
+    let ramp = [
+        limits.temp_reduce_dc - 100,
+        limits.temp_reduce_dc + 10,
+        limits.temp_bypass_dc + 10,
+        limits.temp_stop_dc + 10,
+    ];
     let mut seen: Vec<&'static str> = Vec::new();
     let mut denied_strikes = 0_u32;
 
@@ -211,7 +219,7 @@ fn thermal_bypass_on_five_volts_is_allowed() {
 
     let mut limits = GuardLimits::standard();
     limits.iin_profile_ua = pump.config().iin_limit_ua;
-    set_die_temp(&mut pump, 489);
+    set_die_temp(&mut pump, limits.temp_bypass_dc + 10);
     set_vin_adc(&mut pump, 5_000_000);
     let sample = sample_from_with_vin(&mut pump, 0, 5_000_000);
     assert!(matches!(
@@ -246,7 +254,7 @@ fn cooled_down_chip_returns_to_switching() {
     limits.iin_profile_ua = pump.config().iin_limit_ua;
 
     // Сначала перегрев: уходим в защиту.
-    set_die_temp(&mut pump, 559);
+    set_die_temp(&mut pump, limits.temp_stop_dc + 10);
     let hot = sample_from(&mut pump, 0);
     assert!(matches!(
         evaluate(
@@ -260,7 +268,7 @@ fn cooled_down_chip_returns_to_switching() {
     pump.standby().expect("останов");
 
     // Затем остывание: чип можно вернуть в рабочий режим.
-    set_die_temp(&mut pump, 350);
+    set_die_temp(&mut pump, limits.temp_reduce_dc - TEMP_REDUCE_HYST_DC - 100);
     let cold = sample_from(&mut pump, 1_000);
     assert!(
         matches!(

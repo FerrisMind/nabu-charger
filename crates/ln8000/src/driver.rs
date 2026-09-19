@@ -1942,13 +1942,15 @@ mod tests {
         let mut limits = GuardLimits::standard();
         limits.iin_profile_ua = pump.config().iin_limit_ua;
         limits.vbat_reduce_uv = crate::encoding::NABU_VBAT_NON_FFC_UV;
-        // Оба условия среза сразу: 44,0 °C ≥ 43,0 °C и 4,46 В ≥ 4,45 В.
+        // Оба условия среза сразу: температура выше порога среза и 4,46 В ≥ 4,45 В.
+        // Порог берётся из профиля: он обязан лежать выше температуры покоя
+        // кристалла этой платы (живой замер 19.09 — 46,1 °C в простое).
         let sample = TelemetrySample {
             ts_ms: 1_000,
             vbat_uv: 4_460_000,
             vbus_uv: 9_600_000,
             iin_ua: 1_200_000,
-            die_temp_dc: 440,
+            die_temp_dc: limits.temp_reduce_dc + 1,
             op_mode: OpMode::Switching,
             input_present: true,
             vbat_valid: true,

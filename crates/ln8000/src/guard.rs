@@ -72,15 +72,29 @@ impl Default for GuardLimits {
 impl GuardLimits {
     /// Профиль по умолчанию, доступный в константном контексте.
     ///
-    /// Пороги взяты из практики мобильных платформ и значений драйвера
-    /// Android: аларм NTC соответствует ≈ +40 °C, защита кристалла начинается
-    /// задолго до аппаратного максимума (+160 °C).
+    /// Пороги подняты над **живой температурой покоя** этой платы. Прежние
+    /// 43,0/48,0/55,0 °C лежали ниже неё: кристалл nabu в простое (насос в
+    /// standby, вход на полу АЦП) держит 43,5–46,1 °C — замер 19.09 по
+    /// `die_dc`, — то есть срез по температуре срабатывал постоянно, а возврат
+    /// требовал ≤ 40,0 °C (порог минус гистерезис 3,0 °C), чего кристалл не
+    /// достигает никогда. Под нагрузкой 2:1 он доходит до 50,8 °C, и тогда
+    /// срабатывал `FallbackToBypass`, запрещённый на 9 В: ток уходил на
+    /// [`Self::iin_floor_ua`] и оставался там навсегда — живой `IIN_CTRL = 10`
+    /// (500 мА) при профиле 2,7 А.
+    ///
+    /// Вендор для nabu держит `tdie-prot-disable` и `tdie-reg-disable` в DTS
+    /// (`nabu-sm8150.dtsi`): аппаратные петли кристалла выключены, CV ведёт SMB.
+    /// Программный срез обязан стоять **выше** рабочей температуры, иначе он не
+    /// защита, а постоянный тормоз заряда.
+    ///
+    /// 55,0/60,0/65,0 °C — выше измеренной нагрузки (50,8 °C) и далеко ниже
+    /// аппаратного максимума шкалы (+160 °C).
     #[must_use]
     pub const fn standard() -> Self {
         Self {
-            temp_reduce_dc: 430,
-            temp_bypass_dc: 480,
-            temp_stop_dc: 550,
+            temp_reduce_dc: 550,
+            temp_bypass_dc: 600,
+            temp_stop_dc: 650,
             iin_max_ua: 3_500_000,
             iin_target_ua: 2_000_000,
             iin_floor_ua: 500_000,
@@ -200,6 +214,72 @@ impl GuardLimits {
         }
         *self = candidate;
         true
+    }
+
+    /// Принимает одно значение **без** проверки порядка порогов.
+    ///
+    /// Нужна там, где пороги приходят набором: [`Self::apply_parameter`]
+    /// проверяет согласованность после каждого значения, поэтому набор,
+    /// меняющий сразу несколько порогов, не применяется никогда — первое же
+    /// значение сравнивается с ещё не обновлёнными соседями. Живой случай
+    /// 19.09: `TempReduceDc=600`, `TempBypassDc=650`, `TempStopDc=700` — 600
+    /// отвергается против старого `TempBypassDc=480`, и так при любом порядке.
+    ///
+    /// Диапазон значения проверяется здесь же (мусор не проходит), а порядок —
+    /// один раз в [`Self::validate`] после всего набора. Пока `validate` не
+    /// пройден, набор считается неприменённым: вызывающий обязан вернуть
+    /// снимок.
+    #[must_use]
+    pub fn apply_parameter_lenient(&mut self, name: &str, value: u32) -> bool {
+        match name {
+            "TempReduceDc" => match i32::try_from(value) {
+                Ok(temp) if (200..=600).contains(&temp) => self.temp_reduce_dc = temp,
+                _ => return false,
+            },
+            "TempBypassDc" => match i32::try_from(value) {
+                Ok(temp) if (200..=650).contains(&temp) => self.temp_bypass_dc = temp,
+                _ => return false,
+            },
+            "TempStopDc" => match i32::try_from(value) {
+                Ok(temp) if (250..=700).contains(&temp) => self.temp_stop_dc = temp,
+                _ => return false,
+            },
+            "IinMaxUa" => {
+                if !(100_000..=6_850_000).contains(&value) {
+                    return false;
+                }
+                self.iin_max_ua = value;
+            }
+            "IinTargetUa" => {
+                if !(100_000..=6_850_000).contains(&value) {
+                    return false;
+                }
+                self.iin_target_ua = value;
+            }
+            "IinFloorUa" => {
+                if !(100_000..=6_850_000).contains(&value) {
+                    return false;
+                }
+                self.iin_floor_ua = value;
+            }
+            "VbatReduceUv" => {
+                if !(3_000_000..=4_500_000).contains(&value) {
+                    return false;
+                }
+                self.vbat_reduce_uv = value;
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Согласован ли набор порогов (см. [`Self::is_consistent`]).
+    ///
+    /// Отделена от [`Self::apply_parameter`] для набора: там она вызывается на
+    /// каждом значении, здесь — один раз на весь набор.
+    #[must_use]
+    pub const fn validate(&self) -> bool {
+        self.is_consistent()
     }
 }
 
@@ -502,10 +582,12 @@ mod tests {
     #[test]
     fn limits_accept_registry_values() {
         let mut limits = GuardLimits::standard();
-        assert!(limits.apply_parameter("TempReduceDc", 420));
-        assert_eq!(limits.temp_reduce_dc, 420);
-        assert!(limits.apply_parameter("TempStopDc", 560));
-        assert_eq!(limits.temp_stop_dc, 560);
+        // Порог среза остаётся ниже ухода в 1:1 и останова, поэтому одиночное
+        // значение проходит и по строгому пути.
+        assert!(limits.apply_parameter("TempReduceDc", 560));
+        assert_eq!(limits.temp_reduce_dc, 560);
+        assert!(limits.apply_parameter("TempStopDc", 660));
+        assert_eq!(limits.temp_stop_dc, 660);
         assert!(limits.apply_parameter("IinTargetUa", 2_500_000));
         assert_eq!(limits.iin_target_ua, 2_500_000);
         assert!(limits.apply_parameter("IinFloorUa", 1_000_000));
@@ -522,7 +604,8 @@ mod tests {
         let before = limits;
 
         // Снижение тока позже ухода в bypass — защита перестала бы работать по порядку.
-        assert!(!limits.apply_parameter("TempReduceDc", 490));
+        // 610,0 °C среза лежит выше обхода (600,0 °C), поэтому отвергается.
+        assert!(!limits.apply_parameter("TempReduceDc", 610));
         // Цель ниже полу — несогласованные токи.
         assert!(!limits.apply_parameter("IinTargetUa", 100_000));
         // Значения вне диапазонов и чужие имена.
@@ -564,8 +647,9 @@ mod tests {
     #[test]
     fn overheating_caps_current_to_the_band_setpoint() {
         let limits = profile_limits();
+        let hot = limits.temp_reduce_dc + 1;
         let action = evaluate_applied(
-            &sample(2_800_000, 440, 4_000_000),
+            &sample(2_800_000, hot, 4_000_000),
             &limits,
             limits.restore_iin_ua(),
         );
@@ -579,7 +663,7 @@ mod tests {
         }
         // Применённая уставка повторно не пишется.
         assert_eq!(
-            evaluate_applied(&sample(2_800_000, 440, 4_000_000), &limits, 2_000_000),
+            evaluate_applied(&sample(2_800_000, hot, 4_000_000), &limits, 2_000_000),
             GuardAction::None
         );
     }
@@ -588,7 +672,7 @@ mod tests {
     fn severe_heat_falls_back_to_bypass() {
         let limits = GuardLimits::default();
         let action = evaluate_applied(
-            &sample(2_000_000, 490, 4_000_000),
+            &sample(2_000_000, limits.temp_bypass_dc, 4_000_000),
             &limits,
             limits.restore_iin_ua(),
         );
@@ -605,7 +689,7 @@ mod tests {
     fn critical_heat_stops_charging() {
         let limits = GuardLimits::default();
         let action = evaluate_applied(
-            &sample(2_000_000, 560, 4_000_000),
+            &sample(2_000_000, limits.temp_stop_dc, 4_000_000),
             &limits,
             limits.restore_iin_ua(),
         );
@@ -686,7 +770,8 @@ mod tests {
     #[test]
     fn die_temp_band_caps_without_creeping_and_restores_below_hysteresis() {
         let limits = profile_limits();
-        let hot = sample(2_800_000, 431, 4_000_000);
+        // Порог среза — `temp_reduce_dc` (55,0 °C); берём на 0,1 °C выше него.
+        let hot = sample(2_800_000, limits.temp_reduce_dc + 1, 4_000_000);
         let capped = GuardAction::ReduceCurrent {
             to_ua: 2_000_000,
             reason: "die_temp_reduce",
@@ -699,19 +784,90 @@ mod tests {
                 "такт {tick}: уставка обязана быть той же"
             );
         }
-        // 41,5 °C — внутри полосы гистерезиса (порог возврата 40,0 °C): держим.
+        // Внутри полосы гистерезиса (порог возврата `temp_reduce_dc − 3,0 °C`): держим.
         assert_eq!(
-            evaluate_applied(&sample(2_000_000, 415, 4_000_000), &limits, 2_000_000),
+            evaluate_applied(
+                &sample(2_000_000, limits.temp_reduce_dc - 10, 4_000_000),
+                &limits,
+                2_000_000
+            ),
             GuardAction::None
         );
-        // 40,0 °C — возврат к профильному лимиту.
+        // Ровно порог возврата — явный возврат к профильному лимиту.
         assert_eq!(
-            evaluate_applied(&sample(2_000_000, 400, 4_000_000), &limits, 2_000_000),
+            evaluate_applied(
+                &sample(2_000_000, limits.temp_reduce_dc - TEMP_REDUCE_HYST_DC, 4_000_000),
+                &limits,
+                2_000_000
+            ),
             GuardAction::RestoreCurrent {
                 to_ua: 2_800_000,
                 reason: "reduce_band_exit",
             }
         );
+    }
+
+    #[test]
+    fn idle_die_temperature_stays_below_the_reduce_threshold() {
+        // Живой замер 19.09 на .657: кристалл nabu в простое (насос в standby,
+        // вход на полу АЦП) держит 43,5–46,1 °C, а под нагрузкой 2:1 доходит до
+        // 50,8 °C. Прежние пороги 43,0/48,0/55,0 лежали **ниже** покоя, поэтому
+        // срез срабатывал постоянно, а возврат (порог − 3,0 °C) был недостижим:
+        // `IIN_CTRL` уходил на `iin_floor_ua` (500 мА) и оставался там навсегда.
+        const IDLE_MAX_DC: i32 = 461;
+        const LOAD_MAX_DC: i32 = 508;
+        let limits = GuardLimits::standard();
+        assert!(
+            limits.temp_reduce_dc > IDLE_MAX_DC,
+            "порог среза {} обязан быть выше температуры покоя {IDLE_MAX_DC}",
+            limits.temp_reduce_dc
+        );
+        assert!(
+            limits.temp_reduce_dc > LOAD_MAX_DC,
+            "порог среза {} обязан быть выше рабочей температуры {LOAD_MAX_DC}",
+            limits.temp_reduce_dc
+        );
+        // Порог возврата тоже обязан быть достижим на этой плате.
+        assert!(
+            limits.temp_reduce_dc - TEMP_REDUCE_HYST_DC > IDLE_MAX_DC,
+            "порог возврата {} обязан быть выше температуры покоя {IDLE_MAX_DC}",
+            limits.temp_reduce_dc - TEMP_REDUCE_HYST_DC
+        );
+    }
+
+    #[test]
+    fn threshold_set_applies_atomically_and_is_validated_once() {
+        // Набор, меняющий сразу три порога, обязан примениться целиком: прежний
+        // `apply_parameter` проверял согласованность после каждого значения и
+        // отвергал первое же (`TempReduceDc` против ещё старого `TempBypassDc`).
+        let mut limits = GuardLimits::standard();
+        let before = limits;
+        let set = [
+            ("TempReduceDc", 560_u32),
+            ("TempBypassDc", 620),
+            ("TempStopDc", 680),
+        ];
+        for (name, value) in set {
+            assert!(
+                limits.apply_parameter_lenient(name, value),
+                "{name} обязан пройти по диапазону"
+            );
+        }
+        assert!(limits.validate(), "согласованный набор обязан пройти проверку");
+        assert_eq!(limits.temp_reduce_dc, 560);
+        assert_eq!(limits.temp_bypass_dc, 620);
+        assert_eq!(limits.temp_stop_dc, 680);
+
+        // Мусор отвергается и поэлементно, и на валидации набора.
+        let mut junk = before;
+        assert!(!junk.apply_parameter_lenient("TempStopDc", 10_000));
+        assert!(!junk.apply_parameter_lenient("ТакогоПорогаНет", 1));
+        assert_eq!(junk, before, "мусор не меняет набор");
+
+        let mut broken = before;
+        assert!(broken.apply_parameter_lenient("TempReduceDc", 600));
+        assert!(broken.apply_parameter_lenient("TempBypassDc", 200));
+        assert!(!broken.validate(), "нарушенный порядок обязан не пройти");
     }
 
     #[test]
@@ -867,7 +1023,7 @@ mod tests {
         // 2,8 А). Решение «по профилю» подняло бы ток до полосы 2,0 А, то есть
         // защита сработала бы в противоположную сторону.
         let limits = profile_limits();
-        let tapered = sample(1_200_000, 440, 4_460_000);
+        let tapered = sample(1_200_000, limits.temp_reduce_dc + 1, 4_460_000);
         assert_eq!(
             evaluate(
                 &tapered,
@@ -967,14 +1123,24 @@ mod tests {
             "перегрузку по току без уставки тоже не режем"
         );
         assert_eq!(
-            evaluate(&sample(2_800_000, 490, 4_000_000), &limits, None, None),
+            evaluate(
+                &sample(2_800_000, limits.temp_bypass_dc, 4_000_000),
+                &limits,
+                None,
+                None
+            ),
             GuardAction::FallbackToBypass {
                 reason: "die_temp_bypass"
             },
             "порог 1:1 от уставки не зависит"
         );
         assert_eq!(
-            evaluate(&sample(2_800_000, 560, 4_000_000), &limits, None, None),
+            evaluate(
+                &sample(2_800_000, limits.temp_stop_dc, 4_000_000),
+                &limits,
+                None,
+                None
+            ),
             GuardAction::Stop {
                 reason: "die_temp_stop"
             }
@@ -1051,7 +1217,7 @@ mod tests {
         // Тот же отсчёт, но жарко — возврата нет, а уставка уходит в полосу.
         assert_eq!(
             evaluate(
-                &sample(2_000_000, 440, 4_000_000),
+                &sample(2_000_000, limits.temp_reduce_dc + 1, 4_000_000),
                 &limits,
                 Some(2_800_000),
                 None
@@ -1069,18 +1235,20 @@ mod tests {
         // второй эпизод ≥ 48 °C остановил бы заряд на первом же такте, минуя
         // ступень снижения тока.
         let limits = profile_limits();
+        let bypass = limits.temp_bypass_dc;
+        let reset = bypass - TEMP_REDUCE_HYST_DC;
         assert!(
-            !bypass_strikes_expired(&sample(2_800_000, 490, 4_250_000), &limits),
+            !bypass_strikes_expired(&sample(2_800_000, bypass, 4_250_000), &limits),
             "внутри полосы счётчик не сбрасывается"
         );
-        // 47,0 °C — ещё в полосе гистерезиса (порог сброса 48,0 − 3,0 = 45,0 °C).
+        // На 2,0 °C выше порога сброса — ещё в полосе гистерезиса.
         assert!(!bypass_strikes_expired(
-            &sample(2_000_000, 470, 4_250_000),
+            &sample(2_000_000, reset + 20, 4_250_000),
             &limits
         ));
         assert!(
-            bypass_strikes_expired(&sample(2_000_000, 450, 4_250_000), &limits),
-            "45,0 °C — выход из полосы перегрева"
+            bypass_strikes_expired(&sample(2_000_000, reset, 4_250_000), &limits),
+            "порог сброса — выход из полосы перегрева"
         );
         // Недостоверная температура сбросом не считается.
         let mut bad = sample(2_000_000, 200, 4_250_000);
@@ -1106,7 +1274,7 @@ mod tests {
                 "эпизод {episode}: второй такт — останов заряда"
             );
             // Так это делает KMDF перед решением защиты.
-            if bypass_strikes_expired(&sample(2_000_000, 450, 4_250_000), &limits) {
+            if bypass_strikes_expired(&sample(2_000_000, reset, 4_250_000), &limits) {
                 denied_strikes = 0;
             }
         }
