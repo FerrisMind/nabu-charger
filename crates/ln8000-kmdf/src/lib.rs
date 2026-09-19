@@ -144,9 +144,24 @@ const CHARGE_RETRY_MS: u64 = 30_000;
 /// Изменение входа, при котором попытка повторяется сразу, мкВ.
 const CHARGE_RETRY_DELTA_UV: u32 = 300_000;
 
+/// Минимальный выигрыш отклонения шины от цели, считающийся прогрессом, мкВ.
+///
+/// Меньше шага QC3 (200 мВ) с запасом: 50 мВ отделяет настоящий сдвиг от
+/// дрожания АЦП, но не требует угадать реальную крутизну импульса.
+const WINDOW_PROGRESS_UV: u32 = 50_000;
+
+/// Сколько коррекций без прогресса терпит петля окна до редкого повтора.
+const WINDOW_STALL_MAX: u32 = 4;
+
+/// Интервал коррекции шины в застое, мс.
+///
+/// Застой означает, что импульсы QC3 не меняют вход (не-QC3 адаптер) либо шаг
+/// блока мельче ожидаемого. Редкий повтор оставляет попытку, но снимает
+/// постоянную нагрузку на SPMI.
+const WINDOW_STALL_MS: u64 = 60_000;
+
 /// Окно наблюдения пика входного тока для метки `MaxIinUa`, мс.
 const IIN_WINDOW_MS: u64 = 5_000;
-
 /// Период опроса топливного счётчика PM8150B, мс.
 ///
 /// Счётчик — медленная величина: один сырой шаг это ~0,4 % ёмкости, а одна
@@ -232,6 +247,23 @@ struct DriverState {
     last_input_present: bool,
     /// Edge detect armed after PrepareHardware autostart (avoids double-negotiate).
     hvdcp_edge_armed: bool,
+    /// Монотонное время последней коррекции шины под окно 2:1, мс.
+    ///
+    /// Окно едет за банкой (полоса `[2*Vbat+200, 2*Vbat+400]` мВ), поэтому без
+    /// периодической коррекции шина остаётся там, где её оставило согласование:
+    /// при росте Vbat она уходит выше полосы, режим 3 сохраняется, а перенос
+    /// падает до 39 мА. Интервал — [`hvdcp::WINDOW_NUDGE_MS`], чтобы не грузить
+    /// SPMI на каждом такте.
+    last_window_nudge_ms: u64,
+    /// Лучшее (наименьшее) отклонение шины от цели в текущем эпизоде, мкВ.
+    ///
+    /// `u32::MAX` — эпизод не начат (шина в полосе). Нужно, чтобы отличить
+    /// коррекцию, которая работает, от застоя: у PD-адаптера импульсы QC3
+    /// ничего не меняют, и петля должна перейти на редкий повтор, а не сыпать
+    /// импульсами в SPMI вечно.
+    window_best_err_uv: u32,
+    /// Коррекций без прогресса подряд в текущем эпизоде.
+    window_stall_n: u32,
 }
 
 // SAFETY: см. инварианты выше — доступ сериализован WDF.
@@ -264,6 +296,9 @@ impl DriverState {
             hvdcp_retry_next_ms: 0,
             last_input_present: false,
             hvdcp_edge_armed: false,
+            last_window_nudge_ms: 0,
+            window_best_err_uv: u32::MAX,
+            window_stall_n: 0,
         }
     }
 }
@@ -1869,6 +1904,10 @@ unsafe extern "C" fn evt_prepare_hardware(
                 u32::try_from(vbat.max(0)).unwrap_or(0),
                 u32::try_from(vbus.max(0)).unwrap_or(0),
                 u32::try_from(iin.max(0)).unwrap_or(0),
+                // Окно пика ещё не начато: единственный отсчёт и есть пик.
+                st.max_iin_ua
+                    .max(u32::try_from(iin.max(0)).unwrap_or(0)),
+                monotonic_ms(),
             );
         }
         mark_device_value(device, "BattPct", battery::last_percent());
@@ -2109,7 +2148,13 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
 
     // SAFETY: BattC status notify is DISPATCH-safe; we run at PASSIVE.
     unsafe {
-        battery::update_from_telemetry(sample.vbat_uv, sample.vbus_uv, sample.iin_ua);
+        battery::update_from_telemetry(
+            sample.vbat_uv,
+            sample.vbus_uv,
+            sample.iin_ua,
+            st.max_iin_ua,
+            sample.ts_ms,
+        );
     }
     let device = unsafe { DEVICE };
     if !device.is_null() {
@@ -2274,6 +2319,83 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
             "EngageState",
             engage_state(sample.input_present, vbus, vbat_uv, status.op_mode),
         );
+    }
+    // Полоса переноса 2:1 едет за банкой: пока банка набирает заряд, её верх
+    // уходит вверх, и шина, выставленная при согласовании, остаётся НИЖЕ полосы
+    // — либо, наоборот, уходит выше неё, если согласование целилось в
+    // фиксированные 9,5 В. И то и другое кончается одинаково: режим 3
+    // сохраняется (`SYS_STS=0x04`), а перенос падает до 39 мА аддитивного пола.
+    //
+    // Вход считается повышенным уже с `SWITCHING_MIN_VIN_UV`: обход 1:1 там
+    // запрещён, поэтому «повышен, но не в 2:1» — состояние, которое надо
+    // исправлять, а не оставлять. Прежняя форма требовала
+    // `desired == Switching`, а шина НИЖЕ пола полосы даёт `desired = None`
+    // (`charge_mode` требует `2*Vbat + 250 мВ`) — и поднимать её было некому:
+    // живой замер 18.09 22:38, Vin 8,88 В при полосе [9,00; 9,20] В, mode 1,
+    // 39 мА, счётчик попыток стоял, потому что `(None, standby)` считается
+    // согласованным состоянием.
+    let elevated = vbus_uv >= u32::try_from(SWITCHING_MIN_VIN_UV).unwrap_or(0);
+    if vbat_uv > 0 && elevated {
+        // «Мёртвый» ток — это пол АЦП (39,1 мА), а не «мало»: у верха заряда
+        // банка берёт 0,1–0,5 А, и по мгновенному отсчёту такие такты
+        // выглядели мёртвыми. Поэтому требуется, чтобы и мгновенный отсчёт, и
+        // пик за окно `IIN_WINDOW_MS` лежали на полу — тогда за коррекцией
+        // действительно нет переноса.
+        let dead = status.op_mode == OpMode::Switching
+            && sample.iin_ua <= hvdcp::IIN_DEAD_FLOOR_UA
+            && st.max_iin_ua <= hvdcp::IIN_DEAD_FLOOR_UA;
+        let outside = !ln8000::encoding::vin_in_switching_window(vbus, vbat_uv);
+        if outside || dead {
+            let now = monotonic_ms();
+            let target = hvdcp::target_vbus_uv(vbat_uv);
+            let err = vbus_uv.abs_diff(target);
+            // Прогресс сбрасывает выдержку; застой (блок не держит QC3-шаг или
+            // это PD-адаптер, для которого импульсы — пустая трата SPMI)
+            // переводит петлю на редкий повтор.
+            if err.saturating_add(WINDOW_PROGRESS_UV) < st.window_best_err_uv {
+                st.window_best_err_uv = err;
+                st.window_stall_n = 0;
+            }
+            let cooldown = if st.window_stall_n < WINDOW_STALL_MAX {
+                hvdcp::WINDOW_NUDGE_MS
+            } else {
+                WINDOW_STALL_MS
+            };
+            if now.saturating_sub(st.last_window_nudge_ms) >= cooldown {
+                st.last_window_nudge_ms = now;
+                st.window_stall_n = st.window_stall_n.saturating_add(1);
+                // SAFETY: PASSIVE_LEVEL; сессия открыта, доступ сериализован
+                // таймером (см. комментарий у `state()`).
+                let sent = unsafe {
+                    hvdcp::nudge_vin_into_window(
+                        device,
+                        st.usbin_id,
+                        &mut st.hvdcp,
+                        vbus,
+                        vbat_uv,
+                        dead,
+                    )
+                };
+                if !device.is_null() {
+                    mark_device_value(device, "WindowOut", u32::from(outside));
+                    mark_device_value(device, "WindowDead", u32::from(dead));
+                }
+                if sent > 0 {
+                    // Шина только что сдвинулась — режим перерешаем сразу, не
+                    // выжидая `CHARGE_RETRY_MS`: одиночный шаг QC3 меньше
+                    // `CHARGE_RETRY_DELTA_UV`, поэтому «изменение входа» его не
+                    // разбудит.
+                    st.last_charge_attempt_ms = 0;
+                }
+            }
+        } else if st.window_best_err_uv != u32::MAX || st.window_stall_n != 0 {
+            // Вернулись в полосу — история застоя сбрасывается.
+            st.window_best_err_uv = u32::MAX;
+            st.window_stall_n = 0;
+        }
+    } else if st.window_best_err_uv != u32::MAX || st.window_stall_n != 0 {
+        st.window_best_err_uv = u32::MAX;
+        st.window_stall_n = 0;
     }
     if mode_ok {
         st.last_charge_attempt_ms = monotonic_ms();
@@ -2664,27 +2786,27 @@ fn run_hvdcp_and_land(device: WDFDEVICE) -> i32 {
         let mut engage = charge_mode(vin, vbat_now);
         if engage != Some(OpMode::Switching) && vin >= SWITCHING_MIN_VIN_UV {
             // Вход заведомо повышен (не 5-вольтовая ветка), но 2:1 ещё не
-            // допускается: поднимаем до пола окна и перечитываем ADC.
+            // допускается: доводим шину до полосы переноса и перечитываем ADC.
             // SAFETY: PASSIVE_LEVEL; may reopen SUPERUSER for INC pulses.
-            let _ = unsafe { hvdcp::boost_vin_for_pump(device, usbin_id, &mut st.hvdcp, vin) };
+            let _ = unsafe {
+                hvdcp::nudge_vin_into_window(device, usbin_id, &mut st.hvdcp, vin, vbat_now, false)
+            };
             vin = pump.read_adc(AdcChannel::Vin).unwrap_or(vin);
             engage = charge_mode(vin, vbat_now);
         }
         if engage == Some(OpMode::Switching) {
             mark_device_value(device, "SuAfc5vPath", 0);
-            if vin < hvdcp::PUMP_VIN_TARGET_MIN_UV {
-                // SAFETY: PASSIVE_LEVEL; may reopen SUPERUSER for INC pulses.
-                let _ = unsafe { hvdcp::boost_vin_for_pump(device, usbin_id, &mut st.hvdcp, vin) };
-                vin = pump.read_adc(AdcChannel::Vin).unwrap_or(vin);
-            }
-            if vin > hvdcp::PUMP_VIN_TRIM_UV {
-                // SAFETY: PASSIVE_LEVEL; may reopen SUPERUSER for DEC pulses.
-                let _ = unsafe { hvdcp::trim_vin_for_pump(device, usbin_id, &mut st.hvdcp, vin) };
-                vin = pump.read_adc(AdcChannel::Vin).unwrap_or(vin);
-                if vin > hvdcp::PUMP_VIN_TRIM_UV {
-                    let _ = unsafe { hvdcp::trim_vin_for_pump(device, usbin_id, &mut st.hvdcp, vin) };
-                }
-            }
+            // Полоса переноса едет за банкой (`[2*Vbat+200, 2*Vbat+400]` мВ), так
+            // что её держит живой Vbat, а не фиксированные 9,5–10,5 В: те лежат
+            // ВЫШЕ полосы на полной банке, и насос отдаёт ровно 39 мА (живой
+            // замер 18.09). `false` — ток здесь ещё не измерен, коррекция только
+            // по напряжению; мёртвый ток ловит такт телеметрии.
+            // SAFETY: PASSIVE_LEVEL; may reopen SUPERUSER for pulses.
+            let _ = unsafe {
+                hvdcp::nudge_vin_into_window(device, usbin_id, &mut st.hvdcp, vin, vbat_now, false)
+            };
+            // Перечитывать ADC здесь не для чего: `set_charging` ниже читает
+            // Vin и Vbat сам, а режим уже выбран выше.
             // SAFETY: PASSIVE_LEVEL; SUPERUSER / Usbin RH for ICL.
             let _ = unsafe { hvdcp::raise_icl_for_pump(device, usbin_id, &mut st.hvdcp) };
         } else if engage == Some(OpMode::Bypass) && hvdcp::vin_stayed_near_5v(vin) {
@@ -2846,7 +2968,13 @@ unsafe fn handle_get_status(request: WDFREQUEST) {
     // Keep BattC SoC fresh even when the telemetry timer failed to start.
     if status.vbat_uv > 0 || status.vbus_uv > 0 {
         unsafe {
-            battery::update_from_telemetry(status.vbat_uv, status.vbus_uv, status.iin_ua);
+            battery::update_from_telemetry(
+                status.vbat_uv,
+                status.vbus_uv,
+                status.iin_ua,
+                st.max_iin_ua,
+                monotonic_ms(),
+            );
         }
         let device = unsafe { DEVICE };
         if !device.is_null() {

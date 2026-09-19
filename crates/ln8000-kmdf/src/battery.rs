@@ -8,6 +8,7 @@
 //! `IoWMIRegistrationControl(REGISTER)`.
 
 use core::ptr;
+use ln8000::battery_policy::{self, CHARGING_HOLD_MS, Hold, ONLINE_HOLD_MS, charging_raw};
 use wdk::println;
 use wdk_sys::{
     call_unsafe_wdf_function_binding, IRP_MJ_DEVICE_CONTROL, IRP_MJ_SYSTEM_CONTROL, NTSTATUS,
@@ -50,10 +51,16 @@ pub const SOC_SRC_GAUGE: u32 = 1;
 pub const SOC_SRC_VBAT: u32 = 2;
 /// Last VBAT sample (µV) used for SoC.
 static mut LAST_VBAT_UV: u32 = 0;
-/// Last VBUS sample (µV) for AC/charge flags.
+/// Last VBUS sample (µV) — raw input of the online hysteresis.
 static mut LAST_VBUS_UV: u32 = 0;
-/// Last IIN sample (µA).
+/// Last IIN sample (µA) — raw input of the charging hysteresis.
 static mut LAST_IIN_UA: u32 = 0;
+/// Гистерезис признака «адаптер онлайн»: один такт под порогом Vin не снимает
+/// `POWER_ON_LINE` (см. [`ONLINE_HOLD_MS`]).
+static mut ONLINE_HOLD: Hold = Hold::new();
+/// Гистерезис признака «идёт заряд»: Iin падает до пола АЦП (39 мА) на каждом
+/// QC3-импульсе и переходе режима, поэтому удержание длиннее — [`CHARGING_HOLD_MS`].
+static mut CHARGING_HOLD: Hold = Hold::new();
 /// Last published BattC power_state flags.
 static mut LAST_POWER_STATE: u32 = 0;
 /// Battery tag (non-zero = present).
@@ -86,18 +93,6 @@ const IO_NO_INCREMENT: i8 = 0;
 /// Empty / full OCV anchors for nabu Li-ion (µV).
 const VBAT_EMPTY_UV: u32 = 3_400_000;
 const VBAT_FULL_UV: u32 = 4_350_000;
-/// True adapter / USB rail floor (µV).
-///
-/// Must sit **above** Li-ion OCV. With the cable unplugged, LN8000 Vin often
-/// tracks VBAT while in bypass (~4.2–4.4 V) — the old 4.2 V threshold left
-/// `BATTERY_POWER_ON_LINE` stuck and the tray kept showing "charging".
-const VBUS_ONLINE_UV: u32 = 4_600_000;
-/// Vin must exceed VBAT by this much when Vin is below 6 V (µV).
-const VBUS_ABOVE_VBAT_UV: u32 = 200_000;
-/// Elevated QC/PD rail — always AC even if VBAT is high (µV).
-const VBUS_ELEVATED_UV: u32 = 6_000_000;
-/// Charging current floor (µA).
-const IIN_CHARGING_UA: u32 = 80_000;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -409,10 +404,26 @@ pub unsafe fn unload() {
 /// 12 %). While charging we therefore keep the last offline estimate, and
 /// `BATTERY_UNKNOWN_CAPACITY` if there never was one.
 ///
+/// Both reported flags are **held**: `POWER_ON_LINE` follows the online hold and
+/// `CHARGING` the charging hold (see [`ONLINE_HOLD_MS`] / [`CHARGING_HOLD_MS`]),
+/// so one tick at the ADC floor or below the Vin threshold neither clears a flag
+/// nor fires [`BatteryClassStatusNotify`].
+///
 /// Ignores `vbat_uv == 0` (ADC not ready) so a bad first sample cannot pin SoC at 0%.
 /// Calls [`BatteryClassStatusNotify`] only when `power_state` changes so the
 /// tray/Settings see plug/unplug on the same telemetry tick (not after a later poll).
-pub unsafe fn update_from_telemetry(vbat_uv: u32, vbus_uv: u32, iin_ua: u32) {
+///
+/// `iin_peak_ua` — пик Iin за окно наблюдения (`DriverState::max_iin_ua`), а не
+/// мгновенный отсчёт: на такте QC3-импульса или перехода режима Iin лежит на полу
+/// АЦП (39 мА), и без пика признак заряда гас бы на каждом импульсе. `now_ms` —
+/// монотонное время того же такта.
+pub unsafe fn update_from_telemetry(
+    vbat_uv: u32,
+    vbus_uv: u32,
+    iin_ua: u32,
+    iin_peak_ua: u32,
+    now_ms: u64,
+) {
     let prev_power = unsafe { LAST_POWER_STATE };
     if vbat_uv > 0 {
         unsafe {
@@ -421,13 +432,25 @@ pub unsafe fn update_from_telemetry(vbat_uv: u32, vbus_uv: u32, iin_ua: u32) {
     }
     // Счётчик достовернее любой оценки: пока он отвечает, напряжение банки в
     // расчёт не идёт вовсе.
-    if vbat_uv > 0 && unsafe { SOC_SRC } != SOC_SRC_GAUGE && !is_ac_online(vbus_uv, vbat_uv) {
+    let raw_online = battery_policy::online_raw(vbus_uv, vbat_uv, iin_ua);
+    if vbat_uv > 0 && unsafe { SOC_SRC } != SOC_SRC_GAUGE && !raw_online {
         unsafe {
             LAST_PCT = soc_percent(vbat_uv);
             SOC_SRC = SOC_SRC_VBAT;
         }
     }
+    // Гистерезис считаем по «сырым» признакам такта, а в состояние пишем
+    // удержанное значение: сырое снятие Vin/Iin живёт один такт, а tray не
+    // должен перечитывать питание на каждый импульс QC3.
+    let online_hold = unsafe { ONLINE_HOLD }.update(raw_online, now_ms, ONLINE_HOLD_MS);
+    let charging_hold = unsafe { CHARGING_HOLD }.update(
+        charging_raw(online_hold.held, iin_ua, iin_peak_ua),
+        now_ms,
+        CHARGING_HOLD_MS,
+    );
     unsafe {
+        ONLINE_HOLD = online_hold;
+        CHARGING_HOLD = charging_hold;
         LAST_VBUS_UV = vbus_uv;
         LAST_IIN_UA = iin_ua;
         let _ = build_status();
@@ -508,29 +531,18 @@ pub fn last_power_state() -> u32 {
     unsafe { LAST_POWER_STATE }
 }
 
-/// AC / USB-adapter present? Vin ADC alone is not enough: unplugged bypass
-/// leaves Vin ≈ VBAT above a naive 4.2 V floor.
-fn is_ac_online(vbus_uv: u32, vbat_uv: u32) -> bool {
-    if vbus_uv >= VBUS_ELEVATED_UV {
-        return true;
-    }
-    if vbus_uv < VBUS_ONLINE_UV {
-        return false;
-    }
-    // 4.6–6.0 V: require Vin clearly above pack voltage so VBAT float ≠ AC.
-    if vbat_uv > 0 && vbus_uv < vbat_uv.saturating_add(VBUS_ABOVE_VBAT_UV) {
-        return false;
-    }
-    true
-}
-
 fn build_status() -> BatteryStatus {
     let vbat = unsafe { LAST_VBAT_UV };
-    let vbus = unsafe { LAST_VBUS_UV };
-    let iin = unsafe { LAST_IIN_UA };
     let pct = unsafe { LAST_PCT };
-    let online = is_ac_online(vbus, vbat);
-    let charging = online && iin >= IIN_CHARGING_UA;
+    // Удержанные признаки, а не мгновенные отсчёты: см. `update_from_telemetry`
+    // и `ln8000::battery_policy`. DISCHARGING считается от удержанного online —
+    // иначе один такт offline показывал бы «разряжается» на подключённом блоке.
+    let online = unsafe { ONLINE_HOLD }.held;
+    // `CHARGING` implies `POWER_ON_LINE`: the holds expire independently
+    // (8 s vs 20 s), and a bare `0x4` mask — charging with no AC — is a
+    // combination the old `charging = online && ...` form could never produce
+    // and one Windows has no sensible reading for.
+    let charging = unsafe { CHARGING_HOLD }.held && online;
     let mut power = 0u32;
     if online {
         power |= BATTERY_POWER_ON_LINE;

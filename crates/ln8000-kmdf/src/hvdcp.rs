@@ -188,33 +188,74 @@ pub const MICRO_5V_UV: u32 = 5_000_000;
 /// QC3 pulse cap for the CP path: Android `cp_qc30.h:81`
 /// `MAX_PLUSE_COUNT_ALLOWED` = 23 (23 × 200 mV + 5 V = 9.6 V — the top of the
 /// 9.5–10 V window the CP policy holds). The 30 in `smb5-lib.h` belongs to the
-/// non-CP smb5 path and overshoots past [`PUMP_VIN_TARGET_MAX_UV`].
+/// non-CP smb5 path and overshoots past the 2:1 transfer band.
 /// Only INC is capped by this: `pulse_dec` walks back down uncapped.
 pub const MAX_PULSE_CNT: u32 = 23;
-/// LN8000 2:1 stays happy near 9 V; above ~10.5 V live silicon latches `VIN_OV`.
+/// Absolute safety ceiling for the bus (µV) — above ~10.5 V live silicon
+/// latches `VIN_OV` and 2:1 stops being engageable at all.
+///
+/// Policy no longer aims anywhere near it: the operative bounds are the
+/// `2*Vbat`-derived band in [`ln8000::encoding`]. This stays as the last-resort
+/// guard for a path that would otherwise pulse past it.
 pub const PUMP_VIN_TRIM_UV: i32 = 10_500_000;
-/// QC3 bus floor before enabling 2:1 (µV) — Android `cp_qc30.c:848` keeps
-/// raising the bus while `vbus <= 9500`, so the CP window is a fixed
-/// 9.5–9.8 V and not a `2*Vbat`-derived value.
+/// Bus target when the pack voltage is unknown (µV).
+///
+/// Android `cp_qc30.c:848` raises the bus while `vbus <= 9500` — which is also
+/// where the vendor's own CP policy stops. Only used as a fallback when no Vbat
+/// reading exists; with a live pack the target is the band centre, because a
+/// fixed 9.5 V sits *above* the band once the pack passes ~4.42 V (live 18.09:
+/// bus held at 9.888 V against a 9.04–9.24 V band → mode 3 at the 39 mA floor).
 pub const PUMP_VIN_TARGET_MIN_UV: i32 = 9_500_000;
-/// Target ceiling after trim (µV) — one QC3 step above the 9.5 V floor, so the
-/// 23rd INC pulse (9.6 V soft estimate) rests inside the window.
-pub const PUMP_VIN_TARGET_MAX_UV: i32 = 9_800_000;
+/// Absolute floor for a derived target (µV) — mirrors
+/// [`ln8000::encoding::SWITCHING_MIN_VIN_UV`], the gate below which 2:1 is never
+/// requested. At a low pack this pins the target at 8.0 V, which for Vbat ≥
+/// 3.2 V still lands inside or just above the band.
+pub const PUMP_VIN_TARGET_ABS_MIN_UV: u32 = 8_000_000;
+/// Ceiling for a derived target (µV) — the highest bus reachable within
+/// [`MAX_PULSE_CNT`] INC pulses from the 5 V baseline ([`estimated_vbus_uv`]).
+/// Every practical band top is below it: `2*4.45 + 0.4 = 9.3 V`.
+pub const PUMP_VIN_TARGET_CEIL_UV: u32 = 9_600_000;
 /// Max DEC pulses when trimming for the charge pump.
 pub const MAX_TRIM_DEC: u32 = 20;
 /// Max INC pulses when boosting a too-low elevated bus toward the pump floor.
 /// Must never exceed [`MAX_PULSE_CNT`]: the soft counter saturates there, so a
 /// larger budget would issue a pulse the counter can no longer record.
 pub const MAX_BOOST_INC: u32 = 23;
+/// Period floor between bus corrections from the telemetry tick (ms).
+///
+/// The 2:1 band rides up with the pack: at ~3.6 A the pack climbs ~1 % SOC per
+/// 40 s, i.e. the band top moves ~60 mV in that time. Correcting every 10 s
+/// keeps the bus inside without touching the SPMI bus on every 250 ms tick —
+/// the same contention that made [`APSD_POLL_MS`] 200 ms.
+pub const WINDOW_NUDGE_MS: u64 = 10_000;
+/// IIN at or below which a mode-3 pump is judged to be carrying no power (µA).
+///
+/// The floor reading is 39 mA (8 × 4.89 mA, the ADC's zero), so this sits just
+/// above it. A wider threshold is a trap: near end-of-charge the pack accepts
+/// only 0.1–0.5 A, and a 150 mA gate read that as "dead" — live 18.09, the
+/// correction then walked the bus down a step every 10 s and knocked the pump
+/// out of 2:1 (mode 3↔1 flap, peaks 0.31/0.55 A between the drops). Callers
+/// must also require the *window peak* to be at the floor, not just one sample.
+pub const IIN_DEAD_FLOOR_UA: u32 = 60_000;
 
-// Инварианты окна QC3 (Android `cp_qc30.c:848,866`): цель обязана проходить
-// собственные ворота 2:1 (`2*Vbat + 250 мВ`) на всей достижимой ёмкости банки
-// и достигаться за разрешённое число INC-импульсов.
+// Инварианты окна QC3: цель обязана проходить собственные ворота 2:1
+// (`2*Vbat + 250 мВ`) на всей достижимой ёмкости банки и достигаться за
+// разрешённое число INC-импульсов.
 const _: () = assert!(MAX_BOOST_INC <= MAX_PULSE_CNT);
 const _: () = assert!(
     PUMP_VIN_TARGET_MIN_UV as u32 >= ln8000::encoding::min_vin_for_switching_uv(4_500_000)
 );
 const _: () = assert!(PUMP_VIN_TARGET_MIN_UV as u32 <= estimated_vbus_uv(MAX_PULSE_CNT));
+const _: () = assert!(
+    ln8000::encoding::window_target_uv(4_500_000)
+        >= ln8000::encoding::min_vin_for_switching_uv(4_500_000)
+);
+const _: () = assert!(
+    ln8000::encoding::window_target_uv(4_500_000) <= PUMP_VIN_TARGET_CEIL_UV
+);
+const _: () = assert!(
+    PUMP_VIN_TARGET_CEIL_UV <= estimated_vbus_uv(MAX_PULSE_CNT)
+);
 /// Delay between QC3 pulses (ms), nabu `msleep(40)`.
 pub const PULSE_GAP_MS: u32 = 40;
 /// How long to wait for APSD_DONE after rerun (ms).
@@ -383,21 +424,65 @@ impl HvdcpError {
     }
 }
 
-/// Target VBUS for a 2:1 pump — the Android CP window floor.
+/// Target VBUS for a 2:1 pump (µV) — the centre of the transfer band.
 ///
-/// Android does **not** derive the bus target from the pack: `cp_qc30.c:848`
-/// keeps pulling VBUS up while `vbus <= 9500` and only then trims down (`:866`).
-/// A `2 * VBAT + 200 mV` target sat 50 mV **below** this driver's own 2:1
-/// admission gate (`2 * VBAT + 250 mV`, `ln8000::encoding`), so at Vbat 4.0 V it
-/// asked for 8.20 V while 8.25 V was required — `charge_mode` returned `None`
-/// and 2:1 was never entered. The fixed 9.5 V floor admits 2:1 across the whole
-/// reachable pack range (see the `const _` asserts above).
+/// The band rides with the pack: the LN8000 moves power only while `Vin` sits
+/// inside `[2*Vbat + 200, 2*Vbat + 400]` mV (`ln8000::encoding`), so a *fixed*
+/// bus cannot serve a charging pack. Live 18.09 with the old fixed 9.5 V floor:
+/// bus 9.888 V against a 9.04–9.24 V band → mode 3 (`SYS_STS = 0x04`) carrying
+/// the 39 mA ADC floor, i.e. 0.38 W where 2:1 delivers 16–23 W.
 ///
-/// `vbat_uv` stays in the signature for the IOCTL answer and telemetry.
+/// Aims at the band centre because one QC3 step (200 mV) is as wide as the band
+/// itself. Clamped up to [`PUMP_VIN_TARGET_ABS_MIN_UV`] so a low pack still
+/// passes the 2:1 admission gate, and down to [`PUMP_VIN_TARGET_CEIL_UV`] so the
+/// target is always reachable within [`MAX_PULSE_CNT`].
+///
+/// A zero `vbat_uv` (pack not read) falls back to the vendor 9.5 V floor.
 #[must_use]
 pub const fn target_vbus_uv(vbat_uv: u32) -> u32 {
-    let _ = vbat_uv;
-    PUMP_VIN_TARGET_MIN_UV as u32
+    if vbat_uv == 0 {
+        return PUMP_VIN_TARGET_MIN_UV as u32;
+    }
+    let target = ln8000::encoding::window_target_uv(vbat_uv);
+    let target = if target < PUMP_VIN_TARGET_ABS_MIN_UV {
+        PUMP_VIN_TARGET_ABS_MIN_UV
+    } else {
+        target
+    };
+    if target > PUMP_VIN_TARGET_CEIL_UV {
+        PUMP_VIN_TARGET_CEIL_UV
+    } else {
+        target
+    }
+}
+
+/// Top of the transfer band for `vbat_uv` (µV), or the absolute safety ceiling
+/// when the pack is unknown — the bus is never driven past either.
+#[must_use]
+pub const fn trim_target_uv(vbat_uv: u32) -> i32 {
+    if vbat_uv == 0 {
+        return PUMP_VIN_TARGET_MIN_UV;
+    }
+    let top = ln8000::encoding::window_top_uv(vbat_uv);
+    if top > PUMP_VIN_TRIM_UV as u32 {
+        PUMP_VIN_TRIM_UV
+    } else {
+        top as i32
+    }
+}
+
+/// Bottom of the transfer band for `vbat_uv` (µV) — trim never walks below it.
+#[must_use]
+pub const fn window_floor_uv(vbat_uv: u32) -> i32 {
+    if vbat_uv == 0 {
+        return PUMP_VIN_TARGET_MIN_UV;
+    }
+    let floor = ln8000::encoding::window_floor_uv(vbat_uv);
+    if floor < PUMP_VIN_TARGET_ABS_MIN_UV {
+        PUMP_VIN_TARGET_ABS_MIN_UV as i32
+    } else {
+        floor as i32
+    }
 }
 
 /// Soft estimate of adapter VBUS from pulse count.
@@ -407,10 +492,6 @@ pub const fn estimated_vbus_uv(pulse_cnt: u32) -> u32 {
 }
 
 /// How many INC pulses are needed to reach [`target_vbus_uv`], capped at [`MAX_PULSE_CNT`].
-///
-/// From the 5 V baseline the fixed window floor is 23 steps (4.5 V / 200 mV),
-/// i.e. exactly the CP policy cap; the `vbat_uv` argument is only forwarded to
-/// [`target_vbus_uv`].
 #[must_use]
 pub fn pulses_toward_target(vbat_uv: u32) -> u32 {
     let target = target_vbus_uv(vbat_uv);
@@ -1078,12 +1159,16 @@ fn negotiate_on_bus(
             // включается (проверено в комментарии `trim_vin_for_pump`).
             // Недобор до пола окна добирает `boost_vin_for_pump` после
             // согласования, поэтому останавливаться рано безопасно.
+            // Стоп — по `2*Vbat`-цели, а не по фиксированным 9,5 В: на полной
+            // банке 9,5 В лежат ВЫШЕ полосы переноса (живой замер 18.09).
+            let target_now = target_vbus_uv(vbat_uv) as i32;
+            let ceiling_now = trim_target_uv(vbat_uv);
             let mut vin_now = read_vin();
             for _ in 0..want {
                 if state.pulse_cnt >= MAX_PULSE_CNT {
                     break;
                 }
-                if u32::try_from(vin_now.max(0)).unwrap_or(0) >= PUMP_VIN_TARGET_MIN_UV as u32 {
+                if vin_now >= target_now {
                     break;
                 }
                 if let Err(err) = pulse_inc(bus, state) {
@@ -1095,8 +1180,9 @@ fn negotiate_on_bus(
                 mark(device, "PulseCnt", state.pulse_cnt);
                 mark(device, "SuPulseCnt", state.pulse_cnt);
                 vin_now = read_vin();
-                if vin_now >= PUMP_VIN_TRIM_UV {
-                    // Защитный потолок: дальше импульсы только защёлкивают VIN_OV.
+                if vin_now > ceiling_now {
+                    // Защитный потолок: выше полосы переноса импульсы только
+                    // защёлкивают VIN_OV и ничего не заряжают.
                     break;
                 }
             }
@@ -1263,10 +1349,14 @@ pub unsafe fn run_negotiate_report(
     }
 }
 
-/// Lower QC3 VBUS with DEC pulses until `vin_uv` is at/under [`PUMP_VIN_TARGET_MAX_UV`].
+/// Lower QC3 VBUS with DEC pulses until `vin_uv` is at/under [`target_vbus_uv`].
 ///
 /// Live nabu: 20× INC can overshoot to ~12 V and latch LN8000 `VIN_OV`, which
 /// blocks 2:1. Trim before `set_charging`. Returns how many DEC pulses were sent.
+///
+/// The stop point is [`target_vbus_uv`] (band centre), not the band top: the
+/// band is only 200 mV wide and one pulse is 200 mV, so stopping at the top
+/// would land a single pulse *above* it — where the pump carries nothing.
 ///
 /// # Safety
 ///
@@ -1276,8 +1366,11 @@ pub unsafe fn trim_vin_for_pump(
     usbin_id: Option<u64>,
     state: &mut HvdcpState,
     mut vin_uv: i32,
+    vbat_uv: u32,
 ) -> u32 {
-    if vin_uv <= PUMP_VIN_TRIM_UV {
+    let stop = target_vbus_uv(vbat_uv) as i32;
+    let floor = window_floor_uv(vbat_uv);
+    if vin_uv <= stop {
         mark(device, "TrimDec", 0);
         return 0;
     }
@@ -1286,7 +1379,7 @@ pub unsafe fn trim_vin_for_pump(
     if let Ok(mut su) = unsafe { SuperuserBus::open(device) } {
         state.transport = HvdcpTransport::Superuser;
         let mut bus = Bus::Superuser(&mut su);
-        while vin_uv > PUMP_VIN_TARGET_MAX_UV && dec < MAX_TRIM_DEC {
+        while vin_uv > stop && vin_uv > floor && dec < MAX_TRIM_DEC {
             if pulse_dec(&mut bus, state).is_err() {
                 break;
             }
@@ -1300,7 +1393,7 @@ pub unsafe fn trim_vin_for_pump(
     if let Some(id) = usbin_id {
         if let Ok(mut rh) = unsafe { open_usbin(device, id) } {
             let mut bus = Bus::Usbin(&mut rh);
-            while vin_uv > PUMP_VIN_TARGET_MAX_UV && dec < MAX_TRIM_DEC {
+            while vin_uv > stop && vin_uv > floor && dec < MAX_TRIM_DEC {
                 if pulse_dec(&mut bus, state).is_err() {
                     break;
                 }
@@ -1313,11 +1406,11 @@ pub unsafe fn trim_vin_for_pump(
     dec
 }
 
-/// Raise QC3 VBUS with INC pulses until `vin_uv` reaches [`PUMP_VIN_TARGET_MIN_UV`].
+/// Raise QC3 VBUS with INC pulses until `vin_uv` reaches [`target_vbus_uv`].
 ///
-/// Live: capped elevate that stops near 8.0–8.2 V enters 2:1 but delivers only
-/// tens of mA when `Vbat ≈ Vin/2`. Android `cp_qc30.c:848` draws the bus up into
-/// the 9.5–9.8 V window, so boost to that floor before charging.
+/// The target is the `2*Vbat`-derived band centre, so the pulse budget shrinks
+/// with the pack: a full pack needs 21 steps (4.2 V) instead of the 23 that a
+/// fixed 9.5 V floor always cost. The loop never pulses past the band top.
 ///
 /// # Safety
 ///
@@ -1327,8 +1420,11 @@ pub unsafe fn boost_vin_for_pump(
     usbin_id: Option<u64>,
     state: &mut HvdcpState,
     mut vin_uv: i32,
+    vbat_uv: u32,
 ) -> u32 {
-    if vin_uv >= PUMP_VIN_TARGET_MIN_UV {
+    let stop = target_vbus_uv(vbat_uv) as i32;
+    let top = trim_target_uv(vbat_uv);
+    if vin_uv >= stop {
         mark(device, "BoostInc", 0);
         return 0;
     }
@@ -1336,13 +1432,13 @@ pub unsafe fn boost_vin_for_pump(
     if let Ok(mut su) = unsafe { SuperuserBus::open(device) } {
         state.transport = HvdcpTransport::Superuser;
         let mut bus = Bus::Superuser(&mut su);
-        while vin_uv < PUMP_VIN_TARGET_MIN_UV && inc < MAX_BOOST_INC {
+        while vin_uv < stop && inc < MAX_BOOST_INC {
             if pulse_inc(&mut bus, state).is_err() {
                 break;
             }
             inc = inc.saturating_add(1);
             vin_uv = vin_uv.saturating_add(QC3_STEP_UV as i32);
-            if vin_uv > PUMP_VIN_TRIM_UV {
+            if vin_uv > top {
                 break;
             }
         }
@@ -1352,13 +1448,13 @@ pub unsafe fn boost_vin_for_pump(
     if let Some(id) = usbin_id {
         if let Ok(mut rh) = unsafe { open_usbin(device, id) } {
             let mut bus = Bus::Usbin(&mut rh);
-            while vin_uv < PUMP_VIN_TARGET_MIN_UV && inc < MAX_BOOST_INC {
+            while vin_uv < stop && inc < MAX_BOOST_INC {
                 if pulse_inc(&mut bus, state).is_err() {
                     break;
                 }
                 inc = inc.saturating_add(1);
                 vin_uv = vin_uv.saturating_add(QC3_STEP_UV as i32);
-                if vin_uv > PUMP_VIN_TRIM_UV {
+                if vin_uv > top {
                     break;
                 }
             }
@@ -1366,6 +1462,82 @@ pub unsafe fn boost_vin_for_pump(
     }
     mark(device, "BoostInc", inc);
     inc
+}
+
+/// One closed-loop bus correction toward the transfer band (µV moved, ±).
+///
+/// Three cases, in order:
+///
+/// * `Vin` **above** the band → DEC back to the centre ([`trim_vin_for_pump`]).
+/// * `Vin` **below** the centre → INC, but only when the bus is below the band
+///   floor or the pump is carrying nothing: from *inside* the band a pulse of
+///   200 mV would leave it upward, which is the one direction that stops the
+///   transfer.
+/// * **Inside** the band yet `dead_current` — the pump reports mode 3 on the
+///   39 mA ADC floor (live 18.09: bus 9.744 V, window 8.94–9.09 V, all three
+///   loop configurations at exactly 39 mA) → one DEC step down, because the
+///   band the policy computed is not the band silicon is using.
+///
+/// Returns the number of pulses sent, and marks `NudgeInc` / `NudgeDec` for the
+/// post-mortem.
+///
+/// # Safety
+///
+/// PASSIVE_LEVEL; `device` is valid.
+pub unsafe fn nudge_vin_into_window(
+    device: WDFDEVICE,
+    usbin_id: Option<u64>,
+    state: &mut HvdcpState,
+    vin_uv: i32,
+    vbat_uv: u32,
+    dead_current: bool,
+) -> u32 {
+    if vin_uv <= 0 || vbat_uv == 0 {
+        return 0;
+    }
+    let top = trim_target_uv(vbat_uv);
+    let floor = window_floor_uv(vbat_uv);
+    let target = target_vbus_uv(vbat_uv) as i32;
+    if vin_uv > top {
+        let dec = unsafe { trim_vin_for_pump(device, usbin_id, state, vin_uv, vbat_uv) };
+        mark(device, "NudgeDec", dec);
+        return dec;
+    }
+    if vin_uv < target && (dead_current || vin_uv < floor) {
+        let inc = unsafe { boost_vin_for_pump(device, usbin_id, state, vin_uv, vbat_uv) };
+        mark(device, "NudgeInc", inc);
+        return inc;
+    }
+    if dead_current && vin_uv > floor {
+        let dec = unsafe { one_dec_pulse(device, usbin_id, state) };
+        mark(device, "NudgeDec", dec);
+        return dec;
+    }
+    0
+}
+
+/// Single DEC pulse on whichever transport opens (`1` sent, `0` otherwise).
+///
+/// # Safety
+///
+/// PASSIVE_LEVEL; `device` is valid.
+unsafe fn one_dec_pulse(
+    device: WDFDEVICE,
+    usbin_id: Option<u64>,
+    state: &mut HvdcpState,
+) -> u32 {
+    if let Ok(mut su) = unsafe { SuperuserBus::open(device) } {
+        state.transport = HvdcpTransport::Superuser;
+        let mut bus = Bus::Superuser(&mut su);
+        return u32::from(pulse_dec(&mut bus, state).is_ok());
+    }
+    if let Some(id) = usbin_id {
+        if let Ok(mut rh) = unsafe { open_usbin(device, id) } {
+            let mut bus = Bus::Usbin(&mut rh);
+            return u32::from(pulse_dec(&mut bus, state).is_ok());
+        }
+    }
+    0
 }
 
 /// Raise USBIN ICL to the pump budget ([`ICL_RAW_PUMP_3A`]) after Vin elevate.
@@ -1451,13 +1623,17 @@ mod tests {
     use ln8000::encoding::{charge_mode, OpMode};
 
     #[test]
-    fn target_is_the_android_high_window() {
-        // `cp_qc30.c:848` holds the bus up to 9.5 V before trimming; the target
-        // is fixed and does not track Vbat.
-        assert_eq!(target_vbus_uv(3_000_000), 9_500_000);
-        assert_eq!(target_vbus_uv(4_000_000), 9_500_000);
-        assert_eq!(target_vbus_uv(4_500_000), 9_500_000);
-        assert_eq!(target_vbus_uv(4_000_000), PUMP_VIN_TARGET_MIN_UV as u32);
+    fn target_tracks_the_live_transfer_band() {
+        // Цель — середина полосы переноса `[2*Vbat+200, 2*Vbat+400]` мВ, и она
+        // едет за банкой вместо фиксированных 9,5 В, которые на полной банке
+        // лежат выше полосы (живой замер 18.09: 39 мА на 9,744 и 9,888 В).
+        assert_eq!(target_vbus_uv(4_000_000), 8_300_000);
+        assert_eq!(target_vbus_uv(4_420_000), 9_140_000);
+        assert_eq!(target_vbus_uv(4_500_000), 9_300_000);
+        // Низкая банка: цель поднимается до абсолютного пола допуска 2:1.
+        assert_eq!(target_vbus_uv(3_000_000), PUMP_VIN_TARGET_ABS_MIN_UV);
+        // Банка не прочитана — вендорский пол 9,5 В.
+        assert_eq!(target_vbus_uv(0), PUMP_VIN_TARGET_MIN_UV as u32);
     }
 
     #[test]
@@ -1481,8 +1657,8 @@ mod tests {
         assert!(MAX_BOOST_INC <= MAX_PULSE_CNT);
         assert_eq!(MAX_PULSE_CNT, 23); // cp_qc30.h:81 MAX_PLUSE_COUNT_ALLOWED
         assert!(estimated_vbus_uv(MAX_PULSE_CNT) >= PUMP_VIN_TARGET_MIN_UV as u32);
-        // The pulse train is bounded by the cap, not by the (ignored) Vbat.
-        assert_eq!(pulses_toward_target(4_000_000), MAX_PULSE_CNT);
+        // Пулевой бюджет теперь зависит от банки: полная банка дешевле.
+        assert_eq!(pulses_toward_target(4_000_000), 17);
         assert!(pulses_toward_target(4_500_000) <= MAX_PULSE_CNT);
     }
 
@@ -1539,8 +1715,13 @@ mod tests {
 
     #[test]
     fn pump_vin_window_is_ordered() {
-        assert!(PUMP_VIN_TARGET_MIN_UV < PUMP_VIN_TARGET_MAX_UV);
-        assert!(PUMP_VIN_TARGET_MAX_UV < PUMP_VIN_TRIM_UV);
+        assert!(PUMP_VIN_TARGET_ABS_MIN_UV <= PUMP_VIN_TARGET_CEIL_UV);
+        assert!(PUMP_VIN_TARGET_CEIL_UV < PUMP_VIN_TRIM_UV as u32);
+        assert!(window_floor_uv(4_420_000) < trim_target_uv(4_420_000));
+        assert!(trim_target_uv(4_420_000) as u32 <= PUMP_VIN_TRIM_UV as u32);
+        // Без прочитанной банки границы не срываются в ноль.
+        assert_eq!(window_floor_uv(0), PUMP_VIN_TARGET_MIN_UV);
+        assert_eq!(trim_target_uv(0), PUMP_VIN_TARGET_MIN_UV);
     }
 
     #[test]
