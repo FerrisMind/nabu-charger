@@ -535,12 +535,16 @@ impl<T: RegisterBus> Pump<T> {
     fn configure_protections(&mut self) -> Result<(), PumpError> {
         let cfg = self.config;
         self.update(regs::FAULT_CTRL, 1 << 5, 0, "enable_vbat_ovp")?;
-        self.update(
-            regs::FAULT_CTRL,
-            1 << 6,
-            u8::from(cfg.iin_ocp_disabled) << 6,
-            "iin_ocp",
-        )?;
+        // `FAULT_CTRL` IIN_OCP выключается **всегда**, независимо от профиля:
+        // вендорский DT планшета её не оставляет (`ln8000_charger,
+        // iin-ocp-disable`, `nabu-sm8150.dtsi:239`), а `bus-ocp-threshold = 3750`
+        // мА задан там только как аларм. Включённая защита защёлкивает
+        // `FAULT2_IIN_OC` на первом же включении 2:1 — живой замер 19.09 11:10:
+        // шина 8,256 В, `PostHvdcpMode = 3`, следом `FAULT2 = 0x80`,
+        // `SuMode = 1`, 39,1 мА, `EngageState = 0` — заряд не идёт вовсе.
+        // Профиль по-прежнему управляет петлями (`iIN_REG`/`VFLOAT`), но не
+        // этой защёлкой.
+        self.update(regs::FAULT_CTRL, 1 << 6, 1 << 6, "iin_ocp_off_nabu_dts")?;
         self.update(
             regs::REGULATION_CTRL,
             1 << 5,
@@ -835,7 +839,17 @@ impl<T: RegisterBus> Pump<T> {
         // чип слушается; повторять сброс каждый тик нельзя: это дёргает заряд и
         // стирает состояние, которое чип мог защёлкнуть законно.
         if let Some(prev) = self.por_vin_uv {
-            if vin_now.abs_diff(prev) <= POR_VIN_TOLERANCE_UV {
+            // Исключение из бюджета: живая защёлка VFAULT (`FAULT1 = 0x21`).
+            // Импульс `TIMER_CTRL` её не снимает — он чистит только FAULT2
+            // (живой замер 0x3F → 0x20, FAULT1 не тронут), а с ней чип отказывает
+            // в 1:1 на 4,7–5,0 В: замер 19.09 10:49 на MDY-11-EP — 39,1 мА,
+            // mode 1, `ChargeAttemptN` растёт, `LastEnableErr = -4`. POR —
+            // единственная живая последовательность, после которой `FAULT1=0x00`
+            // и обход держит 2,0–2,7 А. Без защёлки бюджет действует как раньше.
+            let fault1 = self.read(regs::FAULT1_STS).unwrap_or(0);
+            if vin_now.abs_diff(prev) <= POR_VIN_TOLERANCE_UV
+                && fault1 & regs::FAULT1_VFAULTS_MASK == 0
+            {
                 return Err(PumpError::ModeNotReached {
                     wanted: OpMode::Bypass.code(),
                     raw_status: self.read(regs::SYS_STS).unwrap_or(0),
@@ -2148,7 +2162,9 @@ mod tests {
         );
 
         let fault = pump.bus.reg(regs::FAULT_CTRL);
-        assert_eq!(fault & (1 << 6), 0, "iin ocp включён");
+        // IIN_OCP выключен в любом профиле: вендорский DT планшета его не
+        // оставляет, а защёлка `FAULT2_IIN_OC` паркует насос в standby.
+        assert_eq!(fault & (1 << 6), 1 << 6, "iin ocp выключен");
         let recovery = pump.bus.reg(regs::RECOVERY_CTRL);
         assert_eq!(recovery & 0b11, 0b11, "мониторы температур включены");
     }

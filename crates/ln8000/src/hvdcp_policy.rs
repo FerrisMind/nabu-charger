@@ -61,6 +61,63 @@ pub const fn input_present_from_vin(vin_uv: i32) -> bool {
     vin_uv > VIN_UNPLUG_MAX_UV
 }
 
+/// VBUS at/above this during the `FORCE_9V` wait means the brick answered the
+/// QC signature and is ramping (µV).
+///
+/// Live MDY-11-EP (19.09): one 6.48 V sample inside a 1.2 s window, then straight
+/// back to 5 V when the retreat forced it — the answer is real but slower than
+/// any fixed window that a 5 V-only source would tolerate.
+pub const FORCE9V_RISE_UV: i32 = 5_600_000;
+/// First wait window for a `FORCE_9V` answer (ms).
+pub const FORCE9V_SETTLE_MS: u32 = 1_600;
+/// Extra time granted once a rise past [`FORCE9V_RISE_UV`] is seen (ms).
+pub const FORCE9V_EXTEND_MS: u32 = 2_400;
+/// Hard cap for the whole wait, extension included (ms). Bounds how long the
+/// SUPERUSER bus can be held on a source that ignores the signature.
+pub const FORCE9V_HARD_CAP_MS: u32 = 5_000;
+
+/// What the `FORCE_9V` wait loop should do with the newest sample.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Force9vWait {
+    /// Keep polling inside the current deadline.
+    Continue,
+    /// The brick answered: move the deadline out (allowed once).
+    Extend,
+    /// Stop polling — the bus reached the 2:1 gate, or the deadline is up.
+    Stop,
+}
+
+/// One step of the `FORCE_9V` wait loop.
+///
+/// `switching_min_uv` is the caller's 2:1 gate ([`SWITCHING_MIN_VIN_UV`] in the
+/// KMDF layer) — passed in so this module stays free of pump encoding.
+#[must_use]
+pub const fn force9v_step(
+    vin_uv: i32,
+    waited_ms: u32,
+    deadline_ms: u32,
+    extended: bool,
+    switching_min_uv: i32,
+) -> Force9vWait {
+    if vin_uv >= switching_min_uv || waited_ms >= deadline_ms {
+        return Force9vWait::Stop;
+    }
+    if !extended && vin_uv >= FORCE9V_RISE_UV {
+        return Force9vWait::Extend;
+    }
+    Force9vWait::Continue
+}
+
+/// Deadline after the first rise is seen: one extension, capped.
+#[must_use]
+pub const fn force9v_extended_deadline(deadline_ms: u32) -> u32 {
+    if deadline_ms.saturating_add(FORCE9V_EXTEND_MS) > FORCE9V_HARD_CAP_MS {
+        FORCE9V_HARD_CAP_MS
+    } else {
+        deadline_ms + FORCE9V_EXTEND_MS
+    }
+}
+
 /// `DCP_CHARGER_BIT` in `APSD_RESULT_STATUS` (`smb5-reg.h`).
 pub const APSD_BIT_DCP: u8 = 1 << 3;
 /// `QC_2P0_BIT` in `APSD_RESULT_STATUS`.
@@ -249,6 +306,64 @@ mod tests {
         assert_eq!(
             apsd_elevate_path(promote_qc_charger(0, APSD_STAT_BIT_QC_CHARGER), false),
             ApsdElevate::Force9v
+        );
+    }
+
+    #[test]
+    fn force9v_wait_stops_the_moment_the_gate_is_met() {
+        // The 2:1 gate is reached on the sample itself — no extra poll.
+        assert_eq!(
+            force9v_step(8_000_000, 0, FORCE9V_SETTLE_MS, false, 8_000_000),
+            Force9vWait::Stop
+        );
+        // A brick still at 5 V keeps the loop polling, then the deadline ends it.
+        assert_eq!(
+            force9v_step(4_800_000, 0, FORCE9V_SETTLE_MS, false, 8_000_000),
+            Force9vWait::Continue
+        );
+        assert_eq!(
+            force9v_step(4_800_000, FORCE9V_SETTLE_MS, FORCE9V_SETTLE_MS, false, 8_000_000),
+            Force9vWait::Stop
+        );
+    }
+
+    #[test]
+    fn force9v_wait_extends_once_on_a_partial_rise() {
+        // Live MDY-11-EP: 6.48 V seen, ramp slower than the first window.
+        assert_eq!(
+            force9v_step(6_480_000, 400, FORCE9V_SETTLE_MS, false, 8_000_000),
+            Force9vWait::Extend
+        );
+        let moved = force9v_extended_deadline(FORCE9V_SETTLE_MS);
+        assert_eq!(moved, FORCE9V_SETTLE_MS + FORCE9V_EXTEND_MS);
+        // The extension is granted once: a second partial rise does not push it.
+        assert_eq!(
+            force9v_step(6_480_000, moved - 1, moved, true, 8_000_000),
+            Force9vWait::Continue
+        );
+        assert_eq!(
+            force9v_step(6_480_000, moved, moved, true, 8_000_000),
+            Force9vWait::Stop
+        );
+        // A 5 V source never triggers the extension at all.
+        assert_eq!(
+            force9v_step(4_900_000, 100, FORCE9V_SETTLE_MS, false, 8_000_000),
+            Force9vWait::Continue
+        );
+    }
+
+    #[test]
+    fn force9v_deadline_never_passes_the_hard_cap() {
+        assert_eq!(
+            force9v_extended_deadline(FORCE9V_HARD_CAP_MS),
+            FORCE9V_HARD_CAP_MS
+        );
+        assert!(force9v_extended_deadline(FORCE9V_SETTLE_MS) <= FORCE9V_HARD_CAP_MS);
+        assert_eq!(force9v_extended_deadline(u32::MAX), FORCE9V_HARD_CAP_MS);
+        // A deadline that is already past the cap stops without extending.
+        assert_eq!(
+            force9v_step(6_000_000, FORCE9V_HARD_CAP_MS, FORCE9V_HARD_CAP_MS, false, 8_200_000),
+            Force9vWait::Stop
         );
     }
 }

@@ -81,11 +81,12 @@ pub use guard::{
     evaluate, resolve_bypass,
 };
 pub use hvdcp_policy::{
-    ApsdElevate, HVDCP_ERR_USBIN_UNAVAILABLE, HVDCP_PHASE_DONE, HVDCP_PHASE_FAILED,
+    ApsdElevate, Force9vWait, HVDCP_ERR_USBIN_UNAVAILABLE, HVDCP_PHASE_DONE, HVDCP_PHASE_FAILED,
     HVDCP_PHASE_FIVE_V_BYPASS, HVDCP_PHASE_IDLE, HVDCP_SUPERUSER_RETRY_MAX,
-    HVDCP_SUPERUSER_RETRY_MS, VIN_UNPLUG_MAX_UV, apsd_elevate_path, input_present_from_vin,
-    promote_qc_charger, should_renegotiate_on_input_edge, should_schedule_superuser_retry,
-    superuser_retry_due,
+    HVDCP_SUPERUSER_RETRY_MS, VIN_UNPLUG_MAX_UV, apsd_elevate_path, force9v_extended_deadline,
+    force9v_step, input_present_from_vin, promote_qc_charger, should_renegotiate_on_input_edge,
+    should_schedule_superuser_retry, superuser_retry_due, FORCE9V_EXTEND_MS, FORCE9V_HARD_CAP_MS,
+    FORCE9V_RISE_UV, FORCE9V_SETTLE_MS,
 };
 pub use qc35_auth::{
     ICL_RAW_QC35_2A, ICL_RAW_QC35_40W, QC35_18W_HI_UV, QC35_27W_HI_UV, QC35_27W_LO_UV,

@@ -229,10 +229,17 @@ impl Status {
     }
 
     /// Есть ли критичный отказ, требующий вмешательства.
+    ///
+    /// `FAULT2_IIN_OC` здесь **не** учитывается: вендорский DT планшета
+    /// выключает эту защиту (`ln8000_charger,iin-ocp-disable`,
+    /// `nabu-sm8150.dtsi:239`), и `configure_protections` пишет в `FAULT_CTRL`
+    /// то же самое. Защёлка может остаться с прошлой сессии до POR, и по ней
+    /// нельзя считать вход отсутствующим: живой замер 19.09 11:10 —
+    /// `FAULT2 = 0x80` при 8,256 В на шине и `PostHvdcpMode = 3`. Для отчётов
+    /// бит остаётся в [`Self::fault_summary`].
     #[must_use]
     pub const fn has_critical_fault(&self) -> bool {
         self.fault1_sts & (regs::FAULT1_WATCHDOG | regs::FAULT1_VBAT_OV | regs::FAULT1_VAC_OV) != 0
-            || self.fault2_sts & regs::FAULT2_IIN_OC != 0
             || self.safety_sts & (regs::SAFETY_NTC_SHUTDOWN | regs::SAFETY_TEMP_MAX) != 0
     }
 
