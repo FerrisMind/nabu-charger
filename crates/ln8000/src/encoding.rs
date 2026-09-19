@@ -109,6 +109,70 @@ pub const fn min_vin_for_switching_uv(vbat_uv: u32) -> u32 {
         .saturating_add(SWITCHING_HEADROOM_UV)
 }
 
+/// Top of the 2:1 transfer band above `2 * Vbat` (µV) — 400 mV.
+///
+/// Live nabu 18.09 (pack 4.40–4.44 V): the LN8000 moves real power only while
+/// `Vin` sits between roughly `2*Vbat + 200 mV` and `2*Vbat + 400 mV`. Above the
+/// top the pump still reports mode 3 (`SYS_STS = 0x04`) but carries only the
+/// 39 mA ADC floor (8 × 4.89 mA) with `FAULT2_IIN_OC` flapping 3↔1; below the
+/// floor the mode is refused outright. Four measured points bracket the band at
+/// Vbat 4.40–4.44 V: 9088 mV → 1887 mA and 9280 mV → 2513 mA, against 9744 mV
+/// → 39 mA and 9888 mV → 39 mA. The window rides with the pack: at 4.42 V its
+/// top sits at 9.24 V, three QC3 steps *below* the 9.5 V this driver held.
+pub const SWITCHING_WINDOW_TOP_UV: u32 = 400_000;
+
+/// Bottom of the *empirical* transfer band above `2 * Vbat` (µV) — 200 mV.
+///
+/// Kept separate from [`SWITCHING_HEADROOM_UV`] (250 mV, the Android admission
+/// gate): the winning live point sat 218 mV above `2*Vbat` and still carried
+/// 1887 mA, so admission keeps the vendor gate while the bus policy aims inside
+/// the measured band.
+pub const SWITCHING_WINDOW_FLOOR_UV: u32 = 200_000;
+
+/// Where to aim inside the band, above `2 * Vbat` (µV) — the middle, 300 mV.
+///
+/// One QC3 step is 200 mV, i.e. wider than the 200 mV band itself, so aiming at
+/// an edge means a single pulse leaves the band — and leaving it *upward* stops
+/// the transfer entirely. The centre keeps ~100 mV of margin on both sides.
+pub const SWITCHING_WINDOW_TARGET_UV: u32 = 300_000;
+
+/// Top of the transfer band for `vbat_uv` (µV).
+#[must_use]
+pub const fn window_top_uv(vbat_uv: u32) -> u32 {
+    vbat_uv
+        .saturating_mul(2)
+        .saturating_add(SWITCHING_WINDOW_TOP_UV)
+}
+
+/// Bottom of the transfer band for `vbat_uv` (µV).
+#[must_use]
+pub const fn window_floor_uv(vbat_uv: u32) -> u32 {
+    vbat_uv
+        .saturating_mul(2)
+        .saturating_add(SWITCHING_WINDOW_FLOOR_UV)
+}
+
+/// Bus target inside the band for `vbat_uv` (µV).
+#[must_use]
+pub const fn window_target_uv(vbat_uv: u32) -> u32 {
+    vbat_uv
+        .saturating_mul(2)
+        .saturating_add(SWITCHING_WINDOW_TARGET_UV)
+}
+
+/// True when `vin_uv` is inside the transfer band for `vbat_uv`.
+///
+/// The band is 200 mV wide while one QC3 pulse moves the bus 200 mV, so sitting
+/// outside it is a normal intermediate state, not a fault: the caller corrects
+/// with one pulse. `false` for a non-positive Vin or an unknown pack.
+#[must_use]
+pub const fn vin_in_switching_window(vin_uv: i32, vbat_uv: u32) -> bool {
+    if vin_uv <= 0 || vbat_uv == 0 {
+        return false;
+    }
+    vin_uv >= window_floor_uv(vbat_uv) as i32 && vin_uv <= window_top_uv(vbat_uv) as i32
+}
+
 /// Non-negative Vin in µV for unsigned comparisons (`0` for absent / negative).
 #[must_use]
 pub const fn non_negative_uv(vin_uv: i32) -> u32 {
@@ -582,22 +646,47 @@ mod tests {
     }
 
     #[test]
-    fn hvdcp_bus_window_floor_admits_switching_across_the_pack_range() {
-        // KMDF HVDCP drives the QC3 bus to a fixed Android window floor
-        // (`cp_qc30.c:848`: UP while `vbus <= 9500`), not to `2*Vbat + 200 mV`:
-        // that old form asked for 8.20 V at Vbat 4.0 V while this gate needs
-        // 8.25 V, so `charge_mode` returned `None` and 2:1 was never entered.
-        // Host-side mirror of `hvdcp::target_vbus_uv` and its
-        // `target_always_admits_switching()` test (the KMDF crate is `no_std`
-        // with `panic=abort`, so its `#[cfg(test)]` tests cannot execute).
-        const HVDCP_BUS_TARGET_UV: i32 = 9_500_000; // = PUMP_VIN_TARGET_MIN_UV
+    fn hvdcp_bus_target_admits_switching_across_the_pack_range() {
+        // Host-side mirror of `hvdcp::target_vbus_uv`: the mid-band target,
+        // clamped up to the absolute 2:1 floor so a low pack still admits the
+        // mode. The KMDF crate is `no_std` with `panic=abort`, so its
+        // `#[cfg(test)]` tests cannot execute — this one stands in for them.
         for vbat in (3_000_000..=4_500_000).step_by(50_000) {
+            let target = window_target_uv(vbat).max(SWITCHING_MIN_VIN_UV as u32);
             assert_eq!(
-                charge_mode(HVDCP_BUS_TARGET_UV, vbat),
+                charge_mode(target as i32, vbat),
                 Some(OpMode::Switching),
-                "окно {HVDCP_BUS_TARGET_UV} обязано допускать 2:1 при Vbat {vbat}"
+                "цель {target} обязана допускать 2:1 при Vbat {vbat}"
+            );
+            // Never above the band top unless the absolute floor pins it there.
+            assert!(
+                target <= window_top_uv(vbat).max(SWITCHING_MIN_VIN_UV as u32),
+                "цель {target} выше окна при Vbat {vbat}"
             );
         }
+    }
+
+    #[test]
+    fn switching_window_matches_the_live_band() {
+        // Live 18.09, pack 4.42–4.44 V: 9088 mV → 1887 mA and 9280 mV →
+        // 2513 mA carry power; 9744 mV and 9888 mV (mode 3, `SYS_STS=0x04`)
+        // carry only the 39 mA ADC floor.
+        assert!(vin_in_switching_window(9_088_000, 4_420_000));
+        assert!(vin_in_switching_window(9_280_000, 4_440_000));
+        assert!(!vin_in_switching_window(9_744_000, 4_420_000));
+        assert!(!vin_in_switching_window(9_888_000, 4_420_000));
+        // The derived target is inside the band; the old fixed 9.5 V floor —
+        // three QC3 steps above the top at this pack voltage — is not. That gap
+        // is why the driver's own telemetry killed the 2:1 state it had just
+        // been handed.
+        assert!(vin_in_switching_window(
+            window_target_uv(4_420_000) as i32,
+            4_420_000
+        ));
+        assert!(!vin_in_switching_window(9_500_000, 4_420_000));
+        // An unknown pack or absent input is never "in band".
+        assert!(!vin_in_switching_window(9_500_000, 0));
+        assert!(!vin_in_switching_window(0, 4_420_000));
     }
 
     #[test]

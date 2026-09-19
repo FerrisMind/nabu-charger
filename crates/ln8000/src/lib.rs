@@ -50,6 +50,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 #![cfg_attr(test, allow(clippy::indexing_slicing, clippy::arithmetic_side_effects))]
 
+pub mod battery_policy;
 pub mod driver;
 pub mod encoding;
 pub mod error;
