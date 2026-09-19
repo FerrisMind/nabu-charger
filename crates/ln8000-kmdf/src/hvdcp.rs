@@ -181,6 +181,15 @@ const _: () = assert!(HvdcpPhase::FiveVBypass as u32 == 9);
 /// Settle after FORCE_9V / last pulse before reading QC_CHANGE (ms).
 pub const QC_STATUS_SETTLE_MS: u32 = 200;
 
+/// Poll period inside the `FORCE_9V` wait (ms).
+///
+/// The timing policy (first window, one extension on a rising brick, hard cap)
+/// is host-tested in `ln8000::hvdcp_policy`; only the poll cadence lives here.
+pub const FORCE9V_POLL_MS: u32 = 50;
+
+/// Сколько подряд отсчётов выше ворот 2:1 засчитываются как установившийся 9 В.
+pub const FORCE9V_CONFIRM_N: u32 = 2;
+
 /// QC3.0 step size (µV), `HVDCP3_STEP_UV`.
 pub const QC3_STEP_UV: u32 = 200_000;
 /// Baseline after APSD before pulses.
@@ -336,6 +345,15 @@ pub struct HvdcpState {
     pub endian_known: bool,
     /// Active transport for the last negotiate.
     pub transport: HvdcpTransport,
+    /// `CMD_HVDCP_2` carries `FORCE_9V` and the brick holds a QC2 level.
+    ///
+    /// Vendor writes `FORCE_9V` **once** (`smb5-lib.c:8376`) and never touches
+    /// the register again for that adapter: the level is held by the bit, not by
+    /// pulses. QC2 has no continuous mode, so an INC/DEC here is both useless
+    /// and — with a raw write — fatal to the latch. Live 19.09 on MDY-11-EP:
+    /// peak 8,224 В, then the post-path pulse wrote `0x01`, the brick folded
+    /// back to ~4,9 В and the landing classified it as a 5 V source.
+    pub force9v_latched: bool,
 }
 
 impl HvdcpState {
@@ -351,6 +369,7 @@ impl HvdcpState {
             big_endian: true,
             endian_known: false,
             transport: HvdcpTransport::None,
+            force9v_latched: false,
         }
     }
 }
@@ -529,11 +548,13 @@ pub const fn vin_stayed_near_5v(vin_uv: i32) -> bool {
 
 // Cold-plug / SUPERUSER-retry + QC3.5 auth policy live in `ln8000` (host-tested).
 pub use ln8000::{
-    input_present_from_vin, should_renegotiate_on_input_edge, should_schedule_superuser_retry,
-    superuser_retry_due, HVDCP_SUPERUSER_RETRY_MAX, HVDCP_SUPERUSER_RETRY_MS,
+    force9v_extended_deadline, force9v_step, input_present_from_vin,
+    should_renegotiate_on_input_edge, should_schedule_superuser_retry, superuser_retry_due,
+    Force9vWait, FORCE9V_HARD_CAP_MS, FORCE9V_RISE_UV, FORCE9V_SETTLE_MS, HVDCP_SUPERUSER_RETRY_MAX,
+    HVDCP_SUPERUSER_RETRY_MS,
 };
 // APSD classification is host-tested in `ln8000::hvdcp_policy`.
-use ln8000::{apsd_elevate_path, promote_qc_charger, ApsdElevate};
+use ln8000::{apsd_elevate_path, encoding::SWITCHING_MIN_VIN_UV, promote_qc_charger, ApsdElevate};
 
 /// Sleep at PASSIVE_LEVEL for `ms` milliseconds.
 pub(crate) fn sleep_ms(ms: u32) {
@@ -770,8 +791,9 @@ fn pulse_inc_gap(
     state: &mut HvdcpState,
     gap_ms: u32,
 ) -> Result<(), HvdcpError> {
-    write_reg(bus, state, REG_CMD_HVDCP_2, BIT_SINGLE_INC)?;
-    state.pulse_cnt = state.pulse_cnt.saturating_add(1).min(MAX_PULSE_CNT);
+    if pulse_cmd_bit(bus, state, BIT_SINGLE_INC)? {
+        state.pulse_cnt = state.pulse_cnt.saturating_add(1).min(MAX_PULSE_CNT);
+    }
     sleep_ms(gap_ms);
     Ok(())
 }
@@ -787,23 +809,58 @@ fn pulse_dec_gap(
     state: &mut HvdcpState,
     gap_ms: u32,
 ) -> Result<(), HvdcpError> {
-    write_reg(bus, state, REG_CMD_HVDCP_2, BIT_SINGLE_DEC)?;
-    state.pulse_cnt = state.pulse_cnt.saturating_sub(1);
+    if pulse_cmd_bit(bus, state, BIT_SINGLE_DEC)? {
+        state.pulse_cnt = state.pulse_cnt.saturating_sub(1);
+    }
     sleep_ms(gap_ms);
     Ok(())
 }
 
+/// Sends one QC3 step bit the way the vendor does: masked, not absolute.
+///
+/// `smblib_dp_pulse` / `smblib_dm_pulse` (`smb5-lib.c:3893-3919`) both use
+/// `smblib_masked_write(chg, CMD_HVDCP_2_REG, SINGLE_*, SINGLE_*)`, so every
+/// other bit of the register survives the pulse. A raw write here cleared
+/// `FORCE_9V`: one INC after the QC2 rise dropped the brick back to 5 V.
+/// On a latched bus the pulse is skipped entirely — QC2 has no continuous mode.
+/// Возвращает `true`, если импульс действительно ушёл в чип.
+///
+/// Признак нужен вызывающему: под защёлкой счётчик импульсов обязан стоять
+/// вместе с импульсом. Иначе `estimated_vbus_uv` публикует уровень, которого на
+/// шине нет (живой замер 19.09 12:02: `SuVbusEst` 5,4 В при измеренных 8,8 В —
+/// счётчик считал импульсы, которые `pulse_cmd_bit` пропустил).
+fn pulse_cmd_bit(bus: &mut Bus<'_>, state: &HvdcpState, bit: u8) -> Result<bool, HvdcpError> {
+    if state.force9v_latched {
+        return Ok(false);
+    }
+    let cur = read_reg(bus, state, REG_CMD_HVDCP_2).unwrap_or(0);
+    write_reg(
+        bus,
+        state,
+        REG_CMD_HVDCP_2,
+        (cur & !(BIT_SINGLE_INC | BIT_SINGLE_DEC)) | bit,
+    )?;
+    Ok(true)
+}
+
 /// QC2 force-9V path (`smblib_force_vbus_voltage(FORCE_9V_BIT)`).
+///
+/// One write, like the vendor's: the level is held by the bit until something
+/// clears it, and from here on the bus is not trimmable (no QC3 continuous
+/// mode), so [`pulse_cmd_bit`] refuses to pulse while the latch is up.
 fn force_9v(bus: &mut Bus<'_>, state: &mut HvdcpState) -> Result<(), HvdcpError> {
-    write_reg(bus, state, REG_CMD_HVDCP_2, BIT_FORCE_9V)?;
+    let existing = read_reg(bus, state, REG_CMD_HVDCP_2).unwrap_or(0);
+    write_reg(bus, state, REG_CMD_HVDCP_2, existing | BIT_FORCE_9V)?;
+    state.force9v_latched = true;
     state.pulse_cnt = 20;
     sleep_ms(100);
     Ok(())
 }
 
 /// Best-effort return to 5 V on failure after we already raised VBUS.
-fn safe_force_5v(bus: &mut Bus<'_>, state: &HvdcpState) {
+fn safe_force_5v(bus: &mut Bus<'_>, state: &mut HvdcpState) {
     let _ = write_reg(bus, state, REG_CMD_HVDCP_2, BIT_FORCE_5V);
+    state.force9v_latched = false;
 }
 
 /// Publish step marks for remote diagnostics.
@@ -818,10 +875,65 @@ fn publish_marks(device: WDFDEVICE, state: &HvdcpState, err: Option<HvdcpError>)
     mark(device, "SuPulseCnt", state.pulse_cnt);
     mark(device, "SuApsdResult", u32::from(state.apsd_result));
     mark(device, "SuVbusEst", estimated_vbus_uv(state.pulse_cnt));
+    // Защёлка `FORCE_9V` — состояние, которое переживает такт и подавляет
+    // импульсный путь. Без марки «шина стоит» неотличимо от «импульсы уходят
+    // впустую».
+    mark(device, "QcLatch", u32::from(state.force9v_latched));
     match err {
         Some(e) => mark(device, "HvdcpErr", e.code() as u32),
         None => mark(device, "HvdcpErr", 0),
     }
+}
+
+/// Poll VBUS while the QC signature is asserted, tolerating a slow brick ramp.
+///
+/// Returns `(last, peak)` in µV. The deadline moves out once when a sample shows
+/// the brick answered (`>= FORCE9V_RISE_UV`) and never passes the host-tested
+/// hard cap, so a source that ignores the signature cannot hold the SUPERUSER
+/// bus for long.
+///
+/// The gate must be met on [`FORCE9V_CONFIRM_N`] consecutive samples: a QC3 brick
+/// answers the legacy QC2 request with a spike and drops back, and a single
+/// sample above the gate used to end the wait on a level that never existed
+/// (live 19.09 11:07: `SuDcp9vVin` = 8,224 В, landing read ~4,8 В).
+fn wait_force9v_rise(read_vin: &mut impl FnMut() -> i32) -> (i32, i32) {
+    let mut waited = 0_u32;
+    let mut deadline = FORCE9V_SETTLE_MS;
+    let mut extended = false;
+    let mut last = read_vin();
+    let mut peak = last;
+    let mut confirm = 0_u32;
+    loop {
+        if last > peak {
+            peak = last;
+        }
+        if last >= SWITCHING_MIN_VIN_UV {
+            confirm = confirm.saturating_add(1);
+            if confirm >= FORCE9V_CONFIRM_N {
+                break;
+            }
+        } else {
+            confirm = 0;
+            match force9v_step(last, waited, deadline, extended, SWITCHING_MIN_VIN_UV) {
+                Force9vWait::Stop => break,
+                Force9vWait::Extend => {
+                    deadline = force9v_extended_deadline(deadline);
+                    extended = true;
+                }
+                Force9vWait::Continue => {}
+            }
+        }
+        if waited >= FORCE9V_HARD_CAP_MS {
+            break;
+        }
+        sleep_ms(FORCE9V_POLL_MS);
+        waited = waited.saturating_add(FORCE9V_POLL_MS);
+        last = read_vin();
+        if last > peak {
+            peak = last;
+        }
+    }
+    (last, peak)
 }
 
 /// Poll until `pred(vin)` or timeout; returns last Vin sample.
@@ -1212,17 +1324,102 @@ fn negotiate_on_bus(
                     Err(err) => mark(device, "SuQc2Icl", err.code() as u32),
                 }
             } else {
-                // Plain DCP (0x08): Android does **not** elevate it — a DCP is a
-                // 5 V source and only receives a current vote
-                // (`DCP_CURRENT_UA` = 2 A, `smb5-lib.h:248`). Our FORCE_9V for
-                // DCP was an experiment; live it never moved Vin and it held the
-                // SUPERUSER bus for the whole settle window. Vote the vendor's
-                // 2 A instead and let the caller's post-path land in the 5 V
-                // high-current route.
-                mark(device, "SuDcpNoElevate", 1);
-                match ensure_icl_at_least(bus, state, ICL_RAW_DCP_2A) {
+                // Plain DCP (0x08): Android only votes `DCP_CURRENT_UA` (2 A,
+                // `smb5-lib.h:248`) and never raises VBUS — but a QC2/QC3 brick
+                // *presents* DCP until the device drives the QC signature, so
+                // "DCP" is not "5 V only". The 5 V route on this build is
+                // thermally capped (1:1 at 2.7 A burns ~2 W in the die, so the
+                // guard parks the charge in the bypass retreat), which is why
+                // the elevation attempt stays in: one bounded `FORCE_9V` per
+                // input session with the vendor's HVDCP2 current vote. No rise
+                // inside the settle window → drop the signature
+                // (`safe_force_5v`), keep the 2 A vote and let the caller's
+                // post-path land in the 5 V high-current route.
+                mark(device, "SuDcpNoElevate", 0);
+                state.phase = HvdcpPhase::Qc2Force9v;
+                publish_marks(device, state, None);
+                if let Err(err) = force_9v(bus, state) {
+                    state.phase = HvdcpPhase::Failed;
+                    safe_force_5v(bus, state);
+                    publish_marks(device, state, Some(err));
+                    return Err(err);
+                }
+                match ensure_icl_at_least(bus, state, ICL_RAW_HVDCP2_1P5A) {
                     Ok(icl) => mark(device, "SuDcpIcl", u32::from(icl)),
                     Err(err) => mark(device, "SuDcpIcl", err.code() as u32),
+                }
+                let (vin_end, vin_peak) = wait_force9v_rise(read_vin);
+                mark(device, "SuDcp9vVin", u32::try_from(vin_end.max(0)).unwrap_or(0));
+                mark(
+                    device,
+                    "SuDcpPeakVin",
+                    u32::try_from(vin_peak.max(0)).unwrap_or(0),
+                );
+                // Решение — по УДЕРЖАНИЮ, а не по пику: `wait_force9v_rise`
+                // останавливается на первом же отсчёте выше ворот, а шина при
+                // этом может ходить 4,6 ↔ 8,2 В (живой замер 19.09 11:07:
+                // `SuDcp9vVin` = 8,224 В, а посадка через такт прочла ~4,8 В).
+                // Уровень считается установленным, только если 8,0 В держатся
+                // два чтения подряд.
+                let mut vin_after = read_vin();
+                let mut hold = 0_u32;
+                for _ in 0..4 {
+                    if vin_after >= SWITCHING_MIN_VIN_UV {
+                        hold = hold.saturating_add(1);
+                    } else {
+                        hold = 0;
+                    }
+                    if hold >= 2 {
+                        break;
+                    }
+                    sleep_ms(FORCE9V_POLL_MS);
+                    vin_after = read_vin();
+                }
+                mark(device, "SuDcpHoldN", hold);
+                // FORCE_9V — это **legacy-команда QC2**. QC3-блок отвечает на
+                // неё всплеском и возвращается к своему шагу continuous-режима;
+                // тот же MDY-11-EP держал 7,952 В тридцать секунд подряд на
+                // импульсах QC3 (замер 10:46). Поэтому неустоявшийся уровень
+                // ведём родным протоколом: база 5 В (`smblib_force_vbus_voltage
+                // (FORCE_5V_BIT)` в начале вендорского `raise_qc3_vbus_work`),
+                // затем шаги INC с чтением результата на каждом шаге.
+                if hold < 2 {
+                    mark(device, "SuDcpNoElevate", 1);
+                    safe_force_5v(bus, state);
+                    state.pulse_cnt = 0;
+                    let target_now = target_vbus_uv(vbat_uv) as i32;
+                    let mut inc = 0_u32;
+                    let mut vin_now = vin_after;
+                    while vin_now < target_now
+                        && inc < MAX_PULSE_CNT
+                        && state.pulse_cnt < MAX_PULSE_CNT
+                    {
+                        if pulse_inc(bus, state).is_err() {
+                            break;
+                        }
+                        inc = inc.saturating_add(1);
+                        vin_now = read_vin();
+                    }
+                    mark(device, "SuDcpPulseRaise", inc);
+                    mark(
+                        device,
+                        "SuDcpPulseVin",
+                        u32::try_from(vin_now.max(0)).unwrap_or(0),
+                    );
+                    if vin_now < FORCE9V_RISE_UV {
+                        // Блок не ответил и на импульсы: это не QC-адаптер,
+                        // откат в 5 В обход с вендорскими 2 А.
+                        safe_force_5v(bus, state);
+                        match ensure_icl_at_least(bus, state, ICL_RAW_DCP_2A) {
+                            Ok(icl) => mark(device, "SuDcpIcl", u32::from(icl)),
+                            Err(err) => mark(device, "SuDcpIcl", err.code() as u32),
+                        }
+                    } else {
+                        match ensure_icl_at_least(bus, state, ICL_RAW_HVDCP2_1P5A) {
+                            Ok(icl) => mark(device, "SuDcpIcl", u32::from(icl)),
+                            Err(err) => mark(device, "SuDcpIcl", err.code() as u32),
+                        }
+                    }
                 }
             }
         }
@@ -1493,6 +1690,12 @@ pub unsafe fn nudge_vin_into_window(
     dead_current: bool,
 ) -> u32 {
     if vin_uv <= 0 || vbat_uv == 0 {
+        return 0;
+    }
+    // Заложенный `FORCE_9V` идёт мимо полосы: QC2 отдаёт фиксированный уровень
+    // и continuous-режима не имеет, а импульс снял бы защёлку (см.
+    // `pulse_cmd_bit`). Решение о режиме принимает вызывающий по живому ADC.
+    if state.force9v_latched {
         return 0;
     }
     let top = trim_target_uv(vbat_uv);
