@@ -31,6 +31,7 @@ mod hvdcp;
 mod ioctl;
 mod spb;
 mod spb_abi;
+mod sysreq;
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -1915,6 +1916,15 @@ unsafe extern "C" fn evt_prepare_hardware(
         mark_device_value(device, "BattPwr", battery::last_power_state());
     }
 
+    // 4d. Держим систему в S0, пока устройство работает: экран гаснет по своему
+    //     таймауту, но Connected Standby не наступает (см. `sysreq`). Без этого
+    //     планшет умирал на idle через 4-12 минут (`Kernel-Power 41`,
+    //     `BugcheckCode=0`, `ConnectedStandbyInProgress=true`).
+    // SAFETY: prepare-hardware идёт на PASSIVE_LEVEL, FDO существует.
+    let req_st = unsafe { sysreq::acquire(device) };
+    mark_device_value(device, "SysReqSt", req_st as u32);
+    mark_device_value(device, "SysReqOk", u32::from(req_st >= 0));
+
     // 5. Запускаем телеметрию с периодом из реестра (one-shot + re-arm).
     arm_telemetry_timer();
     // Железо готово: с этого такта счётчик можно опрашивать. Флаг ставится
@@ -2065,6 +2075,8 @@ unsafe extern "C" fn evt_release_hardware(
     }
     // SAFETY: detach BattC before tearing down the FDO path.
     unsafe { battery::unload() };
+    // SAFETY: запрос питания наш и ещё не снят; снимаем вместе с устройством.
+    unsafe { sysreq::release() };
     // SAFETY: см. инварианты `DriverState`.
     let st = unsafe { state() };
     if let Some(pump) = st.pump.as_mut() {
@@ -2212,6 +2224,15 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
         }
         mark_device_value(device, "SocSrc", battery::last_soc_source());
         mark_device_value(device, "BattPct", battery::last_percent());
+        // Живое напряжение банки с чипа, а не отсчёт, снятый один раз при
+        // запуске устройства: прежняя запись жила только в prepare-hardware и в
+        // IOCTL, поэтому марка замирала на значении первого такта (живой замер
+        // 19.09 12:0x: `BattVbat` 4 010 мВ при живых 4 230 мВ) и портила разбор
+        // полосы переноса, который считается от `vbat`. Во время 2:1 отсчёт
+        // идёт по середине шины преобразователя (≈ Vin/2), а не по банке —
+        // заряд берётся из счётчика PM8150B (`BattPct`).
+        mark_device_value(device, "BattVbat", sample.vbat_uv / 1000);
+        mark_device_value(device, "BattPwr", battery::last_power_state());
         // Возраст последнего удачного чтения: по нему видно, что счётчик не
         // «залип», а опрашивается редко — раз в `GAUGE_POLL_MS`.
         let gauge_last = GAUGE_LAST_MS.load(Ordering::Acquire);
@@ -2262,6 +2283,35 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
     let ov_latched = status.fault1_sts & ln8000::regs::FAULT1_VBAT_OV != 0;
     let deliberate_iin_ua = pump.taper_setpoint_ua(sample.vbat_uv, sample.vbus_uv, ov_latched);
     let action = evaluate(&sample, &st.limits, applied_iin_ua, deliberate_iin_ua);
+    if !device.is_null() {
+        // Кто снял режим: без этих марок падение 2:1 → standby неотличимо от
+        // отказа чипа. `GuardAct`: 0 нет, 1 снижение тока, 2 возврат, 3 переход
+        // в 1:1, 4 стоп. `DieTempDc` — температура кристалла, по которой принято
+        // решение (`0xFFFFFFFF` = канал недостоверен).
+        mark_device_value(
+            device,
+            "GuardAct",
+            match action {
+                GuardAction::None => 0,
+                GuardAction::ReduceCurrent { .. } => 1,
+                GuardAction::RestoreCurrent { .. } => 2,
+                GuardAction::FallbackToBypass { .. } => 3,
+                GuardAction::Stop { .. } => 4,
+                // `GuardAction` помечен `#[non_exhaustive]`: новая ступень
+                // защиты должна быть видна в марке, а не молча давать ноль.
+                _ => 5,
+            },
+        );
+        mark_device_value(
+            device,
+            "DieTempDc",
+            if sample.die_temp_valid {
+                u32::try_from(sample.die_temp_dc).unwrap_or(u32::MAX)
+            } else {
+                u32::MAX
+            },
+        );
+    }
     if action.is_change() {
         apply_guard(
             pump,
@@ -2306,7 +2356,20 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
     // Выбор режима — по Vin И Vbat (cp_qc30: 2:1 только при Vin >= 2*Vbat + 250 мВ).
     // Повышенный Vin без запаса даёт None: обход 1:1 там запрещён, а standby-цикл
     // не крутим — состояние видно в `EngageState=4`.
-    let desired = charge_mode(vbus, vbat_uv);
+    // Работающий перенос не понижаем по просадке: под нагрузкой шина садится
+    // на 100–250 мВ, и живой замер даёт 8,176 В при банке 3,985 В, где
+    // `charge_mode` требует `2*Vbat + 250 мВ` = 8,22 В — то есть обход. Понижение
+    // по мгновенному отсчёту рвало работающий 2:1 каждые ~5 с (живой замер
+    // 19.09 11:28 на MDY-11-EP: mode 1→3→1 при 0,42 А, `ChargeAttemptN` +1 на
+    // каждый разрыв). Липкое решение держится на абсолютном поле 2:1 (8,0 В):
+    // просадка — это следствие нагрузки, а не потеря способности переносить.
+    let pump_alive = status.op_mode == OpMode::Switching
+        && sample.iin_ua > hvdcp::IIN_DEAD_FLOOR_UA;
+    let desired = if pump_alive && vbus_uv >= u32::try_from(SWITCHING_MIN_VIN_UV).unwrap_or(0) {
+        Some(OpMode::Switching)
+    } else {
+        charge_mode(vbus, vbat_uv)
+    };
     let mode_ok = matches!(
         (desired, status.op_mode),
         (Some(OpMode::Switching), OpMode::Switching)
@@ -2335,7 +2398,24 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
     // 39 мА, счётчик попыток стоял, потому что `(None, standby)` считается
     // согласованным состоянием.
     let elevated = vbus_uv >= u32::try_from(SWITCHING_MIN_VIN_UV).unwrap_or(0);
-    if vbat_uv > 0 && elevated {
+    // Шина выше 5 В — уже не «пятивольтовый» вход: обход 1:1 там греет разницу
+    // напряжений на чипе, а полоса переноса 2:1 всего на шаг QC3 выше. Прежнее
+    // условие (`elevated || dead_band`) требовало `desired = None`, но при 6–8 В
+    // `charge_mode` возвращает обход, и в полосу переноса шину не вёл никто:
+    // до ворот 2:1 не хватало одного шага.
+    //
+    // Живой замер 19.09 11:19 на MDY-11-EP: шина 7,888 В, `desired` = обход,
+    // 1:1 даёт 2,06 А при 6,75 В (банка 3,915 В — разница горит на чипе), и
+    // режим флапает 1↔2 каждые ~15 с: обход вне своего окна снимается, шина
+    // возвращается к 7,888 В, обход включается снова. 39 мА и `ChargeAttemptN`
+    // стояли — коррекция не запускалась ни разу.
+    let above_five = vbus_uv >= u32::try_from(hvdcp::FIVE_V_STAY_MAX_UV).unwrap_or(0);
+    let dead_band = desired.is_none() && above_five;
+    let bypass_below_gate = matches!(desired, Some(OpMode::Bypass)) && above_five;
+    // Уход из обхода ради подъёма шины: в этом такте решение о режиме
+    // пересчитывать нельзя, оно посчитано по старому Vin (см. ниже).
+    let mut left_bypass_for_walk = false;
+    if vbat_uv > 0 && (elevated || dead_band || bypass_below_gate) {
         // «Мёртвый» ток — это пол АЦП (39,1 мА), а не «мало»: у верха заряда
         // банка берёт 0,1–0,5 А, и по мгновенному отсчёту такие такты
         // выглядели мёртвыми. Поэтому требуется, чтобы и мгновенный отсчёт, и
@@ -2361,9 +2441,29 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
             } else {
                 WINDOW_STALL_MS
             };
-            if now.saturating_sub(st.last_window_nudge_ms) >= cooldown {
+            // Первый такт в повышенном обходе не ждёт выдержки: 1:1 на 6–8 В
+            // греет разницу напряжений на чипе, и каждый лишний такт там — это
+            // 10 с работы впустую (см. `bypass_below_gate`). Дальше — обычный
+            // темп: `window_stall_n` растёт на каждом срабатывании, так что
+            // шторм импульсов невозможен, даже если вывести из обхода не удалось.
+            let urgent = matches!(desired, Some(OpMode::Bypass))
+                && status.op_mode == OpMode::Bypass
+                && st.window_stall_n == 0;
+            if urgent || now.saturating_sub(st.last_window_nudge_ms) >= cooldown {
                 st.last_window_nudge_ms = now;
                 st.window_stall_n = st.window_stall_n.saturating_add(1);
+                // В 1:1 импульс INC поднимает вход прямо на банку: FET обхода
+                // замкнут, и шаг QC3 уходит не в шину, а в разницу напряжений
+                // на чипе. Поэтому сначала уводим чип в standby — тогда импульс
+                // меняет именно напряжение входа, а решение о режиме примет
+                // следующий такт по новому Vin.
+                if status.op_mode == OpMode::Bypass {
+                    let left = pump.standby().is_ok();
+                    left_bypass_for_walk = left;
+                    if !device.is_null() {
+                        mark_device_value(device, "WalkStandby", u32::from(left));
+                    }
+                }
                 // SAFETY: PASSIVE_LEVEL; сессия открыта, доступ сериализован
                 // таймером (см. комментарий у `state()`).
                 let sent = unsafe {
@@ -2397,10 +2497,13 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
         st.window_best_err_uv = u32::MAX;
         st.window_stall_n = 0;
     }
-    if mode_ok {
+    // Обход снят ради подъёма шины: `desired` посчитан по старому Vin, поэтому
+    // в этом такте режим не перерешаем — следующий такт (250 мс) прочтёт шину
+    // заново и выберет 2:1, если импульс довёл её до полосы переноса.
+    if mode_ok && !left_bypass_for_walk {
         st.last_charge_attempt_ms = monotonic_ms();
         st.last_attempt_vbus_uv = vbus_uv;
-    } else if desired.is_some() && !action.is_change() {
+    } else if desired.is_some() && !action.is_change() && !left_bypass_for_walk {
         let now = monotonic_ms();
         let cooled = now.saturating_sub(st.last_charge_attempt_ms) >= CHARGE_RETRY_MS;
         let changed = st.last_attempt_vbus_uv.abs_diff(vbus_uv) >= CHARGE_RETRY_DELTA_UV;
@@ -2551,6 +2654,13 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
     }
     if want_replug {
         mark_device_value(device, "HvdcpReplug", 1);
+        // Новый вход — старая защёлка `FORCE_9V` силы не имеет: блок мог быть
+        // заменён на QC3, для которого импульсы и есть способ подъёма, а
+        // `pulse_cmd_bit` под защёлкой их пропускает. Держать её через
+        // переподключение — значит запретить импульсный путь до перезапуска
+        // драйвера. Внутри одной сессии защёлку по-прежнему снимает только
+        // `safe_force_5v`: иначе первый же импульс уронил бы уровень QC2.
+        unsafe { state() }.hvdcp.force9v_latched = false;
         println!("ln8000-kmdf: HVDCP re-plug edge — renegotiate");
         let code = run_hvdcp_and_land(device);
         schedule_or_clear_superuser_retry(device, code);
@@ -2784,9 +2894,12 @@ fn run_hvdcp_and_land(device: WDFDEVICE) -> i32 {
             .ok()
             .map_or(vbat_uv, |v| u32::try_from(v.max(0)).unwrap_or(vbat_uv));
         let mut engage = charge_mode(vin, vbat_now);
-        if engage != Some(OpMode::Switching) && vin >= SWITCHING_MIN_VIN_UV {
-            // Вход заведомо повышен (не 5-вольтовая ветка), но 2:1 ещё не
-            // допускается: доводим шину до полосы переноса и перечитываем ADC.
+        if engage != Some(OpMode::Switching) && vin >= hvdcp::FIVE_V_STAY_MAX_UV {
+            // Вход повышен (не 5-вольтовая ветка), но 2:1 ещё не допускается:
+            // доводим шину до полосы переноса и перечитываем ADC. Порог —
+            // «выше 5 В», а не `SWITCHING_MIN_VIN_UV`: живой QC3-блок в
+            // continuous-режиме встаёт чуть НИЖЕ ворот 2:1 (замер 19.09: 7,97 В
+            // против пола 8,0 В), и последний шаг делает INC-импульс, а не отказ.
             // SAFETY: PASSIVE_LEVEL; may reopen SUPERUSER for INC pulses.
             let _ = unsafe {
                 hvdcp::nudge_vin_into_window(device, usbin_id, &mut st.hvdcp, vin, vbat_now, false)
