@@ -429,12 +429,22 @@ pub unsafe fn unload() {
 /// мгновенный отсчёт: на такте QC3-импульса или перехода режима Iin лежит на полу
 /// АЦП (39 мА), и без пика признак заряда гас бы на каждом импульсе. `now_ms` —
 /// монотонное время того же такта.
+///
+/// `input_readings_usable` — несёт ли такт вообще измерение входа. Ноль в этом
+/// телеметрическом отсчёте означает «нет отсчёта», а не «0 В»: отказ шины
+/// схлопывается в ноль на вызывающей стороне, а АЦП LN8000 уходит в
+/// автогибернацию через 4 с покоя и читается **успешно**, но с `0x00` во всех
+/// каналах (`encoding::vbat_reading_usable`). Такой такт не имеет права говорить
+/// «на входе 0 В, значит блока нет» и не старит удержание — кроме случая, когда
+/// железо само выставило `FAULT1` бит 4: тогда блок действительно отключён
+/// (`battery_policy::online_raw_with_evidence`).
 pub unsafe fn update_from_telemetry(
     vbat_uv: u32,
     vbus_uv: u32,
     iin_ua: u32,
     iin_peak_ua: u32,
     vac_unplug: bool,
+    input_readings_usable: bool,
     now_ms: u64,
 ) {
     let prev_power = unsafe { LAST_POWER_STATE };
@@ -445,8 +455,18 @@ pub unsafe fn update_from_telemetry(
     }
     // Счётчик достовернее любой оценки: пока он отвечает, напряжение банки в
     // расчёт не идёт вовсе.
-    let raw_online = battery_policy::online_raw(vbus_uv, vbat_uv, iin_ua, vac_unplug);
-    if vbat_uv > 0 && unsafe { SOC_SRC } != SOC_SRC_GAUGE && !raw_online {
+    //
+    // `None` — такт без отсчётов входа и без вердикта железа: удержание он не
+    // старит, поэтому и оценка по банке на нём не публикуется. «Не знаю» — не
+    // доказательство разряда, а `soc_percent(0)` на таком такте дал бы ноль.
+    let raw_online = battery_policy::online_raw_with_evidence(
+        vbus_uv,
+        vbat_uv,
+        iin_ua,
+        vac_unplug,
+        input_readings_usable,
+    );
+    if vbat_uv > 0 && unsafe { SOC_SRC } != SOC_SRC_GAUGE && matches!(raw_online, Some(false)) {
         unsafe {
             LAST_PCT = soc_percent(vbat_uv);
             SOC_SRC = SOC_SRC_VBAT;
@@ -455,7 +475,7 @@ pub unsafe fn update_from_telemetry(
     // Гистерезис считаем по «сырым» признакам такта, а в состояние пишем
     // удержанное значение: сырое снятие Vin/Iin живёт один такт, а tray не
     // должен перечитывать питание на каждый импульс QC3.
-    let online_hold = unsafe { ONLINE_HOLD }.update(raw_online, now_ms, ONLINE_HOLD_MS);
+    let online_hold = unsafe { ONLINE_HOLD }.update_evidence(raw_online, now_ms, ONLINE_HOLD_MS);
     let charging_hold = unsafe { CHARGING_HOLD }.update(
         charging_raw(online_hold.held, iin_ua, iin_peak_ua),
         now_ms,

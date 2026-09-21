@@ -2136,13 +2136,22 @@ unsafe extern "C" fn evt_prepare_hardware(
         let mut vbus = 0i32;
         let mut iin = 0i32;
         let mut vac_unplug = false;
+        // Годность отсчётов входа для решения о питании (см. такт телеметрии и
+        // `battery_policy::online_raw_with_evidence`).
+        let mut input_readings_usable = false;
         // First ADC right after HVDCP can return 0; retry — a zero sample must
         // not pin tray SoC at 0% (see battery::update_from_telemetry).
         for _ in 0..3 {
             if let Some(pump) = st.pump.as_mut() {
-                vbat = pump.read_adc(AdcChannel::Vbat).unwrap_or_default();
-                vbus = pump.read_adc(AdcChannel::Vin).unwrap_or_default();
+                let vbat_read = pump.read_adc(AdcChannel::Vbat);
+                let vbus_read = pump.read_adc(AdcChannel::Vin);
+                vbat = vbat_read.unwrap_or_default();
+                vbus = vbus_read.unwrap_or_default();
                 iin = pump.read_adc(AdcChannel::Iin).unwrap_or_default();
+                // Ноль канала — это «нет отсчёта», а не «0 В»: отказ шины даёт
+                // ноль, и уснувший АЦП читается успешно, но тоже нулём.
+                input_readings_usable =
+                    vbat_read.is_ok() && vbus_read.is_ok() && vbat > 0 && vbus > 0;
                 // Тот же аппаратный признак, что и в такте телеметрии: без него
                 // отражение `2 · VBAT` после отключения блока снова сошло бы за
                 // живой вход на этом пути публикации.
@@ -2163,6 +2172,7 @@ unsafe extern "C" fn evt_prepare_hardware(
                 st.max_iin_ua
                     .max(u32::try_from(iin.max(0)).unwrap_or(0)),
                 vac_unplug,
+                input_readings_usable,
                 monotonic_ms(),
             );
         }
@@ -2473,6 +2483,14 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
     };
     st.telemetry.push(sample);
 
+    // Годны ли отсчёты входа для решения о питании. Ноль здесь означает «нет
+    // отсчёта», а не «0 В»: отказ чтения схлопывается в ноль выше, а АЦП уходит
+    // в автогибернацию через ~4 с покоя и читается успешно, но с `0x00` во всех
+    // каналах (`encoding::vbat_reading_usable`). Без этого признака 4 с покоя
+    // насоса плюс 8 с окна `ONLINE_HOLD_MS` давали Windows переход AC→DC→AC при
+    // неподвижном кабеле — то есть сброс политики подсветки по Kernel-Power 105.
+    let input_readings_usable = sample.vbat_valid && vbus_read.is_ok() && sample.vbus_uv > 0;
+
     // SAFETY: BattC status notify is DISPATCH-safe; we run at PASSIVE.
     unsafe {
         battery::update_from_telemetry(
@@ -2481,6 +2499,7 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
             sample.iin_ua,
             st.max_iin_ua,
             vac_unplug,
+            input_readings_usable,
             sample.ts_ms,
         );
     }
@@ -2505,6 +2524,10 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
                 | (u32::from(iin_read.is_err()) << 2)
                 | (u32::from(vbus_read.is_err()) << 3),
         );
+        // Годность отсчётов входа для решения о питании — вход ветки
+        // `online_raw_with_evidence`: по метке видно, работал ли на такте
+        // обычный путь или «нет отсчёта, но железо говорит, что VBUS на месте».
+        mark_device_value(device, "InputUsable", u32::from(input_readings_usable));
         // Пик тока за окно наблюдения: пишем раз в IIN_WINDOW_MS и начинаем
         // новое окно, чтобы постфактум было видно, брал ли драйвер ток вообще.
         if sample.iin_ua > st.max_iin_ua {
@@ -3754,6 +3777,9 @@ unsafe fn handle_get_status(request: WDFREQUEST) {
                 status.iin_ua,
                 st.max_iin_ua,
                 status.fault1_sts & ln8000::regs::FAULT1_VAC_UNPLUG != 0,
+                // Годность отсчётов входа: тот же признак, что и в такте
+                // телеметрии, — ноль канала означает «нет отсчёта».
+                status.vbat_uv > 0 && status.vbus_uv > 0,
                 monotonic_ms(),
             );
         }

@@ -98,6 +98,24 @@ impl Hold {
             }
         }
     }
+
+    /// Applies one telemetry tick that may carry **no evidence at all**.
+    ///
+    /// [`online_raw_with_evidence`] returns `None` when the tick had no usable
+    /// input measurement *and* the hardware did not say VBUS was gone — a
+    /// hibernated ADC is not a cable pull. `None` leaves the hold exactly as it
+    /// was, so a run of such ticks can never expire it: neither [`Self::held`]
+    /// nor [`Self::last_true_ms`] moves, and the arming run is not advanced
+    /// either. `Some(raw)` behaves exactly like [`Self::update`].
+    #[must_use]
+    pub const fn update_evidence(self, evidence: Option<bool>, now_ms: u64, hold_ms: u64) -> Self {
+        match evidence {
+            Some(raw) => self.update(raw, now_ms, hold_ms),
+            // Такт без улик не двигает ни флаг, ни метку времени, ни серию
+            // взвода: «не знаю» — это не «нет блока».
+            None => self,
+        }
+    }
 }
 
 impl Default for Hold {
@@ -182,6 +200,58 @@ pub const fn online_raw(vbus_uv: u32, vbat_uv: u32, iin_ua: u32, vac_unplug: boo
         return false;
     }
     true
+}
+
+/// [`online_raw`] for one tick **together with that tick's authority to age the
+/// hold**.
+///
+/// A zero in this telemetry is not "0 V" — it is "no sample", and it arrives by
+/// two different routes:
+///
+/// * a bus read failure collapses to zero at the call site (`vbat_read
+///   .unwrap_or_default()` in the KMDF tick, `ln8000-kmdf/src/lib.rs:2441-2443`);
+/// * the LN8000 ADC auto-hibernates: init step 9 writes `ADC_CTRL` bits 5:7 =
+///   `AutoHibernate` with `Sec4` (`ln8000/src/driver.rs:497-508`), after which
+///   `ADC01..ADC09` read **successfully** but contain `0x00` in every channel
+///   (`encoding::vbat_reading_usable`, `ln8000/src/encoding.rs:279-293`).
+///
+/// Fed those zeros, the Vin chain in [`online_raw`] falls into `vbus_uv <
+/// VBUS_ONLINE_UV → false`, so every unreadable tick reads as "the adapter is
+/// gone" and ages the hold (`battery.rs` calls `Hold::update` on every tick with
+/// a fresh `now_ms`). Because `ONLINE_HOLD_MS` (8 s) is shorter than
+/// `CHARGING_HOLD_MS` (20 s), a pump-idle stretch longer than ~4 s of
+/// hibernation plus the 8 s window publishes AC → DC → AC to Windows while the
+/// brick never moved — the exact shape of a phantom power-source change.
+///
+/// So the tick's validity is part of the decision:
+///
+/// * `input_readings_usable` → `Some(online_raw(..))`: a real measurement, and
+///   the existing chain decides;
+/// * not usable and `vac_unplug` set → `Some(false)`: the hardware itself says
+///   VBUS is gone (`FAULT1` bit 4, read fresh from the chip in the same tick at
+///   `ln8000-kmdf/src/lib.rs:2453`), so the hold must age exactly as before;
+/// * not usable and `vac_unplug` clear → `None`: no measurement and no hardware
+///   verdict. The caller must **leave the hold untouched**
+///   ([`Hold::update_evidence`]) — an unreadable tick is not evidence of absence.
+///
+/// `vac_unplug` is deliberately trusted only in the "not usable" case: while a
+/// real `Vin`/`Iin` measurement exists, [`online_raw`] keeps its current
+/// precedence (current first, then the bit) and its behaviour is untouched.
+#[must_use]
+pub const fn online_raw_with_evidence(
+    vbus_uv: u32,
+    vbat_uv: u32,
+    iin_ua: u32,
+    vac_unplug: bool,
+    input_readings_usable: bool,
+) -> Option<bool> {
+    if input_readings_usable {
+        return Some(online_raw(vbus_uv, vbat_uv, iin_ua, vac_unplug));
+    }
+    if vac_unplug {
+        return Some(false);
+    }
+    None
 }
 
 #[cfg(test)]
@@ -382,5 +452,137 @@ mod tests {
         assert!(online_raw(5_000_000, 4_300_000, 0, false));
         // And exactly at the VBAT guard: 4.6 V against a 4.45 V pack is AC.
         assert!(online_raw(4_600_000, 4_300_000, 0, false));
+    }
+
+    // --- Годность отсчётов входа (гибернация АЦП / отказ шины) -------------
+    //
+    // Живой перечень из дампа 19.09 (`AdcValid = 1`): чип читается успешно, но
+    // все каналы — нули, потому что АЦП уснул. Пока такой такт считался
+    // измерением, `online_raw` отвечал «блока нет» и удержание `POWER_ON_LINE`
+    // старело на каждом такте (8 с — и трей отдаёт AC→DC→AC, хотя кабель не
+    // двигался).
+
+    /// Нечитаемый такт: все каналы нули, `FAULT1` бит 4 снят — вердикта нет.
+    const TICK_NO_READING_VBUS_PRESENT: Option<bool> =
+        online_raw_with_evidence(0, 0, 0, false, false);
+    /// Нечитаемый такт, но железо само сказало «VAC отключён».
+    const TICK_NO_READING_VBUS_GONE: Option<bool> = online_raw_with_evidence(0, 0, 0, true, false);
+    /// Читаемый такт настоящего 2:1 (живой замер: 9,088 В, 1,887 А).
+    const TICK_READING_ELEVATED: Option<bool> =
+        online_raw_with_evidence(9_088_000, 4_400_000, 1_887_000, false, true);
+
+    #[test]
+    fn unreadable_tick_carries_no_verdict_when_the_hardware_says_vbus_is_present() {
+        assert_eq!(
+            TICK_NO_READING_VBUS_PRESENT, None,
+            "нули без вердикта железа — «нет отсчёта», а не «нет блока»"
+        );
+        // Тот же такт, прочитанный как измерение, — это ровно прежний вердикт
+        // «блока нет»; именно его нельзя было пускать в удержание.
+        assert!(!online_raw(0, 0, 0, false));
+        // Зато вердикт железа принимается и без АЦП.
+        assert_eq!(TICK_NO_READING_VBUS_GONE, Some(false));
+        // Читаемый такт идёт полной цепочкой `online_raw`.
+        assert_eq!(TICK_READING_ELEVATED, Some(true));
+    }
+
+    #[test]
+    fn unreadable_run_while_hardware_says_vbus_present_never_clears_online() {
+        // 60 с нечитаемых тактов — впятеро длиннее `ONLINE_HOLD_MS`: если бы
+        // нули старили удержание, `POWER_ON_LINE` погас бы на 12-й секунде.
+        let armed_at = 250_u64;
+        let mut st = arm(true, ONLINE_HOLD_MS);
+        let mut now = armed_at;
+        while now < armed_at + 60_000 {
+            now += TICK_MS;
+            st = st.update_evidence(TICK_NO_READING_VBUS_PRESENT, now, ONLINE_HOLD_MS);
+        }
+        assert!(
+            st.held,
+            "60 с нечитаемых тактов при снятом бите VAC_UNPLUG не снимают POWER_ON_LINE"
+        );
+        assert_eq!(st.last_true_ms, armed_at, "метка улики не должна двигаться");
+        // Нагрузка теста: та же последовательность нулей, принятых за измерение
+        // (прежнее поведение), удержание снимает.
+        let mut as_before = arm(true, ONLINE_HOLD_MS);
+        let mut now = armed_at;
+        while now < armed_at + 9_000 {
+            now += TICK_MS;
+            as_before = as_before.update(online_raw(0, 0, 0, false), now, ONLINE_HOLD_MS);
+        }
+        assert!(
+            !as_before.held,
+            "нули, принятые за 0 В, снимают удержание — это прежний дефект"
+        );
+    }
+
+    #[test]
+    fn unreadable_run_cannot_arm_or_rearm_a_cleared_hold() {
+        // «Не знаю» не улика и в обратную сторону: серия нечитаемых тактов не
+        // взводит удержание, даже когда железо молчит о отключении.
+        let mut st = Hold::new();
+        let mut now = 0_u64;
+        while now < 30_000 {
+            now += TICK_MS;
+            st = st.update_evidence(TICK_NO_READING_VBUS_PRESENT, now, ONLINE_HOLD_MS);
+        }
+        assert!(
+            !st.held,
+            "нечитаемые такты сами по себе не взводят POWER_ON_LINE"
+        );
+        // Живая улика возвращает признак: первый такт — начало серии, второй
+        // взводит (HOLD_ARM_RUN).
+        let first = st.update_evidence(TICK_READING_ELEVATED, now, ONLINE_HOLD_MS);
+        assert!(!first.held, "одиночная улика не взводит удержание");
+        now += TICK_MS;
+        let armed = first.update_evidence(TICK_READING_ELEVATED, now, ONLINE_HOLD_MS);
+        assert!(armed.held, "устойчивая улика возвращает POWER_ON_LINE");
+        // ...и держится положенные 8 с, даже если АЦП снова уснул.
+        let armed_at = now;
+        let mut held = armed;
+        while now < armed_at + 7_750 {
+            now += TICK_MS;
+            held = held.update_evidence(TICK_NO_READING_VBUS_PRESENT, now, ONLINE_HOLD_MS);
+        }
+        assert!(held.held, "успевшая взвестись улика держит окно до конца");
+    }
+
+    #[test]
+    fn genuine_unplug_clears_online_through_both_paths() {
+        // Отключение, о котором сказало железо, кончает удержание и когда АЦП
+        // спит (нули + бит 4), и когда шина ещё читается (фантом 2·VBAT).
+        let armed_at = 250_u64;
+        let mut st = arm(true, ONLINE_HOLD_MS);
+        let mut now = armed_at;
+        while now < armed_at + 7_750 {
+            now += TICK_MS;
+            st = st.update_evidence(TICK_NO_READING_VBUS_GONE, now, ONLINE_HOLD_MS);
+        }
+        assert!(st.held, "до 8 с отключение держит окно, как и раньше");
+        while now < armed_at + 9_000 {
+            now += TICK_MS;
+            st = st.update_evidence(TICK_NO_READING_VBUS_GONE, now, ONLINE_HOLD_MS);
+        }
+        assert!(
+            !st.held,
+            "бит VAC_UNPLUG снимает POWER_ON_LINE даже без отсчётов"
+        );
+
+        // Читаемое отключение: фантомная шина и ток на полу АЦП — тот же вердикт
+        // обеими ветвями, новая не меняет поведение `online_raw`.
+        let readable = online_raw_with_evidence(8_800_000, 4_400_000, IIN_FLOOR_UA, true, true);
+        assert_eq!(readable, Some(false));
+        assert!(!online_raw(8_800_000, 4_400_000, IIN_FLOOR_UA, true));
+        let mut readable_run = arm(true, ONLINE_HOLD_MS);
+        let mut now = armed_at;
+        while now < armed_at + 9_000 {
+            now += TICK_MS;
+            readable_run = readable_run.update_evidence(
+                online_raw_with_evidence(8_800_000, 4_400_000, IIN_FLOOR_UA, true, true),
+                now,
+                ONLINE_HOLD_MS,
+            );
+        }
+        assert!(!readable_run.held, "читаемое отключение снимает удержание");
     }
 }
