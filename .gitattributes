@@ -1,0 +1,12 @@
+# Line endings: LF in the repository, LF in every working copy.
+#
+# `rustfmt.toml` asks for `newline_style = "Unix"`, so `cargo fmt --all --check` fails
+# on a tree with CRLF endings. This file was missing, and a Windows checkout applies
+# `core.autocrlf=true` by default: CI rewrote every source file on checkout and the
+# Formatting step went red on every push, while the same check passed on a developer
+# machine whose working copy happened to be LF already.
+#
+# `eol=lf` is stated explicitly rather than left to `text=auto`, so the result does not
+# depend on the git configuration of whoever clones this. An attribute overrides
+# `core.autocrlf`, which is the point.
+* text=auto eol=lf
