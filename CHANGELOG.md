@@ -3,6 +3,36 @@
 The format is based on [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/),
 and versions follow [SemVer](https://semver.org/lang/ru/).
 
+## [Unreleased]
+
+### Added
+
+* **An access policy on the device object.** Every control code is `FILE_ANY_ACCESS` and
+  the driver made no requestor check, so any process on the tablet could open
+  `\\.\nabu_ln8000` and drive the pump - `SET_MODE`, `SET_CHARGE` and `WRITE_REG` are
+  not diagnostics. The driver now applies `D:P(A;;GA;;;SY)(A;;GA;;;BA)` to the device
+  object (`crates/ln8000-kmdf/src/sddl.rs`), and the INF sets the same descriptor on the
+  device node, whose object is created by the ACPI bus driver and therefore does not
+  carry the driver's. The user-mode tools in `deploy/` now need an elevated session;
+  reading the telemetry marks does not, because those are registry values.
+* `docs/FINDINGS.md`: the six hardware findings this project produced, each with the code
+  or the measurement it rests on, plus the defects that are still open and what a reader
+  can do with the findings.
+
+### Changed
+
+* **The repository is licensed GPL-2.0-or-later** (was `MIT OR Apache-2.0`). A
+  provenance audit compared `crates/ln8000` against the GPL-2.0-or-later Android kernel
+  driver it was written from, function by function: the register map, the bit masks, the
+  numeric codes, the initialisation sequence and six encoding functions are a port of it,
+  and `crates/ln8000-kmdf` links that crate. The previous position, argued in
+  `reference/README.md`, was that the pinned reference file is never compiled and so does
+  not affect the licence of the code; that argument was wrong, because the same content
+  enters the build through `regs.rs` regardless. What came from where is written out in
+  [PROVENANCE.md](PROVENANCE.md).
+* One comment in `crates/core/src/apsd.rs` had been copied verbatim, misspelling
+  included, from `smb5-lib.c`; it is rewritten in this project's own words.
+
 ## [0.2.2] - 2026-09-17
 
 ### Fixed (after the first run on the tablet)

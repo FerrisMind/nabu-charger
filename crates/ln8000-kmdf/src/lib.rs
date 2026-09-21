@@ -32,6 +32,7 @@
 mod battery;
 mod hvdcp;
 mod ioctl;
+mod sddl;
 mod spb;
 mod spb_abi;
 mod sysreq;
@@ -1623,6 +1624,16 @@ unsafe extern "C" fn evt_device_add(
         mark_driver(driver, STAGE_DEVICE, status);
         return status;
     }
+
+    // Access policy. The control codes are `FILE_ANY_ACCESS` and the driver makes
+    // no requestor check, so the descriptor set here is the only thing standing
+    // between the pump and any process on the tablet. Not fatal: see `sddl`.
+    // SAFETY: `device_init` is still owned by the driver; the device is created below.
+    let sddl_status = unsafe { sddl::assign(device_init) };
+    if sddl_status < 0 {
+        println!("ln8000-kmdf: device access policy not applied: {sddl_status:#010X}");
+    }
+    mark_driver_value(driver, "SddlSt", sddl_status as u32);
 
     let mut device: WDFDEVICE = WDF_NO_HANDLE.cast();
     // We do not pass attributes: NULL is the stock WDF variant. KMDF rejects our

@@ -96,6 +96,14 @@ The control codes are computed in the script by the same formula as in
 `SET_LIMITS=0x22204C`, `SET_MODE=0x222050`, `GET_SESSIONS=0x222054`,
 `GET_SAMPLES=0x222058`.
 
+Every one of those commands opens the device, so every one of them needs an
+**elevated** session: the device object is restricted to `LocalSystem` and
+Administrators (`crates/ln8000-kmdf/src/sddl.rs`), and a filtered administrator token
+carries the Administrators group for deny-only, which does not match the descriptor. An
+unprivileged run fails to open the device. Reading the telemetry marks in
+`HKLM\SYSTEM\CurrentControlSet\Enum\...\Parameters` does not need elevation and is the
+way to watch the driver from a non-elevated shell.
+
 All seven codes are implemented in the driver:
 
 | Code | Input | Output |

@@ -50,10 +50,14 @@ StartType      = 3               ; SERVICE_DEMAND_START
 ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
 ServiceBinary  = %13%\kmdf.sys
 
-; ================= Device removal (rollback) =================
+; ================= access policy =================
 
 [NabuCharger_Device.NT$ARCH$.HW]
-; No device settings are required: the parameters come from the logic core.
+; No device parameters are required: they come from the logic core.
+; The device node's descriptor. The driver applies the same policy in code
+; (src/sddl.rs); this value covers the node, whose object is created by the bus
+; driver and therefore does not carry the driver's descriptor.
+HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GA;;;BA)"
 
 ; ================= Strings =================
 

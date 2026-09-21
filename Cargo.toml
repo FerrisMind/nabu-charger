@@ -2,14 +2,14 @@
 resolver = "3"
 members = ["crates/core", "crates/host", "crates/cli", "crates/ln8000", "crates/spb"]
 # The kernel-mode driver is attached separately: it needs the WDK and cargo-wdk,
-# which are not available in the regular CI environment. See crates/kmdf/README.md
+# which are not available in the regular CI environment. See docs/HANDOVER.md
 exclude = ["crates/kmdf"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-license = "MIT OR Apache-2.0"
+license = "GPL-2.0-or-later"
 repository = "https://github.com/FerrisMind/nabu-charger"
 publish = false
 

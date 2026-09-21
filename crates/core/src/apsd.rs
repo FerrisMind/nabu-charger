@@ -148,7 +148,8 @@ impl AdapterType {
                     Self::Hvdcp3
                 }
             }
-            // «since its a qc_charger, either return HVDCP3 or HVDCP2»
+            // The QC flag is set but the pattern is neither HVDCP3.5 nor HVDCP3,
+            // so what is attached is a Quick Charge 2 adapter.
             _ => Self::Hvdcp2,
         };
         Ok(resolved)

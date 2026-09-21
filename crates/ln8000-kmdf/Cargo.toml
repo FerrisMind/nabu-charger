@@ -4,7 +4,7 @@ description = "LN8000 charge pump KMDF driver for Xiaomi Pad 5: PEIC node (QCOM0
 version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
-license = "MIT OR Apache-2.0"
+license = "GPL-2.0-or-later"
 publish = false
 
 # The crate is excluded from the workspace: the build needs the WDK, LLVM/clang

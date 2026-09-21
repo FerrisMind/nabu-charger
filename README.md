@@ -14,6 +14,11 @@ charge never starts.
 This driver closes exactly that gap: it reads the detection result and applies the
 current policy.
 
+The reusable part of the work is not the driver but what was learned about the
+hardware: [docs/FINDINGS.md](docs/FINDINGS.md) collects six findings about charging on
+this platform, each with the code or the measurement it rests on. Start there if you are
+porting Windows to a nabu-class tablet rather than using this driver.
+
 ## Layout
 
 | Crate | What it is | Checks |
@@ -166,7 +171,14 @@ Installing and diagnosing the LN8000 - [docs/DEPLOY-LN8000.md](docs/DEPLOY-LN800
 as UTF-8 with a BOM, because PowerShell 5.1 otherwise decodes it as ANSI and
 mis-parses the quoting.
 
-## Licence
+## Licence and access policy
 
-Dual: MIT or Apache-2.0, at your option. See [LICENSE-MIT](LICENSE-MIT) and
-[LICENSE-APACHE](LICENSE-APACHE).
+**Licence: GPL-2.0-or-later** ([LICENSE](LICENSE)). The LN8000 logic is a port of the
+GPL-2.0-or-later Android kernel driver for the same chip, so this repository cannot be
+MIT/Apache. What came from where is written out in [PROVENANCE.md](PROVENANCE.md).
+
+**Access policy: the pump is open to `LocalSystem` and Administrators only.** The driver
+sets that descriptor on the device object and the INF sets the same one on the device
+node, because every control code is `FILE_ANY_ACCESS` and the driver makes no requestor
+check. The tools in `deploy/` therefore have to run elevated; reading the telemetry marks
+does not, because those are registry values.

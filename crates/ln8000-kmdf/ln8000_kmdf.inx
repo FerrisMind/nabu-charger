@@ -64,11 +64,18 @@ StartType      = 3               ; SERVICE_DEMAND_START
 ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
 ServiceBinary  = %13%\ln8000_kmdf.sys
 
-; ================= parameters (profiles) =================
-; Defaults only; override in the registry without rebuilding the driver
-; (see docs/DEPLOY-LN8000.md, "profiles").
+; ================= access policy and parameters (profiles) =================
+; The device node's own descriptor. The driver applies the same policy in code
+; (src/sddl.rs), which covers the symbolic link \\.\nabu_ln8000; this value
+; covers the node, whose object is created by the ACPI bus driver and therefore
+; does not carry the driver's descriptor. The device interface resolves to that
+; object, so both are needed. GENERIC_ALL to LocalSystem and Administrators.
+;
+; The parameters below are defaults only; override them in the registry without
+; rebuilding the driver (see docs/DEPLOY-LN8000.md, "profiles").
 
 [Ln8000_Device.NT$ARCH$.HW]
+HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GA;;;BA)"
 HKR, Parameters, IinLimitUa,      %REG_DWORD%, 2000000
 ; FFC fv-max (qcom,fv-max-uv, dtbo-03) = 4.47 V; non-FFC (qcom,non-fcc-fv-max-uv)
 ; = 4.45 V is the guard taper threshold. 4.42 V is only the QC3 loop limit.

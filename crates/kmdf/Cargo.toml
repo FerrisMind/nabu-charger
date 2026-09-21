@@ -4,7 +4,7 @@ description = "Kernel-mode driver (KMDF) for charging the Xiaomi Pad 5: APSD rea
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-license = "MIT OR Apache-2.0"
+license = "GPL-2.0-or-later"
 publish = false
 
 # The crate is excluded from the workspace: the build requires the WDK,

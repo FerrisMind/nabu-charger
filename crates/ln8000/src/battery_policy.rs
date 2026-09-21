@@ -209,7 +209,7 @@ pub const fn online_raw(vbus_uv: u32, vbat_uv: u32, iin_ua: u32, vac_unplug: boo
 /// two different routes:
 ///
 /// * a bus read failure collapses to zero at the call site (`vbat_read
-///   .unwrap_or_default()` in the KMDF tick, `ln8000-kmdf/src/lib.rs:2441-2443`);
+///   .unwrap_or_default()` in the KMDF tick, `ln8000-kmdf/src/lib.rs:2511-2514`);
 /// * the LN8000 ADC auto-hibernates: init step 9 writes `ADC_CTRL` bits 5:7 =
 ///   `AutoHibernate` with `Sec4` (`ln8000/src/driver.rs:497-508`), after which
 ///   `ADC01..ADC09` read **successfully** but contain `0x00` in every channel
@@ -229,7 +229,7 @@ pub const fn online_raw(vbus_uv: u32, vbat_uv: u32, iin_ua: u32, vac_unplug: boo
 ///   the existing chain decides;
 /// * not usable and `vac_unplug` set → `Some(false)`: the hardware itself says
 ///   VBUS is gone (`FAULT1` bit 4, read fresh from the chip in the same tick at
-///   `ln8000-kmdf/src/lib.rs:2453`), so the hold must age exactly as before;
+///   `ln8000-kmdf/src/lib.rs:2524`), so the hold must age exactly as before;
 /// * not usable and `vac_unplug` clear → `None`: no measurement and no hardware
 ///   verdict. The caller must **leave the hold untouched**
 ///   ([`Hold::update_evidence`]) — an unreadable tick is not evidence of absence.

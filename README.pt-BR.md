@@ -17,6 +17,11 @@ nunca sobe e a carga não começa.
 O driver fecha exatamente essa lacuna: lê o resultado da detecção e aplica a
 política de corrente.
 
+A parte reutilizável deste trabalho não é o driver, e sim o que se descobriu sobre o
+hardware: [docs/FINDINGS.md](docs/FINDINGS.md) reúne seis achados sobre o carregamento
+nesta plataforma, cada um com o código ou a medição em que se apoia. Comece por ali se
+você estiver portando o Windows para um tablet da classe nabu, e não usando este driver.
+
 ## Estrutura
 
 | Crate | O que é | Verificação |
@@ -173,7 +178,15 @@ Instalação e diagnóstico do LN8000 — [docs/DEPLOY-LN8000.md](docs/DEPLOY-LN
 UTF-8 com BOM, porque o PowerShell 5.1, caso contrário, o decodifica como ANSI e
 quebra a análise das aspas.
 
-## Licença
+## Licença e política de acesso
 
-Dupla: MIT ou Apache-2.0, à sua escolha. Veja [LICENSE-MIT](LICENSE-MIT) e
-[LICENSE-APACHE](LICENSE-APACHE).
+**Licença: GPL-2.0-or-later** ([LICENSE](LICENSE)). A lógica do LN8000 é um porte do
+driver GPL-2.0-or-later do kernel Android para o mesmo chip, então este repositório não
+pode ser MIT/Apache. A origem de cada parte está em [PROVENANCE.md](PROVENANCE.md).
+
+**Política de acesso: a bomba de carga é acessível apenas a `LocalSystem` e
+administradores.** O driver aplica esse descritor ao objeto de dispositivo e o INF aplica
+o mesmo ao nó do dispositivo, porque todos os códigos de controle são `FILE_ANY_ACCESS` e
+o driver não verifica quem está chamando. Por isso os scripts em `deploy/` precisam de
+privilégio elevado; ler as marcas de telemetria não precisa, pois são valores de
+registro.

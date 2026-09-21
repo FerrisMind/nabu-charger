@@ -24,6 +24,7 @@
 #![allow(clippy::missing_safety_doc)]
 
 mod ioctl;
+mod sddl;
 mod spmi;
 
 extern crate wdk_panic;
@@ -190,6 +191,14 @@ unsafe extern "C" fn evt_device_add(
         ..unsafe { core::mem::zeroed() }
     };
     attributes.Size = size_of_ulong::<WDF_OBJECT_ATTRIBUTES>();
+
+    // Access policy: the control codes are `FILE_ANY_ACCESS` and the driver makes
+    // no requestor check, so this descriptor is the only gate. See `sddl`.
+    // SAFETY: `device_init` is still owned by the driver; the device is created below.
+    let sddl_status = unsafe { sddl::assign(device_init) };
+    if sddl_status < 0 {
+        println!("nabu-charger: device access policy not applied: {sddl_status:#010X}");
+    }
 
     let mut device: WDFDEVICE = WDF_NO_HANDLE.cast();
     // SAFETY: `device_init` is provided by WDF; the attributes are filled in.
