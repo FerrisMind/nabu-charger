@@ -1,50 +1,50 @@
-//! Мок-транспорт с журналом транзакций.
+//! Mock transport with a transaction log.
 //!
-//! Отличается от [`charger_core::testkit::ScriptedMockTransport`] тем, что
-//! живёт в `std` и ведёт полный список обращений: удобно для интеграционных
-//! тестов и для демонстраций из командной строки.
+//! Differs from [`charger_core::testkit::ScriptedMockTransport`] in that it
+//! lives in `std` and keeps a full list of accesses: handy for integration
+//! tests and for command-line demos.
 
 use charger_core::testkit::{Fault, ScriptedMockTransport};
 use charger_core::{AdapterType, ChargerTransport, TransportError, TransportErrorKind, regs};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
-/// Одно обращение к устройству.
+/// One access to the device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transaction {
-    /// Чтение регистра.
+    /// Register read.
     Read {
-        /// Адрес.
+        /// Address.
         addr: u16,
-        /// Значение.
+        /// Value.
         value: u8,
     },
-    /// Запись регистра.
+    /// Register write.
     Write {
-        /// Адрес.
+        /// Address.
         addr: u16,
-        /// Значение.
+        /// Value.
         value: u8,
     },
-    /// Неудачное чтение.
+    /// Failed read.
     ReadFailed {
-        /// Адрес.
+        /// Address.
         addr: u16,
-        /// Категория ошибки.
+        /// Error kind.
         kind: TransportErrorKind,
     },
-    /// Неудачная запись.
+    /// Failed write.
     WriteFailed {
-        /// Адрес.
+        /// Address.
         addr: u16,
-        /// Категория ошибки.
+        /// Error kind.
         kind: TransportErrorKind,
     },
-    /// Сброс канала.
+    /// Channel reset.
     Reset,
 }
 
-/// Мок-транспорт: модель регистров плюс запись всех обращений.
+/// Mock transport: a register model plus a log of all accesses.
 #[derive(Debug)]
 pub struct MockTransport {
     inner: ScriptedMockTransport,
@@ -54,19 +54,19 @@ pub struct MockTransport {
 }
 
 impl MockTransport {
-    /// Порт без питания.
+    /// Port with no power.
     #[must_use]
     pub fn detached() -> Self {
         Self::wrap(ScriptedMockTransport::detached())
     }
 
-    /// Стандартный порт USB.
+    /// Standard USB port.
     #[must_use]
     pub fn sdp() -> Self {
         Self::wrap(ScriptedMockTransport::sdp())
     }
 
-    /// Порт зарядки BC1.2.
+    /// BC1.2 charging port.
     #[must_use]
     pub fn dcp() -> Self {
         Self::wrap(ScriptedMockTransport::dcp())
@@ -90,13 +90,13 @@ impl MockTransport {
         Self::wrap(ScriptedMockTransport::hvdcp3p5())
     }
 
-    /// Произвольный адаптер.
+    /// Arbitrary adapter.
     #[must_use]
     pub fn for_adapter(adapter: AdapterType) -> Self {
         Self::wrap(ScriptedMockTransport::for_adapter(adapter))
     }
 
-    /// Устройство с неизвестным образцом детекции (проверка ошибочного пути).
+    /// Device with an unknown detection pattern (error path check).
     #[must_use]
     pub fn unknown_pattern() -> Self {
         Self::wrap(ScriptedMockTransport::unknown_pattern())
@@ -111,40 +111,40 @@ impl MockTransport {
         }
     }
 
-    /// Подменяет адаптер на лету (имитация переподключения).
+    /// Swaps the adapter on the fly (simulates a reconnect).
     pub fn set_adapter(&mut self, adapter: AdapterType) {
         self.inner.set_adapter(adapter);
     }
 
-    /// Задаёт значение регистра модели.
+    /// Sets the value of a model register.
     pub fn set_reg(&mut self, addr: u16, value: u8) {
         self.inner.set_reg(addr, value);
     }
 
-    /// Вносит сбой, который сработает на следующей подходящей операции.
+    /// Injects a fault that will fire on the next matching operation.
     pub fn push_fault(&mut self, fault: Fault) {
         self.faults.borrow_mut().push(fault);
         self.inner.push_fault(fault);
     }
 
-    /// Делает ближайшие `times` сбросов неудачными.
+    /// Makes the next `times` resets fail.
     pub fn fail_next_resets(&mut self, times: u8) {
         *self.reset_fails.borrow_mut() = times;
     }
 
-    /// Полный список обращений.
+    /// The full list of accesses.
     #[must_use]
     pub fn transactions(&self) -> Vec<Transaction> {
         self.log.borrow().clone()
     }
 
-    /// Сколько раз канал сбрасывали.
+    /// How many times the channel was reset.
     #[must_use]
     pub fn reset_count(&self) -> u32 {
         self.inner.reset_count()
     }
 
-    /// Сколько было записей регистров.
+    /// How many register writes there were.
     #[must_use]
     pub fn write_count(&self) -> usize {
         self.log
@@ -154,7 +154,7 @@ impl MockTransport {
             .count()
     }
 
-    /// Последняя запись в указанный регистр.
+    /// The last write to the given register.
     #[must_use]
     pub fn last_write(&self, addr: u16) -> Option<u8> {
         self.log
@@ -167,7 +167,7 @@ impl MockTransport {
             })
     }
 
-    /// Значение регистра модели.
+    /// Value of a model register.
     #[must_use]
     pub fn reg(&self, addr: u16) -> u8 {
         self.inner.reg(addr)
@@ -216,9 +216,7 @@ impl ChargerTransport for MockTransport {
         let mut fails = self.reset_fails.borrow_mut();
         if *fails > 0 {
             *fails = fails.saturating_sub(1);
-            return Err(TransportError::disconnected(
-                "сброс канала не удался (стенд)",
-            ));
+            return Err(TransportError::disconnected("channel reset failed (bench)"));
         }
         let _ = self.inner.reset();
         Ok(())
@@ -229,7 +227,7 @@ impl ChargerTransport for MockTransport {
     }
 }
 
-/// Карта регистров устройства: удобно для проверок в тестах.
+/// Device register map: handy for checks in tests.
 #[must_use]
 pub fn smb_register_map() -> BTreeMap<u16, &'static str> {
     BTreeMap::from([

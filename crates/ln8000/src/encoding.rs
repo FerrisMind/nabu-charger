@@ -1,27 +1,27 @@
-//! Кодирование и декодирование значений LN8000.
+//! Encoding and decoding of LN8000 values.
 //!
-//! Повторяет функции драйвера `ln8000_charger.c`, чтобы под Windows значения
-//! кодировались так же, как под Android.
+//! Repeats the functions of the `ln8000_charger.c` driver so that under Windows
+//! values are encoded the same way as under Android.
 
 use crate::error::PumpError;
 use crate::regs;
 
-/// Рабочий режим charge pump.
+/// Charge pump operating mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum OpMode {
-    /// Состояние не определено.
+    /// State is undefined.
     Unknown,
-    /// Ожидание: ключи выключены, ток не идёт.
+    /// Idle: switches off, no current flows.
     Standby,
-    /// Режим 1:1 — вход идёт на батарею напрямую (5 В).
+    /// 1:1 mode - the input goes straight to the battery (5 V).
     Bypass,
-    /// Режим 2:1 — понижающий преобразователь (9 В → 4.5 В).
+    /// 2:1 mode - step-down converter (9 V → 4.5 V).
     Switching,
 }
 
 impl OpMode {
-    /// Код режима, как в `enum ln8000_opmode_` из драйвера.
+    /// Mode code, as in `enum ln8000_opmode_` from the driver.
     #[must_use]
     pub const fn code(self) -> u8 {
         match self {
@@ -32,7 +32,7 @@ impl OpMode {
         }
     }
 
-    /// Имя для журнала.
+    /// Name for the journal.
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
@@ -43,7 +43,7 @@ impl OpMode {
         }
     }
 
-    /// Разбирает режим по значению регистра `SYS_STS`.
+    /// Parses the mode from the `SYS_STS` register value.
     #[must_use]
     pub const fn from_sys_sts(sys_sts: u8) -> Self {
         if sys_sts & (regs::SYS_STS_SHUTDOWN | regs::SYS_STS_STANDBY) != 0 {
@@ -57,13 +57,13 @@ impl OpMode {
         }
     }
 
-    /// Значение порции `SYS_CTRL` для переключения в этот режим.
+    /// The `SYS_CTRL` portion value for switching to this mode.
     ///
-    /// Маска всегда одна: `STANDBY_EN | EN_1TO1` (см. `ln8000_change_opmode`).
+    /// The mask is always the same: `STANDBY_EN | EN_1TO1` (see `ln8000_change_opmode`).
     ///
     /// # Errors
     ///
-    /// [`PumpError::OutOfRange`], если режим [`OpMode::Unknown`] переключить нельзя.
+    /// [`PumpError::OutOfRange`] if [`OpMode::Unknown`] cannot be switched to.
     pub const fn sys_ctrl_bits(self) -> Result<u8, PumpError> {
         match self {
             Self::Standby => Ok(regs::SYS_CTRL_STANDBY_EN),
@@ -76,7 +76,7 @@ impl OpMode {
         }
     }
 
-    /// Маска битов `SYS_CTRL`, которыми управляет режим.
+    /// Mask of the `SYS_CTRL` bits this mode controls.
     #[must_use]
     pub const fn sys_ctrl_mask() -> u8 {
         regs::SYS_CTRL_STANDBY_EN | regs::SYS_CTRL_EN_1TO1
@@ -170,7 +170,10 @@ pub const fn vin_in_switching_window(vin_uv: i32, vbat_uv: u32) -> bool {
     if vin_uv <= 0 || vbat_uv == 0 {
         return false;
     }
-    vin_uv >= window_floor_uv(vbat_uv) as i32 && vin_uv <= window_top_uv(vbat_uv) as i32
+    // The guard above proved `vin_uv > 0`, so the magnitude is the same value and the
+    // band can be compared in unsigned space without a wrapping cast.
+    let vin = vin_uv.unsigned_abs();
+    vin >= window_floor_uv(vbat_uv) && vin <= window_top_uv(vbat_uv)
 }
 
 /// Non-negative Vin in µV for unsigned comparisons (`0` for absent / negative).
@@ -239,23 +242,23 @@ pub const fn soft_float_for_vbat(profile_float_uv: u32, vbat_uv: u32) -> u32 {
 /// (~4470 mV). Treat that as converter ceiling, not cell float.
 pub const VBAT_VIN_HALF_SLACK_UV: u32 = 80_000;
 
-/// Насколько должен измениться Vin, чтобы POR-бюджет считался новым входом.
+/// How much Vin must change for the POR budget to count as a new input.
 ///
-/// Запас в 200 мВ выбран по живому разбросу: один и тот же блок на 5 В даёт
-/// 4,98–5,05 В (в пределах запаса, POR не повторяется), а переход 5 В → 9 В
-/// (QC3/PD) меняет вход на вольты и открывает новый бюджет.
+/// The 200 mV margin is chosen from the live spread: the same 5 V adapter gives
+/// 4.98-5.05 V (within the margin, so POR is not repeated), while a 5 V → 9 V step
+/// (QC3/PD) changes the input by volts and opens a new budget.
 pub const POR_VIN_TOLERANCE_UV: u32 = 200_000;
 
 /// True when `Vin` is the converter's own `2 · VBAT` reflection, not an adapter.
 ///
-/// Отличие от [`vbat_tracks_converter_rail`] — нет порога 8 В: отражение
-/// масштабируется вместе с банкой, и на разряженной банке (2,1–4,0 В) попадает
-/// в 4,2–8,0 В, то есть ровно в ту полосу, где `vbat_tracks_converter_rail`
-/// молчит, а [`crate::battery_policy::online_raw`] решает судьбу `POWER_ON_LINE`.
+/// The difference from [`vbat_tracks_converter_rail`]: no 8 V threshold - the
+/// reflection scales with the cell, and on a discharged cell (2.1-4.0 V) it
+/// lands in 4.2-8.0 V, exactly the band where `vbat_tracks_converter_rail` stays
+/// silent while [`crate::battery_policy::online_raw`] decides `POWER_ON_LINE`.
 ///
-/// Живой случай 19.09: кабель отключён, `Vin = 8 800 000`, `VBAT = 4 400 000`
-/// (ровно вдвое), ток на полу АЦП 39 мА, режим Standby — и трей показывал
-/// «подключён», пока пак разряжался.
+/// Live case 19.09: cable unplugged, `Vin = 8 800 000`, `VBAT = 4 400 000`
+/// (exactly half), current at the ADC floor of 39 mA, Standby mode - and yet the
+/// tray reported "connected" while the pack was discharging.
 #[must_use]
 pub const fn vin_is_doubled_vbat(vbat_uv: u32, vin_uv: u32) -> bool {
     if vbat_uv == 0 {
@@ -276,17 +279,17 @@ pub const fn vbat_tracks_converter_rail(vbat_uv: u32, vin_uv: u32) -> bool {
     vin_is_doubled_vbat(vbat_uv, vin_uv)
 }
 
-/// Пригоден ли отсчёт VBAT к решениям о токе.
+/// Whether a VBAT sample is fit for current decisions.
 ///
-/// Ноль вольт на живой банке невозможен, а АЦП LN8000 уходит в автогибернацию
-/// через 4 с покоя: шаг 9 инициализации пишет `ADC_CTRL` биты 5:7 = `AutoHibernate`
-/// с задержкой `Sec4`, после чего регистры `ADC01..ADC09` читаются **успешно**, но
-/// содержат `0x00` во всех каналах. Поэтому `is_ok()` на таком такте означает
-/// «регистр ответил», а не «канал жив», и ноль обязан считаться недостоверным.
+/// Zero volts on a live cell is impossible, but the LN8000 ADC enters auto-
+/// hibernation after 4 s of idle: initialisation step 9 writes `ADC_CTRL` bits
+/// 5:7 = `AutoHibernate` with the `Sec4` delay, after which the `ADC01..ADC09`
+/// registers read **successfully** but hold `0x00` in every channel. Hence
+/// `is_ok()` means "the register answered", not "the channel is alive", and zero is invalid.
 ///
-/// Живой замер 19.09 (кабель отключён, `ADC_CTRL = 0x1C` = AutoHibernate):
-/// `vbat = 0`, `AdcValid = 0` — то есть марка рапортовала «все каналы прочитаны»,
-/// а сторож [`crate::guard`] принимал решения о токе по несуществующему напряжению.
+/// Live measurement 19.09 (cable unplugged, `ADC_CTRL = 0x1C` = AutoHibernate):
+/// `vbat = 0`, `AdcValid = 0` - that is, the mark reported "all channels read"
+/// while the [`crate::guard`] watchdog made current decisions from a non-existent voltage.
 #[must_use]
 pub const fn vbat_reading_usable(read_ok: bool, vbat_uv: u32) -> bool {
     read_ok && vbat_uv > 0
@@ -344,35 +347,35 @@ pub const fn charge_mode(vin_uv: i32, vbat_uv: u32) -> Option<OpMode> {
     }
 }
 
-/// Разрешён ли 1:1 (bypass) при таком входе — единственный гейт для `EN_1TO1`.
+/// Whether 1:1 (bypass) is allowed at this input - the only gate for `EN_1TO1`.
 ///
-/// `EN_1TO1` соединяет вход с батареей напрямую, поэтому режим допустим только в
-/// окне обхода (`CHARGE_MIN_VIN_UV … SWITCHING_MIN_VIN_UV`). На повышенном Vin
-/// (QC/PD) он запрещён: 8 В и выше на банке — это перенапряжение.
+/// `EN_1TO1` connects the input straight to the battery, so the mode is allowed
+/// only in the bypass window (`CHARGE_MIN_VIN_UV … SWITCHING_MIN_VIN_UV`). At a
+/// raised Vin (QC/PD) it is forbidden: 8 V and above on the cell is overvoltage.
 ///
-/// Предикат общий для всех путей, которые могут включить 1:1: выбор режима в
-/// [`charge_mode`], термозащита, IOCTL `SET_MODE` и восстановление после
+/// The predicate is common to every path that can enable 1:1: mode selection in
+/// [`charge_mode`], thermal protection, the `SET_MODE` IOCTL and recovery after
 /// `soft_reset`.
 #[must_use]
 pub const fn bypass_allowed_by_vin(vin_uv: i32, vbat_uv: u32) -> bool {
     matches!(charge_mode(vin_uv, vbat_uv), Some(OpMode::Bypass))
 }
 
-/// Длительность периода сторожевого таймера.
+/// Watchdog timer period duration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WatchdogPeriod {
-    /// 5 секунд.
+    /// 5 seconds.
     Sec5,
-    /// 10 секунд.
+    /// 10 seconds.
     Sec10,
-    /// 20 секунд.
+    /// 20 seconds.
     Sec20,
-    /// 40 секунд.
+    /// 40 seconds.
     Sec40,
 }
 
 impl WatchdogPeriod {
-    /// Код периода для битов 5:6 регистра `TIMER_CTRL`.
+    /// Period code for bits 5:6 of the `TIMER_CTRL` register.
     #[must_use]
     pub const fn code(self) -> u8 {
         match self {
@@ -383,7 +386,7 @@ impl WatchdogPeriod {
         }
     }
 
-    /// Период в секундах.
+    /// Period in seconds.
     #[must_use]
     pub const fn seconds(self) -> u8 {
         match self {
@@ -395,21 +398,21 @@ impl WatchdogPeriod {
     }
 }
 
-/// Задержка перехода АЦП в гибернацию.
+/// ADC hibernation entry delay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdcHibernateDelay {
-    /// 500 мс.
+    /// 500 ms.
     Ms500,
-    /// 1 секунда.
+    /// 1 second.
     Sec1,
-    /// 2 секунды.
+    /// 2 seconds.
     Sec2,
-    /// 4 секунды.
+    /// 4 seconds.
     Sec4,
 }
 
 impl AdcHibernateDelay {
-    /// Код для битов 3:4 регистра `ADC_CTRL`.
+    /// Code for bits 3:4 of the `ADC_CTRL` register.
     #[must_use]
     pub const fn code(self) -> u8 {
         match self {
@@ -421,23 +424,23 @@ impl AdcHibernateDelay {
     }
 }
 
-/// Режим работы АЦП.
+/// ADC operating mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdcMode {
-    /// Автоматически в гибернацию.
+    /// Automatic hibernation.
     AutoHibernate,
-    /// Автоматически в shutdown.
+    /// Automatic shutdown.
     AutoShutdown,
-    /// Принудительно выключен.
+    /// Forced off.
     Shutdown,
-    /// Принудительно в гибернации.
+    /// Forced hibernation.
     Hibernate,
-    /// Обычный режим измерений.
+    /// Normal measurement mode.
     Normal,
 }
 
 impl AdcMode {
-    /// Код для битов 5:7 регистра `ADC_CTRL`.
+    /// Code for bits 5:7 of the `ADC_CTRL` register.
     #[must_use]
     pub const fn code(self) -> u8 {
         match self {
@@ -450,18 +453,18 @@ impl AdcMode {
     }
 }
 
-/// Верхняя граница кодирования входного тока (7 бит).
+/// Upper bound of the input current encoding (7 bits).
 pub const IIN_CODE_MAX: u8 = 0x7F;
 
-/// Кодирует лимит входного тока.
+/// Encodes the input current limit.
 ///
-/// Код = `ток / 50 мА` (см. `ln8000_set_iin_limit`). Как и в драйвере,
-/// значение ограничивается сверху полем регистра; снизу эффективный минимум —
-/// [`regs::IIN_MIN_UA`].
+/// Code = `current / 50 mA` (see `ln8000_set_iin_limit`). As in the driver, the
+/// value is clamped from above by the register field; from below the effective
+/// minimum is [`regs::IIN_MIN_UA`].
 ///
 /// # Errors
 ///
-/// [`PumpError::OutOfRange`], если запрошен нулевой или меньший минимального ток.
+/// [`PumpError::OutOfRange`] if a zero or below-minimum current is requested.
 pub fn encode_iin_limit(iin_ua: u32) -> Result<u8, PumpError> {
     if iin_ua < regs::IIN_MIN_UA {
         return Err(PumpError::OutOfRange {
@@ -477,7 +480,7 @@ pub fn encode_iin_limit(iin_ua: u32) -> Result<u8, PumpError> {
     })
 }
 
-/// Декодирует лимит входного тока, применённый устройством.
+/// Decodes the input current limit applied by the device.
 #[must_use]
 pub fn decode_iin_limit(raw: u8) -> u32 {
     let value = u32::from(raw & IIN_CODE_MAX).saturating_mul(regs::IIN_STEP_UA);
@@ -488,9 +491,9 @@ pub fn decode_iin_limit(raw: u8) -> u32 {
     }
 }
 
-/// Кодирует целевое напряжение заряда.
+/// Encodes the charge target voltage.
 ///
-/// Код = `(напряжение − 3.725 В) / 5 мВ`, с насыщением на границах диапазона.
+/// Code = `(voltage − 3.725 V) / 5 mV`, saturating at the range bounds.
 #[must_use]
 pub fn encode_vbat_float(vbat_uv: u32) -> u8 {
     if vbat_uv <= regs::VBAT_FLOAT_MIN_UV {
@@ -503,13 +506,13 @@ pub fn encode_vbat_float(vbat_uv: u32) -> u8 {
     u8::try_from(steps).unwrap_or(0xFF)
 }
 
-/// Декодирует напряжение заряда из кода.
+/// Decodes the charge voltage from the code.
 #[must_use]
 pub fn decode_vbat_float(raw: u8) -> u32 {
     regs::VBAT_FLOAT_MIN_UV.saturating_add(u32::from(raw).saturating_mul(regs::VBAT_FLOAT_STEP_UV))
 }
 
-/// Кодирует порог перенапряжения входа (поле 3:2 регистра `GLITCH_CTRL`).
+/// Encodes the input overvoltage threshold (field 3:2 of the `GLITCH_CTRL` register).
 #[must_use]
 pub const fn encode_vac_ovp(ovp_uv: u32) -> u8 {
     if ovp_uv <= 6_500_000 {
@@ -523,7 +526,7 @@ pub const fn encode_vac_ovp(ovp_uv: u32) -> u8 {
     }
 }
 
-/// Кодирует порог аларма NTC (10 бит: 8 в `NTC_CTRL`, 2 в `ADC_CTRL`).
+/// Encodes the NTC alarm threshold (10 bits: 8 in `NTC_CTRL`, 2 in `ADC_CTRL`).
 #[must_use]
 pub const fn encode_ntc_alarm(code: u16) -> (u8, u8) {
     ((code & 0xFF) as u8, ((code >> 8) & 0x03) as u8)
@@ -549,7 +552,7 @@ mod tests {
             OpMode::Bypass
         );
         assert_eq!(OpMode::from_sys_sts(0), OpMode::Unknown);
-        // Бит петли регулирования не должен путать разбор режима.
+        // The regulation loop bit must not confuse mode parsing.
         assert_eq!(
             OpMode::from_sys_sts(regs::SYS_STS_SWITCHING_ENABLED | regs::SYS_STS_IIN_LOOP),
             OpMode::Switching
@@ -687,15 +690,17 @@ mod tests {
         // `#[cfg(test)]` tests cannot execute — this one stands in for them.
         for vbat in (3_000_000..=4_500_000).step_by(50_000) {
             let target = window_target_uv(vbat).max(SWITCHING_MIN_VIN_UV as u32);
+            // The window is a few volts, so the conversion never saturates.
+            let vin_uv = i32::try_from(target).unwrap_or(i32::MAX);
             assert_eq!(
-                charge_mode(target as i32, vbat),
+                charge_mode(vin_uv, vbat),
                 Some(OpMode::Switching),
-                "цель {target} обязана допускать 2:1 при Vbat {vbat}"
+                "target {target} must allow 2:1 at Vbat {vbat}"
             );
             // Never above the band top unless the absolute floor pins it there.
             assert!(
                 target <= window_top_uv(vbat).max(SWITCHING_MIN_VIN_UV as u32),
-                "цель {target} выше окна при Vbat {vbat}"
+                "target {target} is above the window at Vbat {vbat}"
             );
         }
     }
@@ -714,7 +719,7 @@ mod tests {
         // is why the driver's own telemetry killed the 2:1 state it had just
         // been handed.
         assert!(vin_in_switching_window(
-            window_target_uv(4_420_000) as i32,
+            i32::try_from(window_target_uv(4_420_000)).unwrap_or(i32::MAX),
             4_420_000
         ));
         assert!(!vin_in_switching_window(9_500_000, 4_420_000));
@@ -725,13 +730,13 @@ mod tests {
 
     #[test]
     fn bypass_window_covers_only_the_five_volt_side() {
-        // Единый гейт для всех путей, включающих EN_1TO1 (термозащита, SET_MODE,
-        // восстановление после soft_reset): окно 4,2…8 В, независимо от Vbat.
+        // Single gate for every path that enables EN_1TO1 (thermal protection,
+        // SET_MODE, recovery after soft_reset): the 4.2-8 V window, regardless of Vbat.
         for vin in [4_200_000, 4_500_000, 5_000_000, 7_999_999] {
             for vbat in [0, 3_900_000, 4_470_000] {
                 assert!(
                     bypass_allowed_by_vin(vin, vbat),
-                    "Vin {vin} при Vbat {vbat} — окно обхода"
+                    "Vin {vin} at Vbat {vbat} - bypass window"
                 );
             }
         }
@@ -739,11 +744,11 @@ mod tests {
             for vbat in [0, 3_900_000, 4_275_000, 4_470_000] {
                 assert!(
                     !bypass_allowed_by_vin(vin, vbat),
-                    "Vin {vin} при Vbat {vbat} — 1:1 подаёт вход на батарею"
+                    "Vin {vin} at Vbat {vbat} - 1:1 feeds the input to the battery"
                 );
             }
         }
-        // Ниже окна обхода тоже нельзя: 1:1 от почти нулевого входа бесполезен.
+        // Below the bypass window is also not allowed: 1:1 from a near-zero input is useless.
         assert!(!bypass_allowed_by_vin(4_199_999, 4_000_000));
         assert!(!bypass_allowed_by_vin(0, 4_000_000));
         assert!(!bypass_allowed_by_vin(-1, 4_000_000));
@@ -751,10 +756,10 @@ mod tests {
 
     #[test]
     fn taper_band_follows_charge_target_not_qc3_limit() {
-        // F5: полосу среза задаёт цель заряда (float − 100 мВ), а не лимит петли
-        // QC3 (4,42 В). Иначе при цели 4,47 В ток режется уже с 4,32 В.
+        // F5: the fold-back band is set by the charge target (float - 100 mV), not by the
+        // QC3 loop limit (4.42 V). Otherwise a 4.47 V target already cuts current from 4.32 V.
         assert_eq!(NABU_QC3_BAT_VOLT_MAX_UV, 4_420_000);
-        // Цель 4,47 В → срез с 4,37 В.
+        // Target 4.47 V → fold-back from 4.37 V.
         assert!(!vbat_near_float_with_vin(
             4_350_000,
             NABU_VBAT_FLOAT_UV,
@@ -779,7 +784,7 @@ mod tests {
             false,
             0
         ));
-        // Не-FFC цель 4,45 В → срез с 4,35 В, всё ещё не 4,32 В.
+        // Non-FFC target 4.45 V → fold-back from 4.35 V, still not 4.32 V.
         assert!(!vbat_near_float_with_vin(
             4_340_000,
             NABU_VBAT_NON_FFC_UV,
@@ -792,7 +797,7 @@ mod tests {
             false,
             0
         ));
-        // Если целью выбран сам лимит петли QC3, полоса едет за ним.
+        // If the target is the QC3 loop limit itself, the band follows it.
         assert!(!vbat_near_float_with_vin(
             4_319_999,
             NABU_QC3_BAT_VOLT_MAX_UV,
@@ -805,7 +810,7 @@ mod tests {
             false,
             0
         ));
-        // Защёлкнутый VBAT_OV и рэйл Vin/2 обрабатываются как раньше.
+        // Latched VBAT_OV and the Vin/2 rail are handled as before.
         assert!(vbat_near_float_with_vin(
             4_000_000,
             NABU_VBAT_FLOAT_UV,
@@ -842,16 +847,16 @@ mod tests {
 
     #[test]
     fn hibernated_adc_zero_is_not_a_usable_vbat_reading() {
-        // Живой замер 19.09, кабель отключён: `ADC_CTRL = 0x1C`. Биты 5:7 = 0 =
-        // `AutoHibernate`, биты 3:4 = 3 = `Sec4` — то есть ровно то, что пишет
-        // шаг 9 инициализации. Через четыре секунды покоя `ADC01..ADC09` читаются
-        // успешно и содержат `0x00`.
+        // Live measurement 19.09, cable unplugged: `ADC_CTRL = 0x1C`. Bits 5:7 = 0 =
+        // `AutoHibernate`, bits 3:4 = 3 = `Sec4` - that is exactly what
+        // initialisation step 9 writes. After four seconds of idle `ADC01..ADC09`
+        // read successfully and contain `0x00`.
         assert_eq!(0x1Cu8 >> 5, AdcMode::AutoHibernate.code());
         assert_eq!((0x1Cu8 >> 3) & 0x03, AdcHibernateDelay::Sec4.code());
-        // Успешно прочитанный ноль — всё равно не отсчёт банки.
+        // A successfully read zero is still not a cell sample.
         assert!(!vbat_reading_usable(true, 0));
         assert!(vbat_reading_usable(true, 4_400_000));
-        // Отказ чтения недостоверен при любом значении.
+        // A failed read is invalid for any value.
         assert!(!vbat_reading_usable(false, 4_400_000));
         assert!(!vbat_reading_usable(false, 0));
     }

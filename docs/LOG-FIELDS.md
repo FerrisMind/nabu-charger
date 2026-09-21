@@ -1,67 +1,67 @@
-# Справочник полей журнала и телеметрии
+# Reference of journal and telemetry fields
 
-Три слоя данных, от быстрого к долговременному:
+Three layers of data, from fast to long-lived:
 
-1. **Отсчёты** (`TelemetrySample`) — кольцо в памяти драйвера, до 256 записей.
-2. **Сеансы** (`ChargeSession`) — история в памяти драйвера, до 32 сеансов.
-3. **Журнал на диске** (JSON Lines) — то, что переживает перезагрузку.
+1. **Samples** (`TelemetrySample`) - a ring in driver memory, up to 256 records.
+2. **Sessions** (`ChargeSession`) - history in driver memory, up to 32 sessions.
+3. **The journal on disk** (JSON Lines) - what survives a reboot.
 
 ---
 
-## 1. Отсчёт телеметрии
+## 1. Telemetry sample
 
-Источник: `crates/ln8000/src/session.rs`, структура `TelemetrySample`.
+Source: `crates/ln8000/src/session.rs`, structure `TelemetrySample`.
 
-| Поле | Тип | Единица | Откуда |
+| Field | Type | Unit | Where it comes from |
 |---|---|---|---|
-| `at_ms` | u64 | мс | монотонное время драйвера (`KeQueryInterruptTimePrecise / 10_000`) |
-| `iin_ua` | u32 | мкА | АЦП канал `IIN`, LSB 4.89 мА |
-| `vbat_uv` | u32 | мкВ | АЦП канал `VBAT`, LSB 5 мВ (Android: без смещения +1 В; `ADC_VBAT_MIN` — порог валидности) |
-| `vin_uv` | u32 | мкВ | АЦП канал `VIN`, LSB 16 мВ |
-| `die_temp_dc` | i32 | 0.1 °C | АЦП канал `DIETEMP`, LSB 0.435 °C, смещение −25 °C |
-| `op_mode` | u8 | — | режим: 1 standby, 2 bypass 1:1, 3 switching 2:1 |
-| `flags` | u8 | битовая маска | бит 0 — ускоренный режим, бит 1 — сработала защита, бит 2 — отказ чипа |
+| `at_ms` | u64 | ms | monotonic driver time (`KeQueryInterruptTimePrecise / 10_000`) |
+| `iin_ua` | u32 | µA | ADC channel `IIN`, LSB 4.89 mA |
+| `vbat_uv` | u32 | µV | ADC channel `VBAT`, LSB 5 mV (Android: no +1 V offset; `ADC_VBAT_MIN` - the validity threshold) |
+| `vin_uv` | u32 | µV | ADC channel `VIN`, LSB 16 mV |
+| `die_temp_dc` | i32 | 0.1 °C | ADC channel `DIETEMP`, LSB 0.435 °C, offset -25 °C |
+| `op_mode` | u8 | - | mode: 1 standby, 2 bypass 1:1, 3 switching 2:1 |
+| `flags` | u8 | bit mask | bit 0 - fast mode, bit 1 - protection tripped, bit 2 - chip failure |
 
-## 2. Сеанс заряда
+## 2. Charge session
 
-Источник: `crates/ln8000/src/session.rs`, структура `ChargeSession`.
+Source: `crates/ln8000/src/session.rs`, structure `ChargeSession`.
 
-| Поле | Тип | Единица | Смысл |
+| Field | Type | Unit | Meaning |
 |---|---|---|---|
-| `started_ms` | u64 | мс | момент появления входного питания |
-| `duration_ms` | u64 | мс | длительность; у текущего сеанса — «на момент запроса» |
-| `samples` | u32 | шт | сколько отсчётов попало в сеанс |
-| `peak_iin_ua` | u32 | мкА | максимальный входной ток за сеанс |
-| `peak_die_temp_dc` | i32 | 0.1 °C | максимальная температура кристалла |
-| `had_fast_mode` | bool | — | включался ли режим 2:1 хотя бы раз |
-| `had_guard_action` | bool | — | срабатывала ли защита (снижение тока / bypass / stop) |
-| `end_reason` | u8 | — | 0 открыт, 1 питание пропало, 2 защита остановила, 3 отказ чипа |
+| `started_ms` | u64 | ms | the moment input power appeared |
+| `duration_ms` | u64 | ms | duration; for the current session - "at the moment of the request" |
+| `samples` | u32 | pcs | how many samples fell into the session |
+| `peak_iin_ua` | u32 | µA | peak input current over the session |
+| `peak_die_temp_dc` | i32 | 0.1 °C | peak die temperature |
+| `had_fast_mode` | bool | - | whether 2:1 mode was engaged at least once |
+| `had_guard_action` | bool | - | whether protection tripped (current reduction / bypass / stop) |
+| `end_reason` | u8 | - | 0 open, 1 power lost, 2 stopped by protection, 3 chip failure |
 
-## 3. Запись журнала на диске (JSON Lines)
+## 3. Journal record on disk (JSON Lines)
 
-Формат: одна запись JSON на строку, кодировка UTF-8, файл дописывается.
-Источник: `crates/host/src/journal.rs` + выгрузка `nabu-ln8000.ps1 journal`.
+Format: one JSON record per line, UTF-8 encoding, the file is appended to.
+Source: `crates/host/src/journal.rs` + the `nabu-ln8000.ps1 journal` export.
 
-| Поле JSON | Тип | Смысл |
+| JSON field | Type | Meaning |
 |---|---|---|
-| `exported_at` | строка | время выгрузки, ISO 8601 с зоной |
-| `host` | строка | имя компьютера (для матрицы устройств) |
-| `soc_percent` | число | уровень заряда батареи в % по данным ОС (`Win32_Battery`), `-1` если ОС не сообщила. Насос его не знает — данные приходят от системы |
-| `battery_status` | число | состояние батареи по классификации WMI (`1` разряд, `2` от сети, и т.д.) |
-| `pd_status` | число | статус согласования: `0` неизвестно, `1` обычный блок 5 В, `2` повышенное напряжение 9 В и выше, `3` согласован QC. Значение задаёт тот, кто знает: в протоколе приёмки — из показаний мультиметра, в сборе отчёта — неизвестно |
-| `pd_status_label` | строка | то же человеческим языком |
-| `mode` | число | режим pump: 1/2/3 |
-| `state` | число | состояние драйвера: 1 опознан … 4 отказ |
-| `sys_sts` | число | `SYS_STS` как есть (hex-источник: 0x03) |
-| `fault1_sts`, `fault2_sts` | число | регистры отказов 0x05, 0x06 |
-| `safety_sts` | число | регистр защит 0x04 |
-| `critical` | 0/1 | признак критичного отказа |
-| `iin_ua`, `vbat_uv`, `vbus_uv` | число | телеметрия на момент выгрузки |
-| `die_temp_dc` | число | температура кристалла, 0.1 °C |
-| `sessions` | число | сколько сеансов отработал драйвер |
-| `samples` | число | сколько отсчётов накоплено |
+| `exported_at` | string | export time, ISO 8601 with zone |
+| `host` | string | computer name (for the device matrix) |
+| `soc_percent` | number | battery state of charge in % as reported by the OS (`Win32_Battery`), `-1` if the OS did not report it. The pump does not know it - the data comes from the system |
+| `battery_status` | number | battery status by the WMI classification (`1` discharging, `2` on AC, etc.) |
+| `pd_status` | number | negotiation status: `0` unknown, `1` ordinary 5 V adapter, `2` raised voltage 9 V and above, `3` QC negotiated. The value is set by whoever knows: in the acceptance protocol - from multimeter readings, in the report run - unknown |
+| `pd_status_label` | string | the same in plain words |
+| `mode` | number | pump mode: 1/2/3 |
+| `state` | number | driver state: 1 identified ... 4 failure |
+| `sys_sts` | number | `SYS_STS` as is (hex source: 0x03) |
+| `fault1_sts`, `fault2_sts` | number | failure registers 0x05, 0x06 |
+| `safety_sts` | number | protection register 0x04 |
+| `critical` | 0/1 | flag of a critical failure |
+| `iin_ua`, `vbat_uv`, `vbus_uv` | number | telemetry at the moment of the export |
+| `die_temp_dc` | number | die temperature, 0.1 °C |
+| `sessions` | number | how many sessions the driver completed |
+| `samples` | number | how many samples were accumulated |
 
-Записи читаются построчно; для анализа достаточно `jq` или `ConvertFrom-Json`
-по строкам. Смысл: **каждая сессия оставляет след**, пригодный для разбора
-после перезагрузки — этим закрывается требование «журнал переживает
-перезагрузку» (в памяти драйвера держится только текущее состояние).
+Records are read line by line; `jq` or `ConvertFrom-Json` over the lines is enough
+for analysis. The point: **every session leaves a trace** suitable for analysis
+after a reboot - this closes the "the journal survives a reboot" requirement
+(only the current state is kept in driver memory).

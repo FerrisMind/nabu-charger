@@ -1,18 +1,18 @@
-﻿# nabu-ln8000.ps1 — диагностика драйвера charge pump LN8000
+﻿# nabu-ln8000.ps1 - LN8000 charge pump driver diagnostics
 #
-# Открывает устройство \\.\nabu_ln8000 (символическая ссылка, созданная
-# драйвером) и общается с ним через DeviceIoControl. Коды управления вычисляются
-# по той же формуле, что в crates/ln8000-kmdf/src/ioctl.rs:
+# Opens the \\.\nabu_ln8000 device (a symbolic link created by the driver) and
+# talks to it through DeviceIoControl. The control codes are computed by the same
+# formula as in crates/ln8000-kmdf/src/ioctl.rs:
 #     CTL_CODE(0x22, function, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #
-# Команды:
-#     .\nabu-ln8000.ps1 status            — режим, отказы, телеметрия, счётчики
-#     .\nabu-ln8000.ps1 sessions          — сеансы заряда (текущий и последний)
-#     .\nabu-ln8000.ps1 read <reg>        — прочитать регистр LN8000 (hex)
-#     .\nabu-ln8000.ps1 write <reg> <val> — записать регистр (hex), диагностика
-#     .\nabu-ln8000.ps1 journal <file>    — выгрузить журнал сеансов в файл JSONL
-#     .\nabu-ln8000.ps1 limits <mA> [mV]  — задать лимиты: ток в мА, напряжение в мВ
-#     .\nabu-ln8000.ps1 mode <1|2|3>      — режим: 1 standby, 2 bypass, 3 switching
+# Commands:
+#     .\nabu-ln8000.ps1 status            - mode, faults, telemetry, counters
+#     .\nabu-ln8000.ps1 sessions          - charge sessions (current and last)
+#     .\nabu-ln8000.ps1 read <reg>        - read an LN8000 register (hex)
+#     .\nabu-ln8000.ps1 write <reg> <val> - write a register (hex), diagnostics
+#     .\nabu-ln8000.ps1 journal <file>    - export the session journal to a JSONL file
+#     .\nabu-ln8000.ps1 limits <mA> [mV]  - set limits: current in mA, voltage in mV
+#     .\nabu-ln8000.ps1 mode <1|2|3>      - mode: 1 standby, 2 bypass, 3 switching
 
 [CmdletBinding()]
 param(
@@ -24,7 +24,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-# --- контракт драйвера (см. crates/ln8000-kmdf/src/ioctl.rs) ---
+# --- driver contract (see crates/ln8000-kmdf/src/ioctl.rs) ---
 
 function Get-CtlCode {
   param([int]$Function, [int]$Method = 0, [int]$Access = 0)
@@ -43,7 +43,7 @@ $IOCTL = @{
 
 $STATUS_MAGIC = 0x4C4E3830  # "LN80"
 
-# --- P/Invoke нативного API ---
+# --- native API P/Invoke ---
 
 if (-not ('NabuNative' -as [type])) {
   Add-Type -Namespace '' -Name 'NabuNative' -MemberDefinition @'
@@ -60,14 +60,14 @@ public static extern bool CloseHandle(IntPtr handle);
 
 function Open-Device {
   # 0xC0000000 = GENERIC_READ | GENERIC_WRITE, 3 = OPEN_EXISTING, share = READ|WRITE.
-  # Значения проводим как UInt32: иначе PowerShell передаёт отрицательный Int32
-  # и разбор перегрузки падает.
+  # The values are passed as UInt32: otherwise PowerShell passes a negative Int32
+  # and overload resolution fails.
   $desiredAccess = [uint32]3221225472
   $handle = [NabuNative]::CreateFileW($DevicePath, $desiredAccess, [uint32]3, [IntPtr]::Zero,
                                       [uint32]3, [uint32]0, [IntPtr]::Zero)
   if ($handle -eq [IntPtr]::new(-1)) {
-    throw ("не удалось открыть $DevicePath (код " + [Runtime.InteropServices.Marshal]::GetLastWin32Error() +
-           "). Драйвер установлен и устройство PEIC доступно?")
+    throw ("failed to open $DevicePath (code " + [Runtime.InteropServices.Marshal]::GetLastWin32Error() +
+           "). Is the driver installed and the PEIC device available?")
   }
   return $handle
 }
@@ -93,7 +93,7 @@ function Read-Struct {
   }
 }
 
-# --- структуры ответов (порядок полей совпадает с Rust) ---
+# --- response structures (field order matches Rust) ---
 
 if (-not ('Ln8000Status' -as [type])) {
   Add-Type -TypeDefinition @'
@@ -125,29 +125,29 @@ function Invoke-Status {
   $handle = Open-Device
   try {
     $result = Invoke-DeviceIoControl -Handle $handle -Code $IOCTL.GET_STATUS -Input (New-Object byte[] 0) -OutputSize 64
-    if (-not $result.Ok) { throw ("DeviceIoControl GET_STATUS: ошибка " + $result.Error) }
+    if (-not $result.Ok) { throw ("DeviceIoControl GET_STATUS: error " + $result.Error) }
     $status = Read-Struct $result.Bytes ([Ln8000Status])
     if ($status.Magic -ne $STATUS_MAGIC) {
-      Write-Host ("  ВНИМАНИЕ: неизвестная магия 0x{0:X8}" -f $status.Magic) -ForegroundColor Yellow
+      Write-Host ("  WARNING: unknown magic 0x{0:X8}" -f $status.Magic) -ForegroundColor Yellow
     }
     $modeName = switch ($status.OpMode) { 0 {'UNKNOWN'} 1 {'STANDBY'} 2 {'BYPASS 1:1'} 3 {'SWITCHING 2:1'} default {'?'} }
-    $stateName = switch ($status.State) { 0 {'закрыта'} 1 {'опознан'} 2 {'настроен'} 3 {'switching'} 4 {'ОТКАЗ'} default {'?'} }
-    Write-Host '=== LN8000: состояние ===' -ForegroundColor Cyan
-    Write-Host ("  режим            : " + $modeName + " (" + $status.OpMode + ")")
-    Write-Host ("  состояние сессии : " + $stateName)
+    $stateName = switch ($status.State) { 0 {'closed'} 1 {'identified'} 2 {'configured'} 3 {'switching'} 4 {'FAULT'} default {'?'} }
+    Write-Host '=== LN8000: state ===' -ForegroundColor Cyan
+    Write-Host ("  mode             : " + $modeName + " (" + $status.OpMode + ")")
+    Write-Host ("  session state    : " + $stateName)
     Write-Host ("  SYS_STS          : 0x{0:X2}" -f $status.SysSts)
     Write-Host ("  FAULT1/FAULT2    : 0x{0:X2} / 0x{1:X2}" -f $status.Fault1Sts, $status.Fault2Sts)
     Write-Host ("  SAFETY_STS       : 0x{0:X2}" -f $status.SafetySts)
-    Write-Host ("  критичный отказ  : " + $(if ($status.CriticalFault -ne 0) { 'ДА' } else { 'нет' })) `
+    Write-Host ("  critical fault   : " + $(if ($status.CriticalFault -ne 0) { 'YES' } else { 'no' })) `
       -ForegroundColor $(if ($status.CriticalFault -ne 0) { 'Red' } else { 'Gray' })
-    Write-Host ("  входной ток      : {0} мкА ({1:N2} А)" -f $status.IinUa, ($status.IinUa / 1e6))
-    Write-Host ("  напряжение батареи: {0} мкВ ({1:N3} В)" -f $status.VbatUv, ($status.VbatUv / 1e6))
-    Write-Host ("  напряжение входа : {0} мкВ ({1:N3} В)" -f $status.VbusUv, ($status.VbusUv / 1e6))
-    Write-Host ("  температура крист.: {0} (0.1 °C)" -f $status.DieTempDc)
-    Write-Host ("  сеансов/отсчётов : {0} / {1}" -f $status.Sessions, $status.Samples)
-    Write-Host ("  записей/чтений   : {0} / {1}" -f $status.Writes, $status.Reads)
+    Write-Host ("  input current    : {0} µA ({1:N2} A)" -f $status.IinUa, ($status.IinUa / 1e6))
+    Write-Host ("  battery voltage  : {0} µV ({1:N3} V)" -f $status.VbatUv, ($status.VbatUv / 1e6))
+    Write-Host ("  input voltage    : {0} µV ({1:N3} V)" -f $status.VbusUv, ($status.VbusUv / 1e6))
+    Write-Host ("  die temperature  : {0} (0.1 °C)" -f $status.DieTempDc)
+    Write-Host ("  sessions/samples : {0} / {1}" -f $status.Sessions, $status.Samples)
+    Write-Host ("  writes/reads     : {0} / {1}" -f $status.Writes, $status.Reads)
     if ($status.LastError -ne 0) {
-      Write-Host ("  последняя ошибка : " + $status.LastError) -ForegroundColor Yellow
+      Write-Host ("  last error       : " + $status.LastError) -ForegroundColor Yellow
     }
     return $status
   } finally {
@@ -159,17 +159,17 @@ function Invoke-Sessions {
   $handle = Open-Device
   try {
     $result = Invoke-DeviceIoControl -Handle $handle -Code $IOCTL.GET_SESSIONS -Input (New-Object byte[] 0) -OutputSize 48
-    if (-not $result.Ok) { throw ("DeviceIoControl GET_SESSIONS: ошибка " + $result.Error) }
+    if (-not $result.Ok) { throw ("DeviceIoControl GET_SESSIONS: error " + $result.Error) }
     $s = Read-Struct $result.Bytes ([Ln8000Sessions])
-    Write-Host '=== LN8000: сеансы заряда ===' -ForegroundColor Cyan
-    Write-Host ("  всего сеансов    : " + $s.Total)
+    Write-Host '=== LN8000: charge sessions ===' -ForegroundColor Cyan
+    Write-Host ("  total sessions   : " + $s.Total)
     if ($s.CurrentMs -gt 0) {
-      Write-Host ("  текущий          : {0:N1} с, пик {1:N2} А, быстрый режим: {2}" -f ($s.CurrentMs / 1000), ($s.CurrentPeakIinUa / 1e6), $(if ($s.CurrentFast -ne 0) { 'да' } else { 'нет' }))
+      Write-Host ("  current          : {0:N1} s, peak {1:N2} A, fast mode: {2}" -f ($s.CurrentMs / 1000), ($s.CurrentPeakIinUa / 1e6), $(if ($s.CurrentFast -ne 0) { 'yes' } else { 'no' }))
     } else {
-      Write-Host '  текущий          : питания нет'
+      Write-Host '  current          : no power'
     }
     if ($s.LastMs -gt 0) {
-      Write-Host ("  последний        : {0:N1} с, пик {1:N2} А, пик темп. {2} (0.1 °C), быстрый режим: {3}" -f ($s.LastMs / 1000), ($s.LastPeakIinUa / 1e6), $s.LastPeakTempDc, $(if ($s.LastFast -ne 0) { 'да' } else { 'нет' }))
+      Write-Host ("  last             : {0:N1} s, peak {1:N2} A, peak temp {2} (0.1 °C), fast mode: {3}" -f ($s.LastMs / 1000), ($s.LastPeakIinUa / 1e6), $s.LastPeakTempDc, $(if ($s.LastFast -ne 0) { 'yes' } else { 'no' }))
     }
     return $s
   } finally {
@@ -184,10 +184,10 @@ function Invoke-ReadReg {
     $input = New-Object byte[] 8
     $input[0] = [byte]$Address
     $result = Invoke-DeviceIoControl -Handle $handle -Code $IOCTL.READ_REG -Input $input -OutputSize 8
-    if (-not $result.Ok) { throw ("DeviceIoControl READ_REG: ошибка " + $result.Error) }
+    if (-not $result.Ok) { throw ("DeviceIoControl READ_REG: error " + $result.Error) }
     $reg = Read-Struct $result.Bytes ([Ln8000Reg])
-    if ($reg.ErrorCode -ne 0) { throw ("драйвер вернул код ошибки " + $reg.ErrorCode) }
-    Write-Host ("  регистр 0x{0:X2} = 0x{1:X2}" -f $reg.Addr, $reg.Value)
+    if ($reg.ErrorCode -ne 0) { throw ("the driver returned error code " + $reg.ErrorCode) }
+    Write-Host ("  register 0x{0:X2} = 0x{1:X2}" -f $reg.Addr, $reg.Value)
     return $reg.Value
   } finally {
     [NabuNative]::CloseHandle($handle) | Out-Null
@@ -202,8 +202,8 @@ function Invoke-WriteReg {
     $input[0] = [byte]$Address
     $input[1] = [byte]$Value
     $result = Invoke-DeviceIoControl -Handle $handle -Code $IOCTL.WRITE_REG -Input $input -OutputSize 8
-    if (-not $result.Ok) { throw ("DeviceIoControl WRITE_REG: ошибка " + $result.Error) }
-    Write-Host ("  записано 0x{0:X2} в 0x{1:X2}" -f $Value, $Address)
+    if (-not $result.Ok) { throw ("DeviceIoControl WRITE_REG: error " + $result.Error) }
+    Write-Host ("  wrote 0x{0:X2} to 0x{1:X2}" -f $Value, $Address)
   } finally {
     [NabuNative]::CloseHandle($handle) | Out-Null
   }
@@ -211,11 +211,11 @@ function Invoke-WriteReg {
 
 function Invoke-Journal {
   param([string]$Path, [int]$Pd = 0)
-  Write-Host '=== журнал сеансов ===' -ForegroundColor Cyan
+  Write-Host '=== session journal ===' -ForegroundColor Cyan
   $status = Invoke-Status
   $sessions = Invoke-Sessions
 
-  # Уровень заряда и состояние питания насос знать не может — их даёт ОС.
+  # The pump cannot know the state of charge or the power state - the OS provides them.
   $battery = Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue | Select-Object -First 1
   $soc = -1
   $batteryStatus = 0
@@ -226,10 +226,10 @@ function Invoke-Journal {
     $batteryStatus = [int]$battery.BatteryStatus
   }
   $pdLabel = switch ($Pd) {
-    0 { 'неизвестно' }
-    1 { '5 В / обычный блок' }
-    2 { 'повышенное напряжение 9 В и выше' }
-    3 { 'согласован QC' }
+    0 { 'unknown' }
+    1 { '5 V / regular brick' }
+    2 { 'raised voltage 9 V and above' }
+    3 { 'QC negotiated' }
     default { '?' }
   }
 
@@ -256,30 +256,30 @@ function Invoke-Journal {
   }
   $json = $record | ConvertTo-Json -Compress
   Add-Content -LiteralPath $Path -Value $json -Encoding UTF8
-  Write-Host ("  записано в " + $Path) -ForegroundColor Green
-  Write-Host ("  заряд по данным ОС: " + $soc + " %; согласование: " + $pdLabel)
+  Write-Host ("  written to " + $Path) -ForegroundColor Green
+  Write-Host ("  charge by OS data: " + $soc + " %; negotiation: " + $pdLabel)
 }
 
 switch ($Command.ToLower()) {
   'status' { Invoke-Status | Out-Null }
   'sessions' { Invoke-Sessions | Out-Null }
   'read' {
-    if (-not $Arg1) { throw 'укажите адрес регистра: read 1E' }
+    if (-not $Arg1) { throw 'specify the register address: read 1E' }
     Invoke-ReadReg ([Convert]::ToInt32($Arg1, 16)) | Out-Null
   }
   'write' {
-    if (-not $Arg1 -or -not $Arg2) { throw 'укажите адрес и значение: write 1E 00' }
+    if (-not $Arg1 -or -not $Arg2) { throw 'specify the address and the value: write 1E 00' }
     Invoke-WriteReg ([Convert]::ToInt32($Arg1, 16)) ([Convert]::ToInt32($Arg2, 16))
   }
   'journal' {
-    if (-not $Arg1) { throw 'укажите файл: journal out.jsonl' }
+    if (-not $Arg1) { throw 'specify the file: journal out.jsonl' }
     $pdCode = 0
     if ($Arg2) { $pdCode = [int]$Arg2 }
     Invoke-Journal $Arg1 $pdCode
   }
   default {
-    Write-Host 'Команды: status | sessions | read <hex> | write <hex> <hex> | journal <file>'
-    Write-Host ("Коды управления: GET_STATUS=0x{0:X6} READ=0x{1:X6} WRITE=0x{2:X6} SESSIONS=0x{3:X6}" -f `
+    Write-Host 'Commands: status | sessions | read <hex> | write <hex> <hex> | journal <file>'
+    Write-Host ("Control codes: GET_STATUS=0x{0:X6} READ=0x{1:X6} WRITE=0x{2:X6} SESSIONS=0x{3:X6}" -f `
       $IOCTL.GET_STATUS, $IOCTL.READ_REG, $IOCTL.WRITE_REG, $IOCTL.GET_SESSIONS)
   }
 }

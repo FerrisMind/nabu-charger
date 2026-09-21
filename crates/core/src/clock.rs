@@ -1,24 +1,24 @@
-//! Источник времени.
+//! Time source.
 //!
-//! Ядро не спит и не обращается к системным часам: оно принимает время извне.
-//! Это делает таймауты детекции детерминированными и полностью проверяемыми.
+//! The core never sleeps and never touches the system clock: it takes time from
+//! the outside. This makes detection timeouts deterministic and fully testable.
 
-/// Монотонные часы в миллисекундах.
+/// Monotonic clock in milliseconds.
 pub trait Clock {
-    /// Текущее монотонное время в миллисекундах.
+    /// Current monotonic time in milliseconds.
     fn now_ms(&self) -> u64;
 }
 
-/// Часы с ручным управлением для тестов и демонстраций.
+/// Manually controlled clock for tests and demonstrations.
 ///
-/// Время двигается только явно, через [`ManualClock::advance_ms`].
+/// Time moves only explicitly, through [`ManualClock::advance_ms`].
 #[derive(Debug, Default)]
 pub struct ManualClock {
     now_ms: core::cell::Cell<u64>,
 }
 
 impl ManualClock {
-    /// Создаёт часы, начинающие отсчёт с нуля.
+    /// Creates a clock that starts counting from zero.
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -26,7 +26,7 @@ impl ManualClock {
         }
     }
 
-    /// Создаёт часы с заданным начальным значением.
+    /// Creates a clock with a given initial value.
     #[must_use]
     pub const fn starting_at(now_ms: u64) -> Self {
         Self {
@@ -34,7 +34,7 @@ impl ManualClock {
         }
     }
 
-    /// Продвигает время вперёд.
+    /// Advances time forward.
     pub fn advance_ms(&self, delta_ms: u64) {
         self.now_ms.set(self.now_ms.get().saturating_add(delta_ms));
     }

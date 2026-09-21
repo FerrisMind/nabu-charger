@@ -1,45 +1,48 @@
-//! Транспорт к регистрам PMIC через шину SPMI.
+//! Transport to PMIC registers over the SPMI bus.
 //!
-//! # Что подтверждено реверсом
+//! # What reverse engineering confirmed
 //!
-//! Реверс штатных драйверов Qualcomm (`qcpmicEIC8150.sys`, `qcspmi8150.sys`)
-//! показал два разных механизма, и их важно не путать:
+//! Reverse engineering of the stock Qualcomm drivers (`qcpmicEIC8150.sys`,
+//! `qcspmi8150.sys`) revealed two different mechanisms, and it is important not
+//! to confuse them:
 //!
-//! 1. **Подключение к SPMI** — служебный код `0x32C004` (это
-//!    `CTL_CODE(0x32, 1, METHOD_BUFFERED, FILE_READ|FILE_WRITE)`). Штатный клиент
-//!    посылает запрос из 8 байт (младшие 4 — сигнатура `0x42696541`, старшие 4 —
-//!    константа из `.rdata`) и получает буфер, который разбирает в свой контекст, а
-//!    затем ставит таблицу функций доступа к регистрам, выбирая её по версии
-//!    контроллера. Раскладка этого запроса и ответа подтверждена **частично**.
+//! 1. **SPMI connection** is helper code `0x32C004` (that is
+//!    `CTL_CODE(0x32, 1, METHOD_BUFFERED, FILE_READ|FILE_WRITE)`). The stock
+//!    client sends an 8-byte request (the low 4 bytes are the signature
+//!    `0x42696541`, the high 4 are a constant from `.rdata`) and receives a buffer
+//!    that it parses into its context, then installs a table of register access
+//!    functions, choosing it by the controller version. The layout of this
+//!    request and response is confirmed **partially**.
 //!
-//! 2. **Доступ к регистрам** — публичный код `0x41808`:
+//! 2. **Register access** is public code `0x41808`:
 //!
 //!    ```text
 //!    0x41808 = CTL_CODE(FILE_DEVICE_CONTROLLER, 0x602, METHOD_BUFFERED, FILE_ANY_ACCESS)
 //!            = IOCTL_SPB_EXECUTE_SEQUENCE
 //!    ```
 //!
-//!    То есть регистры читаются и пишутся обычным списком передач SPB
-//!    (`SPB_TRANSFER_LIST`) — тем же интерфейсом, что использует драйвер LN8000 на
-//!    шине I²C. Приватного протокола «регистр-в-ответе» нет, и именно поэтому
-//!    поиск такой раскладки раньше не давал результата.
+//!    That is, registers are read and written with an ordinary SPB transfer list
+//!    (`SPB_TRANSFER_LIST`), the same interface the LN8000 driver uses on the I²C
+//!    bus. There is no private "register-in-response" protocol, and that is why
+//!    looking for such a layout gave no result before.
 //!
-//! Разбор с адресами и выдержками — `docs/SPMI-PATH.md`.
+//! The breakdown with addresses and excerpts is in `docs/SPMI-PATH.md`.
 //!
-//! # Чего не хватает
+//! # What is missing
 //!
-//! Чтобы отправить список передач, нужна **цель ввода-вывода шины SPMI**. Штатный
-//! клиент получает её первым шагом (`0x32C004`) через хаб ресурсов. Наш драйвер
-//! такой шаг пока не выполняет: он открывает устройство хаба по имени и посылает
-//! последовательность ему. На железе это может оказаться недостаточно — тогда
-//! запрос честно вернёт ошибку транспорта, а не «тихо ничего не сделает».
-//! Правильное решение — получить подключение SPMI из `_CRS` своего узла, поэтому
-//! драйверу нужен колбэк подготовки ресурсов (его сейчас нет).
+//! To send a transfer list, an **SPMI bus I/O target** is required. The stock
+//! client obtains it in the first step (`0x32C004`) through the resource hub. Our
+//! driver does not perform that step yet: it opens the hub device by name and
+//! sends the sequence to it. On hardware this may prove insufficient, in which
+//! case the request honestly returns a transport error instead of "quietly doing
+//! nothing". The right solution is to obtain the SPMI connection from the `_CRS`
+//! of our own node, so the driver needs a resource preparation callback (it does
+//! not have one yet).
 //!
-//! # Уровень IRQL
+//! # IRQL level
 //!
-//! Все операции синхронные, пассивного уровня: вызываются из
-//! `EvtIoDeviceControl` последовательной очереди.
+//! All operations are synchronous, at passive level: they are called from the
+//! `EvtIoDeviceControl` of the sequential queue.
 
 use charger_core::{ChargerTransport, RegAddr, TransportError};
 use spb::{
@@ -54,48 +57,48 @@ use wdk_sys::{
     WDF_REQUEST_SEND_OPTIONS, WDF_NO_HANDLE, WDF_NO_OBJECT_ATTRIBUTES,
 };
 
-/// Служебный код подключения к SPMI (подтверждён реверсом; шаг не выполняется).
+/// Helper SPMI connection code (confirmed by reverse engineering; step not run).
 #[allow(dead_code)]
 pub const IOCTL_RESOURCE_HUB_TRANSACT: u32 = 0x0032_C004;
 
-/// Тип устройства хаба (старшие 16 бит кода `0x32C004`).
+/// Hub device type (the high 16 bits of code `0x32C004`).
 #[allow(dead_code)]
 pub const FILE_DEVICE_RESOURCE_HUB: u32 = 0x32;
 
-/// Область под список передач, байт.
+/// Area for the transfer list, in bytes.
 const TRANSFER_AREA: usize = 256;
 
-/// Буфер данных (адрес и значение регистра).
+/// Data buffer (register address and value).
 const DATA_LEN: usize = 8;
 
-/// Наибольшее число передач в одной последовательности.
+/// Maximum number of transfers in one sequence.
 const MAX_TRANSFERS: usize = 2;
 
-/// Смещение полезной нагрузки: сразу за списком из двух передач.
+/// Payload offset: right after the list of two transfers.
 ///
 /// `sizeof(SPB_TRANSFER_LIST) + sizeof(SPB_TRANSFER_LIST_ENTRY)` = 48 + 32 = 80.
 const PAYLOAD_OFFSET: usize = 80;
 
-/// Таймаут одной транзакции: 1 с в единицах по 100 нс (значение отрицательное —
-/// отсчёт относительный, как требует `WDF_REQUEST_SEND_OPTIONS.Timeout`).
+/// Timeout of one transaction: 1 s in 100 ns units (the value is negative
+/// because the count is relative, as `WDF_REQUEST_SEND_OPTIONS.Timeout` requires).
 const SPB_TIMEOUT_100NS: i64 = -10_000_000;
 
-/// Настройки доступа к шине.
+/// Bus access settings.
 #[derive(Debug, Clone, Copy)]
 pub struct SpmiConfig {
-    /// Таймаут одной транзакции в единицах по 100 нс (отрицательное значение).
+    /// Timeout of one transaction in 100 ns units (a negative value).
     pub timeout_100ns: i64,
-    /// Порядок байт адреса регистра: `true` — старший байт первым.
+    /// Byte order of the register address: `true` means most significant byte first.
     ///
-    /// Принято по спецификации SPMI: командный кадр передаёт адрес, начиная со
-    /// старшего байта. **На железе не подтверждено** — поэтому это параметр, а не
-    /// зашитая константа: при первом же прогоне на планшете его можно перевернуть
-    /// без правки логики.
+    /// Chosen per the SPMI specification: the command frame transmits the address
+    /// starting with the most significant byte. **Not confirmed on hardware**, so it
+    /// is a parameter rather than a hard-coded constant: on the first run on the
+    /// tablet it can be flipped without touching the logic.
     pub address_big_endian: bool,
 }
 
 impl SpmiConfig {
-    /// Конфигурация по умолчанию для планшета `nabu`.
+    /// Default configuration for the `nabu` tablet.
     #[must_use]
     pub const fn nabu() -> Self {
         Self {
@@ -104,7 +107,7 @@ impl SpmiConfig {
         }
     }
 
-    /// Байты адреса регистра в порядке, заданном конфигурацией.
+    /// Register address bytes in the order set by the configuration.
     #[must_use]
     fn address_bytes(&self, addr: RegAddr) -> [u8; 2] {
         if self.address_big_endian {
@@ -115,10 +118,10 @@ impl SpmiConfig {
     }
 }
 
-/// Имя устройства шины в UTF-16, собранное на этапе компиляции.
+/// Bus device name in UTF-16, built at compile time.
 const DEVICE_NAME_UTF16: [u16; 20] = utf16_lit("/Device/RESOURCE_HUB");
 
-/// Собирает UTF-16 без завершающего нуля: символы `'/'` заменяются на `'\\'`.
+/// Builds UTF-16 without a trailing zero: `'/'` characters are replaced with `'\\'`.
 const fn utf16_lit(ascii: &str) -> [u16; 20] {
     let bytes = ascii.as_bytes();
     let mut out = [0_u16; 20];
@@ -140,10 +143,10 @@ fn device_name() -> UNICODE_STRING {
     }
 }
 
-/// Транспорт к регистрам PMIC поверх шины SPMI.
+/// Transport to PMIC registers over the SPMI bus.
 ///
-/// Объекты WDF создаются один раз при добавлении устройства и живут до его
-/// удаления, поэтому повторные чтения и записи не создают новых объектов.
+/// The WDF objects are created once when the device is added and live until its
+/// removal, so repeated reads and writes create no new objects.
 #[derive(Debug)]
 pub struct SpmiTransport {
     target: WDFIOTARGET,
@@ -156,20 +159,20 @@ pub struct SpmiTransport {
 }
 
 impl SpmiTransport {
-    /// Открывает устройство шины и готовит буферы обмена.
+    /// Opens the bus device and prepares the exchange buffers.
     ///
     /// # Errors
     ///
-    /// * `Io` — устройство шины недоступно или объекты WDF не создались.
-    /// * `Unsupported` — WDF не поддержал запрошенный режим.
+    /// * `Io` - the bus device is unavailable or the WDF objects were not created.
+    /// * `Unsupported` - WDF did not support the requested mode.
     ///
     /// # Safety
     ///
-    /// Вызывается на пассивном уровне IRQL (из `EvtDeviceAdd`): создание объектов
-    /// WDF и открытие цели по имени на повышенном уровне запрещено.
+    /// Called at passive IRQL (from `EvtDeviceAdd`): creating WDF objects and
+    /// opening a target by name at raised IRQL is forbidden.
     pub unsafe fn open(device: WDFDEVICE, config: SpmiConfig) -> Result<Self, TransportError> {
         let mut target: WDFIOTARGET = WDF_NO_HANDLE.cast();
-        // SAFETY: `device` — валидный WDFDEVICE; `target` — локальная переменная.
+        // SAFETY: `device` is a valid WDFDEVICE; `target` is a local variable.
         let status = unsafe {
             call_unsafe_wdf_function_binding!(
                 WdfIoTargetCreate,
@@ -179,7 +182,7 @@ impl SpmiTransport {
             )
         };
         if !nt_ok(status) {
-            return Err(TransportError::io("не удалось создать цель ввода-вывода"));
+            return Err(TransportError::io("failed to create the I/O target"));
         }
 
         let mut params: WDF_IO_TARGET_OPEN_PARAMS = unsafe { core::mem::zeroed() };
@@ -187,12 +190,12 @@ impl SpmiTransport {
         params.Type = WdfIoTargetOpenByName;
         params.TargetDeviceName = device_name();
 
-        // SAFETY: `target` создан выше, параметры заполнены; уровень пассивный.
+        // SAFETY: `target` was created above, the parameters are filled in; passive level.
         let status =
             unsafe { call_unsafe_wdf_function_binding!(WdfIoTargetOpen, target, &raw mut params) };
         if !nt_ok(status) {
             return Err(TransportError::io(
-                "устройство \\Device\\RESOURCE_HUB недоступно",
+                "device \\Device\\RESOURCE_HUB is unavailable",
             ));
         }
 
@@ -200,7 +203,7 @@ impl SpmiTransport {
         let mut input: WDFMEMORY = WDF_NO_HANDLE.cast();
         let mut output: WDFMEMORY = WDF_NO_HANDLE.cast();
 
-        // SAFETY: дескрипторы — локальные переменные под выходные значения.
+        // SAFETY: the handles are local variables for output values.
         let status = unsafe {
             call_unsafe_wdf_function_binding!(
                 WdfRequestCreate,
@@ -210,12 +213,12 @@ impl SpmiTransport {
             )
         };
         if !nt_ok(status) {
-            return Err(TransportError::unsupported("не удалось создать WDFREQUEST"));
+            return Err(TransportError::unsupported("failed to create WDFREQUEST"));
         }
 
         let mut area: *mut core::ffi::c_void = core::ptr::null_mut();
-        // SAFETY: память выделяется в невыгружаемом пуле и живёт до удаления
-        // устройства; выравнивание пула достаточно для `SPB_TRANSFER_LIST`.
+        // SAFETY: the memory is allocated from the non-paged pool and lives until the
+        // device is removed; the pool alignment is sufficient for `SPB_TRANSFER_LIST`.
         let status = unsafe {
             call_unsafe_wdf_function_binding!(
                 WdfMemoryCreate,
@@ -228,11 +231,11 @@ impl SpmiTransport {
             )
         };
         if !nt_ok(status) {
-            return Err(TransportError::unsupported("не удалось выделить область передач"));
+            return Err(TransportError::unsupported("failed to allocate the transfer area"));
         }
 
         let mut data: *mut core::ffi::c_void = core::ptr::null_mut();
-        // SAFETY: аналогично области передач.
+        // SAFETY: same as for the transfer area.
         let status = unsafe {
             call_unsafe_wdf_function_binding!(
                 WdfMemoryCreate,
@@ -245,7 +248,7 @@ impl SpmiTransport {
             )
         };
         if !nt_ok(status) {
-            return Err(TransportError::unsupported("не удалось выделить буфер данных"));
+            return Err(TransportError::unsupported("failed to allocate the data buffer"));
         }
 
         Ok(Self {
@@ -259,23 +262,23 @@ impl SpmiTransport {
         })
     }
 
-    /// Записывает байт регистра: одна передача «адрес (16 бит) + значение».
+    /// Writes a register byte: one transfer "address (16 bits) + value".
     ///
     /// # Errors
     ///
-    /// * `Io` — шина отказала.
-    /// * `Timeout` — шина не ответила за [`SpmiConfig::timeout_100ns`].
-    /// * `Protocol` — шина отклонила последовательность.
+    /// * `Io` - the bus failed.
+    /// * `Timeout` - the bus did not respond within [`SpmiConfig::timeout_100ns`].
+    /// * `Protocol` - the bus rejected the sequence.
     pub fn write_reg(&mut self, addr: RegAddr, value: u8) -> Result<(), TransportError> {
         if self.area.is_null() || self.data.is_null() {
-            return Err(TransportError::unsupported("буферы SPB не созданы"));
+            return Err(TransportError::unsupported("SPB buffers were not created"));
         }
         let bytes = self.config.address_bytes(addr);
 
-        // SAFETY: полезная нагрузка лежит внутри выделенной области с запасом;
-        // запись идёт с пассивного уровня, сериализация — на вызывающей стороне.
+        // SAFETY: the payload lies inside the allocated area with room to spare; the
+        // write happens at passive level, serialization is on the caller's side.
         let (payload, list) = unsafe { self.begin(1)? };
-        // SAFETY: пишем «адрес, значение» и одну передачу на три байта.
+        // SAFETY: we write "address, value" and one transfer of three bytes.
         unsafe {
             core::ptr::write_volatile(payload, bytes[0]);
             core::ptr::write_volatile(payload.add(1), bytes[1]);
@@ -289,22 +292,23 @@ impl SpmiTransport {
         self.send()
     }
 
-    /// Читает байт регистра: передача адреса (16 бит), затем чтение байта.
+    /// Reads a register byte: address transfer (16 bits), then a byte read.
     ///
     /// # Errors
     ///
-    /// * `Io` — шина отказала.
-    /// * `Timeout` — шина не ответила за [`SpmiConfig::timeout_100ns`].
-    /// * `Protocol` — шина отклонила последовательность.
+    /// * `Io` - the bus failed.
+    /// * `Timeout` - the bus did not respond within [`SpmiConfig::timeout_100ns`].
+    /// * `Protocol` - the bus rejected the sequence.
     pub fn read_reg(&mut self, addr: RegAddr) -> Result<u8, TransportError> {
         if self.area.is_null() || self.data.is_null() {
-            return Err(TransportError::unsupported("буферы SPB не созданы"));
+            return Err(TransportError::unsupported("SPB buffers were not created"));
         }
         let bytes = self.config.address_bytes(addr);
 
-        // SAFETY: см. `write_reg`; вторая передача ссылается на буфер данных.
+        // SAFETY: see `write_reg`; the second transfer refers to the data buffer.
         let (payload, list) = unsafe { self.begin(MAX_TRANSFERS)? };
-        // SAFETY: адрес — два байта; первая передача пишет их, вторая читает байт.
+        // SAFETY: the address is two bytes; the first transfer writes them, the
+        // second reads a byte.
         unsafe {
             core::ptr::write_volatile(payload, bytes[0]);
             core::ptr::write_volatile(payload.add(1), bytes[1]);
@@ -325,48 +329,49 @@ impl SpmiTransport {
             );
         }
         self.send()?;
-        // SAFETY: буфер данных создан размером `DATA_LEN`, читаем первый байт.
+        // SAFETY: the data buffer was created with size `DATA_LEN`, we read the first byte.
         Ok(unsafe { core::ptr::read_volatile(self.data) })
     }
 
-    /// Готовит список передач под `count` передач и возвращает нагрузку и список.
+    /// Prepares the transfer list for `count` transfers and returns payload and list.
     ///
     /// # Errors
     ///
-    /// * `Unsupported` — буферы не созданы или передач больше `MAX_TRANSFERS`.
+    /// * `Unsupported` - the buffers were not created or the count exceeds `MAX_TRANSFERS`.
     ///
     /// # Safety
     ///
-    /// Вызывается с пассивного уровня; буферы принадлежат транспорту.
+    /// Called at passive level; the buffers belong to the transport.
     unsafe fn begin(&mut self, count: usize) -> Result<(*mut u8, *mut SpbTransferList), TransportError> {
         if count == 0 || count > MAX_TRANSFERS {
-            return Err(TransportError::unsupported("недопустимое число передач"));
+            return Err(TransportError::unsupported("invalid transfer count"));
         }
-        // SAFETY: область передач выделена размером `TRANSFER_AREA`, выравнивание
-        // невыгружаемого пула не меньше выравнивания `SPB_TRANSFER_LIST`.
+        // SAFETY: the transfer area is allocated with size `TRANSFER_AREA`; the
+        // non-paged pool alignment is at least the alignment of `SPB_TRANSFER_LIST`.
         let list = self.area.cast::<SpbTransferList>();
-        // SAFETY: заголовок списка заполняется целиком.
+        // SAFETY: the list header is filled in completely.
         unsafe {
             (*list).size = u32::try_from(SpbTransferList::header_size()).unwrap_or(0);
             (*list).reserved = 0;
-            (*list).transfer_count =
-                u32::try_from(count).map_err(|_| TransportError::unsupported("слишком много передач"))?;
+            (*list).transfer_count = u32::try_from(count)
+                .map_err(|_| TransportError::unsupported("too many transfers"))?;
         }
-        // SAFETY: смещение входит в `TRANSFER_AREA`.
+        // SAFETY: the offset lies within `TRANSFER_AREA`.
         let payload = unsafe { self.area.add(PAYLOAD_OFFSET) };
         Ok((payload, list))
     }
 
-    /// Отправляет подготовленную последовательность на шину.
+    /// Sends the prepared sequence to the bus.
     ///
     /// # Errors
     ///
-    /// * `Protocol` — шина отклонила формат запроса.
-    /// * `Timeout` — шина не ответила.
-    /// * `Io` — шина вернула отказ.
+    /// * `Protocol` - the bus rejected the request format.
+    /// * `Timeout` - the bus did not respond.
+    /// * `Io` - the bus returned a failure.
     fn send(&mut self) -> Result<(), TransportError> {
-        // SAFETY: запрос, память и цель валидны; формат — управляющий запрос IOCTL,
-        // входом идёт область со списком передач, выход не используется.
+        // SAFETY: the request, memory and target are valid; the format is an IOCTL
+        // control request, the input is the area with the transfer list, the output
+        // is unused.
         let status = unsafe {
             call_unsafe_wdf_function_binding!(
                 WdfIoTargetFormatRequestForIoctl,
@@ -380,7 +385,7 @@ impl SpmiTransport {
             )
         };
         if !nt_ok(status) {
-            return Err(TransportError::protocol("шина отклонила последовательность SPB"));
+            return Err(TransportError::protocol("the bus rejected the SPB sequence"));
         }
 
         let mut options: WDF_REQUEST_SEND_OPTIONS = unsafe { core::mem::zeroed() };
@@ -388,8 +393,8 @@ impl SpmiTransport {
         options.Flags = WDF_REQUEST_SEND_OPTION_TIMEOUT as ULONG;
         options.Timeout = self.config.timeout_100ns;
 
-        // SAFETY: отправка синхронная, уровень пассивный, повторный вход исключён
-        // последовательной очередью устройства.
+        // SAFETY: the send is synchronous, the level is passive, re-entry is
+        // excluded by the device's sequential queue.
         let sent = unsafe {
             call_unsafe_wdf_function_binding!(
                 WdfRequestSend,
@@ -399,28 +404,28 @@ impl SpmiTransport {
             )
         };
         if sent == 0 {
-            // SAFETY: при отказе отправки запрос нужно вернуть в исходное состояние.
+            // SAFETY: when the send fails the request must be returned to its initial state.
             unsafe { reuse_request(self.request) };
-            return Err(TransportError::timeout("шина SPMI не ответила за отведённое время"));
+            return Err(TransportError::timeout("the SPMI bus did not respond"));
         }
 
-        // SAFETY: запрос завершён; читаем статус и переиспользуем запрос.
+        // SAFETY: the request is complete; we read the status and reuse the request.
         let status = unsafe { call_unsafe_wdf_function_binding!(WdfRequestGetStatus, self.request) };
         unsafe { reuse_request(self.request) };
         if !nt_ok(status) {
-            return Err(TransportError::io("шина SPMI вернула отказ"));
+            return Err(TransportError::io("the SPMI bus returned a failure"));
         }
         Ok(())
     }
 
-    /// Освобождает объекты WDF. Вызывается при удалении устройства.
+    /// Releases the WDF objects. Called when the device is removed.
     ///
     /// # Safety
     ///
-    /// Дескрипторы должны быть валидны; вызов на пассивном уровне.
+    /// The handles must be valid; call at passive level.
     #[allow(dead_code)]
     pub unsafe fn close(self) {
-        // SAFETY: цель создана в `open`; закрываем корректно.
+        // SAFETY: the target was created in `open`; we close it properly.
         unsafe {
             let _ = call_unsafe_wdf_function_binding!(WdfIoTargetClose, self.target);
         }
@@ -436,7 +441,7 @@ impl ChargerTransport for SpmiTransport {
         self.write_reg(addr, value)
     }
 
-    /// Сброса не требуется: соединение с шиной постоянно, состояние держит хаб.
+    /// No reset is required: the bus connection is permanent, the hub holds the state.
     fn reset(&mut self) -> Result<(), TransportError> {
         Ok(())
     }
@@ -450,11 +455,11 @@ fn nt_ok(status: NTSTATUS) -> bool {
     status >= 0
 }
 
-/// Возвращает завершённый запрос в исходное состояние для следующей транзакции.
+/// Returns a completed request to its initial state for the next transaction.
 ///
 /// # Safety
 ///
-/// `request` должен быть завершён и не использоваться параллельно.
+/// `request` must be complete and must not be used concurrently.
 unsafe fn reuse_request(request: WDFREQUEST) {
     let mut params = WDF_REQUEST_REUSE_PARAMS {
         Size: size_of_ulong::<WDF_REQUEST_REUSE_PARAMS>(),
@@ -463,13 +468,13 @@ unsafe fn reuse_request(request: WDFREQUEST) {
         NewIrp: core::ptr::null_mut(),
     };
     params.Size = size_of_ulong::<WDF_REQUEST_REUSE_PARAMS>();
-    // SAFETY: запрос завершён; параметры заполнены.
+    // SAFETY: the request is complete; the parameters are filled in.
     unsafe {
         let _ = call_unsafe_wdf_function_binding!(WdfRequestReuse, request, &raw mut params);
     }
 }
 
-/// Размер структуры в виде `ULONG` для поля `Size`.
+/// Structure size as a `ULONG` for the `Size` field.
 fn size_of_ulong<T>() -> ULONG {
     u32::try_from(core::mem::size_of::<T>()).unwrap_or(0)
 }

@@ -1,17 +1,17 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 <#
-    receive-report.ps1 — принимает отчёт с планшета по локальной сети.
+    receive-report.ps1 - receives a report from the tablet over the local network.
 
-    Зачем: агент не может сам зайти в сессию планшета, поэтому отчёт должен
-    приехать к нему на диск. Этот скрипт поднимает маленький приёмник и ждёт
-    один файл (или текст), который планшет отправит обычным HTTP-запросом.
-    Ничего не устанавливается и не открывается наружу: слушаем только свою сеть.
+    Why: the agent cannot enter the tablet session itself, so the report has to
+    arrive on its disk. This script brings up a small receiver and waits for
+    one file (or text) that the tablet sends with an ordinary HTTP request.
+    Nothing is installed and nothing is exposed: we listen only on our own network.
 
-    Запуск на ЭТОМ компьютере (там, где лежит проект):
+    Run on THIS computer (the one holding the project):
         .\receive-report.ps1
-        .\receive-report.ps1 -OpenFirewall     # от администратора: сразу открыть порт
+        .\receive-report.ps1 -OpenFirewall     # as administrator: open the port right away
 
-    Скрипт напечатает готовую команду для планшета — её нужно скопировать туда.
+    The script prints a ready-to-use command for the tablet - copy it there.
 #>
 [CmdletBinding()]
 param(
@@ -25,8 +25,8 @@ $ErrorActionPreference = 'Stop'
 New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
 
 function Get-LanAddress {
-    # Берём адрес адаптера, у которого есть шлюз: это настоящая локальная сеть,
-    # а не виртуальные интерфейсы вроде VirtualBox или Hyper-V.
+    # Take the address of the adapter that has a gateway: that is the real local
+    # network, not virtual interfaces such as VirtualBox or Hyper-V.
     $config = Get-NetIPConfiguration -ErrorAction SilentlyContinue |
         Where-Object { $_.IPv4DefaultGateway -and $_.NetAdapter.Status -eq 'Up' }
     foreach ($item in $config) {
@@ -49,15 +49,15 @@ if ($OpenFirewall) {
     try {
         New-NetFirewallRule -DisplayName "nabu report $Port" -Direction Inbound -LocalPort $Port `
             -Protocol TCP -Action Allow -ErrorAction Stop | Out-Null
-        Write-Host "  правило брандмауэра добавлено для порта $Port" -ForegroundColor Green
+        Write-Host "  firewall rule added for port $Port" -ForegroundColor Green
     } catch {
-        Write-Host ("  правило не добавлено: " + $_.Exception.Message) -ForegroundColor Yellow
+        Write-Host ("  rule not added: " + $_.Exception.Message) -ForegroundColor Yellow
     }
 }
 
 $prefixes = @("http://+:$Port/")
 if (-not $isAdmin) {
-    Write-Host '  без прав администратора слушаем только localhost' -ForegroundColor Yellow
+    Write-Host '  without administrator rights we listen on localhost only' -ForegroundColor Yellow
     $prefixes = @("http://localhost:$Port/")
 }
 
@@ -70,32 +70,32 @@ foreach ($prefix in $prefixes) {
         $listener = $candidate
         break
     } catch {
-        Write-Host ("  не удалось слушать " + $prefix + ": " + $_.Exception.Message) -ForegroundColor Yellow
+        Write-Host ("  could not listen on " + $prefix + ": " + $_.Exception.Message) -ForegroundColor Yellow
     }
 }
 if (-not $listener) {
-    throw 'приёмник не поднялся: попробуйте запустить от администратора или смените порт'
+    throw 'the receiver did not start: try running as administrator or change the port'
 }
 
 $address = Get-LanAddress
 $url = "http://${address}:$Port/upload"
 
 Write-Host ''
-Write-Host '=== приёмник отчётов поднят ===' -ForegroundColor Cyan
-Write-Host ("  сохраняю в : " + $OutDir)
-Write-Host ("  проверка из браузера: http://${address}:$Port/")
+Write-Host '=== report receiver is up ===' -ForegroundColor Cyan
+Write-Host ("  saving to   : " + $OutDir)
+Write-Host ("  browser check: http://${address}:$Port/")
 Write-Host ''
-Write-Host '  Скопируйте это на планшет и выполните там в PowerShell:' -ForegroundColor Green
+Write-Host '  Copy this to the tablet and run it there in PowerShell:' -ForegroundColor Green
 Write-Host ''
 Write-Host ("    `$report = Get-ChildItem `"`$env:ProgramData\nabu-fastcharge\report`" -Filter 'nabu-report-*.zip' | Sort-Object LastWriteTime -Descending | Select-Object -First 1")
 Write-Host ("    Invoke-WebRequest -Uri '$url' -Method Post -InFile `$report.FullName -ContentType 'application/octet-stream'")
 Write-Host ''
-Write-Host '  Если архива нет, отправьте текстовый отчёт:' -ForegroundColor Green
+Write-Host '  If there is no archive, send the text report:' -ForegroundColor Green
 Write-Host ("    `$txt = Get-ChildItem `"`$env:ProgramData\nabu-fastcharge\report`" -Filter 'nabu-report-*.txt' | Sort-Object LastWriteTime -Descending | Select-Object -First 1")
 Write-Host ("    Invoke-WebRequest -Uri '$url' -Method Post -InFile `$txt.FullName -ContentType 'text/plain'")
 Write-Host ''
-Write-Host '  Или просто вставьте текст отчёта в это окно и нажмите Ctrl+Z, Enter.' -ForegroundColor Green
-Write-Host ("  Жду до " + (Get-Date).AddSeconds($TimeoutSeconds).ToString('HH:mm:ss') + ' ...')
+Write-Host '  Or just paste the report text into this window and press Ctrl+Z, Enter.' -ForegroundColor Green
+Write-Host ("  Waiting until " + (Get-Date).AddSeconds($TimeoutSeconds).ToString('HH:mm:ss') + ' ...')
 Write-Host ''
 
 $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
@@ -123,7 +123,7 @@ while ((Get-Date) -lt $deadline -and -not $saved) {
         }
 
         $size = (Get-Item -LiteralPath $target).Length
-        $answer = [Text.Encoding]::UTF8.GetBytes("принято: $name ($size байт)")
+        $answer = [Text.Encoding]::UTF8.GetBytes("accepted: $name ($size bytes)")
         $response.StatusCode = 200
         $response.ContentType = 'text/plain; charset=utf-8'
         $response.ContentLength64 = $answer.Length
@@ -132,20 +132,20 @@ while ((Get-Date) -lt $deadline -and -not $saved) {
         $response.OutputStream.Flush()
         $response.OutputStream.Close()
         $response.Close()
-        # Даём ответу уйти до остановки приёмника, иначе клиент увидит
-        # оборванное соединение вместо ответа.
+        # Give the response time to leave before stopping the receiver, otherwise the client
+        # sees a broken connection instead of the response.
         Start-Sleep -Milliseconds 800
 
-        Write-Host ("  ПРИНЯТО: " + $target + '  (' + $size + ' байт)') -ForegroundColor Green
+        Write-Host ("  ACCEPTED: " + $target + '  (' + $size + ' bytes)') -ForegroundColor Green
         $saved = $target
     } else {
         $page = @"
-Приёмник отчётов nabu работает.
-Отправьте файл так (на планшете, в PowerShell):
+The nabu report receiver is running.
+Send the file like this (on the tablet, in PowerShell):
 
-  Invoke-WebRequest -Uri '$url' -Method Post -InFile '<путь к отчёту>' -ContentType 'application/octet-stream'
+  Invoke-WebRequest -Uri '$url' -Method Post -InFile '<path to the report>' -ContentType 'application/octet-stream'
 
-Сохранение идёт в: $OutDir
+Saving to: $OutDir
 "@
         $bytes = [Text.Encoding]::UTF8.GetBytes($page)
         $response.StatusCode = 200
@@ -156,7 +156,7 @@ while ((Get-Date) -lt $deadline -and -not $saved) {
         $response.OutputStream.Flush()
         $response.OutputStream.Close()
         $response.Close()
-        Write-Host '  запрос проверки из браузера — ответ отправлен'
+        Write-Host '  browser check request - response sent'
     }
 }
 
@@ -165,8 +165,8 @@ $listener.Close()
 
 if ($saved) {
     Write-Host ''
-    Write-Host ("Отчёт получен: " + $saved) -ForegroundColor Green
+    Write-Host ("Report received: " + $saved) -ForegroundColor Green
 } else {
     Write-Host ''
-    Write-Host 'Время ожидания истекло, файл не получен.' -ForegroundColor Yellow
+    Write-Host 'The wait time expired, no file received.' -ForegroundColor Yellow
 }

@@ -1,8 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/core", "crates/host", "crates/cli", "crates/ln8000", "crates/spb"]
-# Драйвер режима ядра подключается отдельно: ему нужен WDK и cargo-wdk,
-# которых нет в обычном окружении CI. См. crates/kmdf/README.md
+# The kernel-mode driver is attached separately: it needs the WDK and cargo-wdk,
+# which are not available in the regular CI environment. See crates/kmdf/README.md
 exclude = ["crates/kmdf"]
 
 [workspace.package]
@@ -10,7 +10,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
-repository = "https://example.invalid/nabu-fastcharge"
+repository = "https://github.com/FerrisMind/nabu-charger"
 publish = false
 
 [workspace.dependencies]

@@ -1,143 +1,172 @@
 # nabu-fastcharge
 
-Драйвер зарядки для **Xiaomi Pad 5 (nabu, Snapdragon 860) под Windows on ARM64**.
+**English** | [Русский](README.ru.md) | [Português (Brasil)](README.pt-BR.md)
 
-Задача: под Windows планшет не заряжается ни от одного блока питания — ни от
-USB-A (Quick Charge), ни от USB-C (Power Delivery). Причина не в «отсутствии
-быстрой зарядки», а в том, что **аппаратная детекция адаптера (APSD) в PMIC
-выполняется, но ни один компонент Windows её результат не читает**, поэтому
-лимит входного тока не поднимается и заряд не идёт.
+Charging driver for the **Xiaomi Pad 5 (nabu, Snapdragon 860) on Windows on
+ARM64**.
 
-Драйвер закрывает ровно этот пробел: читает результат детекции и применяет
-политику тока.
+On Windows the tablet does not charge from any power supply - neither USB-A
+(Quick Charge) nor USB-C (Power Delivery). The cause is not a missing fast-charge
+feature: **the PMIC performs hardware adapter detection (APSD), but no Windows
+component reads its result**, so the input current limit is never raised and the
+charge never starts.
 
-## Состав
+This driver closes exactly that gap: it reads the detection result and applies the
+current policy.
 
-| Крейт | Что это | Проверка |
+## Layout
+
+| Crate | What it is | Checks |
 |---|---|---|
-| [`crates/core`](crates/core) | ядро логики SMB: детекция APSD, политика тока, состояния, таймауты, журнал. Без `std`, без `unsafe` | 37 unit-тестов + doctests |
-| [`crates/ln8000`](crates/ln8000) | ядро драйвера charge pump LN8000 (I²C 0x51): регистры, режимы, защиты, АЦП, телеметрия сеансов, тепловая защита. Без `std`, без `unsafe` | 42 unit-теста + doctests |
-| [`crates/ln8000-kmdf`](crates/ln8000-kmdf) | KMDF-драйвер LN8000 на узле ACPI `PEIC` поверх I²C (SPB/Resource Hub) + скрипты установки и диагностики | собран под ARM64 |
-| [`crates/host`](crates/host) | хост-слой: транспорты (мок, TCP), журнал JSONL, `tracing`, симулятор устройства, бенчмарки | 9 интеграционных тестов |
-| [`crates/cli`](crates/cli) | утилита `nabu-charger`: `demo`, `detect`, `sim`, `verify` | 4 теста CLI |
-| [`crates/kmdf`](crates/kmdf) | драйвер режима ядра (KMDF) для ARM64 через шину SPMI | собран: `kmdf.sys` ARM64, подписан, `infverif` пройден |
+| [`crates/core`](crates/core) | SMB logic core: APSD detection, current policy, states, timeouts, journal. No `std`, no `unsafe` | 37 unit tests |
+| [`crates/ln8000`](crates/ln8000) | LN8000 charge pump core (I²C 0x51): registers, modes, protections, ADC, session telemetry, thermal guard. No `std`, no `unsafe` | 125 unit tests, 6 integration tests, 2 doctests |
+| [`crates/spb`](crates/spb) | SPB types and transfer-list building shared by the kernel drivers, declared by hand because `wdk-sys` does not generate them | 10 unit tests |
+| [`crates/ln8000-kmdf`](crates/ln8000-kmdf) | LN8000 KMDF driver on the ACPI node `PEIC` over I²C (SPB / Resource Hub), plus install and diagnostics scripts | builds for ARM64 |
+| [`crates/host`](crates/host) | Host layer: transports (mock, TCP), JSONL journal, `tracing`, device simulator, benchmarks | 9 integration tests, 2 doctests |
+| [`crates/cli`](crates/cli) | The `nabu-charger` tool: `demo`, `detect`, `sim`, `pump`, `verify` | 4 CLI tests |
+| [`crates/kmdf`](crates/kmdf) | Kernel-mode driver (KMDF) for ARM64 over the SPMI bus | built: `kmdf.sys` ARM64, signed, `infverif` passed |
 
-## Быстрый старт
+`cargo test --workspace` covers 195 tests - unit, integration and doctests - in
+the five crates of the root workspace. The two kernel-mode drivers declare their
+own workspace, because they need the WDK and `cargo-wdk`, which the regular CI
+environment does not have.
+
+## Quick start
 
 ```powershell
-# 1. Проверки (то же, что гоняет CI)
+# 1. The same checks CI runs
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 
-# 2. Демонстрация: все типы адаптеров на мок-транспорте + журнал
+# 2. Demonstration: every adapter type on the mock transport, plus a journal
 cargo run -p cli -- --journal artifacts/journal-demo.jsonl demo
 
-# 3. Charge pump LN8000 на мок-шине I²C (настройка → режим 2:1 → статус → АЦП)
+# 3. The LN8000 charge pump on a mock I²C bus (configure -> 2:1 mode -> status -> ADC)
 cargo run -p cli -- pump --profile qc35
 
-# 4. Самопроверка таблиц и математики драйвера
+# 4. Self-check of the driver's tables and arithmetic
 cargo run -p cli -- verify
 
-# 5. Стенд без железа: симулятор устройства + реальный TCP-транспорт
+# 5. A bench without hardware: the device simulator plus the real TCP transport
 cargo run -p cli -- sim --adapter hvdcp3 --listen 127.0.0.1:9700
 cargo run -p cli -- detect --transport tcp --addr 127.0.0.1:9700
 ```
 
-Ожидаемый вывод `pump` (проверено, см. `artifacts/verify-pump.txt`):
+`pump` on the mock bus. The mock is deterministic, so this output reproduces
+exactly:
 
 ```text
-шина          : mock
-состояние     : probed
-после настройки: configured
-режим         : SWITCHING (код 3)
-SYS_STS       : 0x04 (петля тока: нет, петля напряжения: нет)
-отказы        : нет
+bus           : mock
+state         : probed
+after configuration: configured
+mode          : SWITCHING (code 3)
+SYS_STS       : 0x04 (current loop: no, voltage loop: no)
+faults        : none
 
-показания АЦП (мок), каналы алармов:
+ADC readings (mock), alarm channels:
   iin       ADC1     489000 uA
-  vin       ADC3    3200000 uV
-  vbat      ADC6    4340000 uV
+  vin       ADC3     192000 uV
+  vbat      ADC6    3340000 uV
 
-операций      : записей 27, чтений 67
-после standby : STANDBY
+operations    : writes 33, reads 84
+after standby : STANDBY
 ```
 
-Ожидаемый вывод `demo` (проверено, см. `artifacts/verify-demo.txt`):
+`demo`. The two failures are deliberate: they exercise the error path.
 
 ```text
-сценарий   итог   адаптер    ток,мкА pump   пояснение
+scenario   result adapter    current,µA pump   note
 ------------------------------------------------------------------------------
-HVDCP3P5   ок     HVDCP3     3000000 да     Quick Charge 3.0, 9 В и 3 А, возможен charge pump
-HVDCP3     ок     HVDCP3     3000000 да     Quick Charge 3.0, 9 В и 3 А, возможен charge pump
-HVDCP2     ок     HVDCP2     1500000 нет    Quick Charge 2.0, 9 В и 1.5 А
-DCP        ок     DCP        1500000 нет    порт только зарядки, BC1.2 1.5 А
-SDP        ок     SDP        500000  нет    стандартный порт USB, предел 500 мА
-DETACHED   отказ  —          —       —      ошибка detection_timeout — питание отсутствует: ожидается таймаут
-UNKNOWN    отказ  —          —       —      ошибка unknown_adapter_pattern — неизвестный образец: ожидается отказ
+HVDCP3P5   ok     HVDCP3     3000000 yes    Quick Charge 3.0, 9 V and 3 A, charge pump possible
+HVDCP3     ok     HVDCP3     3000000 yes    Quick Charge 3.0, 9 V and 3 A, charge pump possible
+HVDCP2     ok     HVDCP2     1500000 no     Quick Charge 2.0, 9 V and 1.5 A
+DCP        ok     DCP        1500000 no     charging-only port, BC1.2 1.5 A
+SDP        ok     SDP        500000  no     standard USB port, 500 mA limit
+DETACHED   failure -          -       -      error detection_timeout - no power: a timeout is expected
+UNKNOWN    failure -          -       -      error unknown_adapter_pattern - unknown pattern: a failure is expected
+
+journal: artifacts\journal-demo.jsonl
 ```
 
-## Как это работает
+`verify` ends with:
 
 ```text
-клиент (IOCTL) ──► драйвер KMDF ──► ядро логики ──► транспорт ──► \Device\RESOURCE_HUB (SPMI) ──► SMB в PM8150B
-                                     │
-                                     ├─ читает APSD_STATUS / APSD_RESULT_STATUS
-                                     ├─ разбирает тип адаптера (таблица из Android)
-                                     └─ пишет лимит входного тока и напряжение QC2
+self-check: passed (policies, current grid, APSD decoding, error path)
 ```
 
-Ядро не знает ни про Windows, ни про ввод-вывод: оно работает поверх трейта
-[`ChargerTransport`](crates/core/src/transport.rs), а время и журнал получает
-извне. Поэтому вся логика, включая таймауты и восстановление после сбоев,
-проверяется без железа.
+## How it works
 
-Архитектура подробно: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
-Карта регистров: [docs/REGISTERS.md](docs/REGISTERS.md).
+```text
+client (IOCTL) ──► KMDF driver ──► logic core ──► transport ──► \Device\RESOURCE_HUB (SPMI) ──► SMB in PM8150B
+                                     │
+                                     ├─ reads APSD_STATUS / APSD_RESULT_STATUS
+                                     ├─ decodes the adapter type (table from Android)
+                                     └─ writes the input current limit and the QC2 voltage
+```
 
-## Ограничения и честные оговорки
+The core knows nothing about Windows and nothing about I/O: it works on top of the
+[`ChargerTransport`](crates/core/src/transport.rs) trait, and it is handed time and
+the journal from the outside. That is why all of the logic, timeouts and failure
+recovery included, is testable without hardware.
 
-* **Драйвер режима ядра** (`crates/kmdf`) собирается под ARM64
-  (`cargo wdk build --target-arch arm64`): `kmdf.sys` подписан, INF прошёл
-  `infverif`, разрядность подтверждена по PE (`0xAA64`). Пакет лежит в
-  `artifacts/driver-arm64/`. Требуется LLVM **17.x** для `bindgen`.
-* **Таймер детекции** в драйвере ещё не подключён к очереди: IOCTL
-  `DETECT_START`/`APPLY_POLICY`/`GET_JOURNAL` возвращают `STATUS_NOT_IMPLEMENTED`.
-  Логика под ними готова и проверена на моках — осталась проводка в ядре.
-* **Read-путь** транспорта SPMI пока возвращает типизированный отказ: раскладка
-  ответа шины не подтверждена реверсом до конца (см. `TODO(RE)` в
-  `crates/kmdf/src/spmi.rs`). Догадка не выдаётся за факт.
-* **Charge pump (LN8000)** — ядро готово и проверено (`crates/ln8000`: 29 тестов),
-  но драйвера поверх шины I²C под Windows пока нет: нужен KMDF-модуль на SpbCx
-  для узла ACPI `PEIC` (адрес 0x51). Регистры и последовательности уже описаны —
-  см. [docs/LN8000.md](docs/LN8000.md).
-* **Согласование напряжения (PD)** остаётся за Type-C-частью платформы: без неё
-  charge pump может держать уже согласованное напряжение или работать в bypass
-  от 5 В, но не выдаст полные 33 Вт.
+More detail: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md),
+[docs/REGISTERS.md](docs/REGISTERS.md), [docs/LN8000.md](docs/LN8000.md).
 
-## Сборка драйвера
+## Limitations and honest caveats
+
+* **The IOCTL surface of the SMB driver is not wired up yet.** `GET_STATUS`
+  answers. `READ_REG` returns a payload whose `error_code` is
+  `STATUS_NOT_IMPLEMENTED`, and `WRITE_REG`, `SET_ICL` and `GET_JOURNAL` return
+  `STATUS_NOT_IMPLEMENTED` outright. Detection and policy application run on the
+  bring-up timer, so `DETECT_START` and `APPLY_POLICY` answer the same way. The
+  logic behind those entry points is written and covered by mock-based tests; what
+  is missing is the kernel-side plumbing.
+* **The SPMI response layout is not confirmed by reverse engineering.** The
+  transport builds a register read as "16-bit address, then one byte" and the
+  driver holds a live `Charger` over it, but the framing of the bus response has
+  not been proven, so [docs/REGISTERS.md](docs/REGISTERS.md) and
+  [docs/SPMI-PATH.md](docs/SPMI-PATH.md) keep register readings provisional. A
+  guess is not presented as a fact.
+* **Building the kernel-mode drivers needs the WDK.** `kmdf.sys` is signed, its INF
+  passes `infverif`, and the PE machine field confirms 64-bit ARM (`0xAA64`). The
+  package is written to `artifacts/driver-arm64/`. LLVM **17.x** is required for
+  `bindgen`.
+* **PD voltage negotiation stays with the platform's Type-C part.** Without it the
+  charge pump can hold an already-negotiated voltage or work in bypass from 5 V,
+  but it cannot deliver the full 33 W.
+* **The LN8000 driver is deployed and under measurement, not finished.** The KMDF
+  driver for the ACPI node `PEIC` (I²C address 0x51) is built and installed on the
+  tablet. [docs/STATE-2026-09-17.md](docs/STATE-2026-09-17.md) records the defects
+  that are still open, and [docs/DEPLOY-LN8000.md](docs/DEPLOY-LN8000.md) is the
+  install and diagnostics procedure.
+
+## Building the driver
 
 ```powershell
 rustup target add aarch64-pc-windows-msvc
 cargo install cargo-wdk --locked
-$env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"   # нужен LLVM 17.0.6
+$env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"   # LLVM 17.0.6 required
 
-# драйвер SMB-детекции (детекция блока и лимит тока)
+# The SMB detection driver (block detection and input current limit)
 cd crates/kmdf        ; cargo wdk build --target-arch arm64 --profile release
 
-# драйвер charge pump LN8000 (узел PEIC, I2C 0x51)
+# The LN8000 charge pump driver (PEIC node, I2C 0x51)
 cd crates/ln8000-kmdf ; cargo wdk build --target-arch arm64 --profile release
 ```
 
-Готовые пакеты: `artifacts/driver-arm64/` (SMB) и
-`artifacts/driver-ln8000-arm64/` (LN8000).
+The packages are written to `artifacts/driver-arm64/` (SMB) and
+`artifacts/driver-ln8000-arm64/` (LN8000). Both are produced locally and are not
+tracked by git.
 
-Установка и диагностика LN8000 — [docs/DEPLOY-LN8000.md](docs/DEPLOY-LN8000.md):
+Installing and diagnosing the LN8000 - [docs/DEPLOY-LN8000.md](docs/DEPLOY-LN8000.md):
 `install-driver.ps1`, `nabu-ln8000.ps1 status|sessions|read|write|journal`,
-`run-acceptance.ps1` (автоматический протокол приёмки), `uninstall-driver.ps1`.
-Все скрипты в UTF-8 с BOM.
+`run-acceptance.ps1` (the automated acceptance protocol) and
+`uninstall-driver.ps1`. A PowerShell script that carries non-ASCII text is saved
+as UTF-8 with a BOM, because PowerShell 5.1 otherwise decodes it as ANSI and
+mis-parses the quoting.
 
-## Лицензия
+## Licence
 
-Двойная: MIT или Apache-2.0, на выбор. См. [LICENSE-MIT](LICENSE-MIT) и
+Dual: MIT or Apache-2.0, at your option. See [LICENSE-MIT](LICENSE-MIT) and
 [LICENSE-APACHE](LICENSE-APACHE).

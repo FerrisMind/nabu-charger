@@ -1,26 +1,29 @@
-//! KMDF-драйвер charge pump LN8000 (Xiaomi Pad 5, `nabu`), Windows on ARM64.
+//! KMDF driver for the LN8000 charge pump (Xiaomi Pad 5, `nabu`), Windows on ARM64.
 //!
-//! # Что делает драйвер
+//! # What the driver does
 //!
-//! 1. Встаёт на существующий узел ACPI `PEIC` (`_HID = QCOM057E`) — это внешняя
-//!    ИС LN8000 на шине I²C с адресом 0x51 (см. `09-acpi-nabu/ln8000-acpi-uefi.md`).
-//! 2. В `EvtDevicePrepareHardware` разбирает `_CRS`, достаёт идентификатор
-//!    подключения и открывает шину через Resource Hub: путь
-//!    `\Device\RESOURCE_HUB\<16 hex>` (правило из `reshub.h`).
-//! 3. Проверяет `DEVICE_ID`, настраивает пороги и защиты, включает режим 2:1.
-//! 4. Таймером периодически снимает телеметрию (напряжения, ток, температуру),
-//!    ведёт журнал сеансов заряда и применяет защиту по температуре и току.
-//! 5. Отдаёт состояние и журнал пользовательскому режиму через IOCTL.
+//! 1. Attaches to the existing ACPI node `PEIC` (`_HID = QCOM057E`) - that is the
+//!    external LN8000 IC on the I²C bus at address 0x51 (see
+//!    `09-acpi-nabu/ln8000-acpi-uefi.md`).
+//! 2. In `EvtDevicePrepareHardware` parses `_CRS`, takes the connection
+//!    identifier and opens the bus through the Resource Hub: path
+//!    `\Device\RESOURCE_HUB\<16 hex>` (rule from `reshub.h`).
+//! 3. Checks `DEVICE_ID`, sets up thresholds and protection, enables 2:1 mode.
+//! 4. The timer samples telemetry periodically (voltages, current, temperature),
+//!    keeps a journal of charge sessions and applies temperature and current
+//!    protection.
+//! 5. Exposes state and journal to user mode through IOCTL.
 //!
-//! # Почему ARM64
+//! # Why ARM64
 //!
-//! Целевое устройство — планшет под Snapdragon 860; сборка идёт только под
-//! `aarch64-pc-windows-msvc` (см. `.cargo/config.toml` рядом).
+//! The target device is a tablet with a Snapdragon 860; the build only targets
+//! `aarch64-pc-windows-msvc` (see `.cargo/config.toml` next to this file).
 //!
-//! # Состояние проверки
+//! # Verification status
 //!
-//! Ядро логики ([`ln8000`]) покрыто тестами на хосте. Обвязка WDF собирается
-//! `cargo wdk build`; проверка на планшете описана в `docs/DEPLOY-LN8000.md`.
+//! The core logic ([`ln8000`]) is covered by host tests. The WDF glue is built
+//! with `cargo wdk build`; on-tablet verification is described in
+//! `docs/DEPLOY-LN8000.md`.
 
 #![no_std]
 #![deny(missing_docs)]
@@ -35,17 +38,17 @@ mod sysreq;
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-/// Код остановки `MANUALLY_INITIATED_CRASH`: «драйвер сам остановил систему».
+/// Stop code `MANUALLY_INITIATED_CRASH`: "the driver itself stopped the system".
 ///
-/// Своё значение не заводим: у этого кода параметры вольные, а номер читается
-/// однозначно, в отличие от самодельного.
+/// We do not define our own value: this code has free-form parameters, and its
+/// number reads unambiguously, unlike a home-made one.
 const BUGCHECK_MANUALLY_INITIATED_CRASH: u32 = 0x0000_00E2;
 
-/// Магия паники (`LN80`) — отличает наш вызов от любого чужого `0xE2`.
+/// Panic magic (`LN80`) - distinguishes our call from any other `0xE2`.
 const PANIC_MAGIC: usize = 0x4C4E_3830;
 
 unsafe extern "C" {
-    /// Останавливает систему с диагностируемым кодом (`ntoskrnl`).
+    /// Stops the system with a diagnosable code (`ntoskrnl`).
     fn KeBugCheckEx(
         bugcheck_code: u32,
         parameter1: usize,
@@ -55,7 +58,7 @@ unsafe extern "C" {
     ) -> !;
 }
 
-/// FNV-1a от имени файла: в параметры остановки влезает число, а не строка.
+/// FNV-1a of the file name: the stop parameters fit a number, not a string.
 const fn file_hash(path: &str) -> usize {
     let bytes = path.as_bytes();
     let mut hash: u32 = 0x811C_9DC5;
@@ -68,14 +71,14 @@ const fn file_hash(path: &str) -> usize {
     hash as usize
 }
 
-/// Обработчик паники: вместо бесконечного цикла — аварийная остановка.
+/// Panic handler: an emergency stop instead of an infinite loop.
 ///
-/// Штатный `wdk-panic 0.4.1` крутится в `loop {}` (в его исходнике так и
-/// написано: `FIXME: Should this trigger Bugcheck via KeBugCheckEx?`). Цикл на
-/// месте паники — это зависший процессор без единой зацепки и с удержанными
-/// блокировками; дампы 18.09 пришлось разбирать по RVA вручную. Остановка
-/// оставляет и модуль, и точное место: `Arg1` — магия `LN80`, `Arg2` — строка,
-/// `Arg3` — колонка, `Arg4` — FNV-1a от имени файла.
+/// The stock `wdk-panic 0.4.1` spins in `loop {}` (its source even says so:
+/// `FIXME: Should this trigger Bugcheck via KeBugCheckEx?`). A loop at the panic
+/// site means a hung processor with no single clue and with locks held; the
+/// 18.09 dumps had to be taken apart by RVA by hand. A stop leaves both the
+/// module and the exact site: `Arg1` - the `LN80` magic, `Arg2` - line,
+/// `Arg3` - column, `Arg4` - FNV-1a of the file name.
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     let (line, column, file_hash_value) = match info.location() {
@@ -86,8 +89,8 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
         ),
         None => (0, 0, 0),
     };
-    // SAFETY: `KeBugCheckEx` вызывается на любом уровне IRQL и не возвращает
-    // управление; печать не делаем — на месте паники она может не пройти.
+    // SAFETY: `KeBugCheckEx` may be called at any IRQL and does not return;
+    // we do not print - at the panic site it may not go through.
     unsafe {
         KeBugCheckEx(
             BUGCHECK_MANUALLY_INITIATED_CRASH,
@@ -126,7 +129,7 @@ use wdk_sys::{
     WDF_PNPPOWER_EVENT_CALLBACKS, WDF_REQUEST_SEND_OPTIONS, WDF_TIMER_CONFIG,
 };
 
-/// Интерфейс устройства для пользовательского режима.
+/// Device interface for user mode.
 ///
 /// `{B0A1C3D2-4E5F-4A6B-8C7D-9E0F1A2B3C4D}`
 pub const GUID_DEVINTERFACE_LN8000: wdk_sys::GUID = wdk_sys::GUID {
@@ -136,133 +139,140 @@ pub const GUID_DEVINTERFACE_LN8000: wdk_sys::GUID = wdk_sys::GUID {
     Data4: [0x8C, 0x7D, 0x9E, 0x0F, 0x1A, 0x2B, 0x3C, 0x4D],
 };
 
-/// Нижняя граница периода телеметрии, мс (реестр `TelemetryMs`).
+/// Lower bound of the telemetry period, ms (registry `TelemetryMs`).
 const TELEMETRY_MS_MIN: u32 = 100;
 
-/// Период повторных попыток автозапуска, мс.
+/// Retry period for charge autostart, ms.
 const CHARGE_RETRY_MS: u64 = 30_000;
 
-/// Изменение входа, при котором попытка повторяется сразу, мкВ.
+/// Input change that triggers an immediate retry, µV.
 const CHARGE_RETRY_DELTA_UV: u32 = 300_000;
 
-/// Пол между попытками «по изменению входа», мс.
+/// Floor between "input changed" retries, ms.
 ///
-/// Сам по себе [`CHARGE_RETRY_DELTA_UV`] темпа не ограничивает: на пяти­вольтовом
-/// входе `recover_5v_bypass` делает POR, POR перезапускает детект входа, и шина
-/// ходит пилой в пол-вольта. Каждый зуб — «вход изменился» и новая попытка.
-/// Живой замер 19.09 14:45 (MDY-08-EI после потери QC-уровня): Vin 4,27↔4,83 В,
-/// `ChargeAttemptN` 198→346 за 3,5 мин (1,6 попытки/с), `FAULT1 = 0x21`, ток —
-/// пол АЦП. Пол в пять секунд оставляет быстрый повтор осмысленным (QC поднял
-/// шину — перерешаем сразу), но снимает шторм: POR тяжёл, а защёлка VFAULT после
-/// него всё равно возвращается, пока вход не поднят.
+/// [`CHARGE_RETRY_DELTA_UV`] alone does not limit the rate: on a five-volt
+/// input `recover_5v_bypass` does a POR, the POR restarts input detection, and
+/// the bus runs like a sawtooth in half a volt. Every tooth is "input changed"
+/// and a new attempt. Live measurement 19.09 14:45 (MDY-08-EI after losing the
+/// QC level): Vin 4,27↔4,83 V, `ChargeAttemptN` 198→346 in 3,5 min (1,6
+/// attempts/s), `FAULT1 = 0x21`, current at the ADC floor. A five-second floor
+/// keeps a fast retry meaningful (QC raised the bus - we re-decide at once),
+/// but stops the storm: a POR is heavy, and the VFAULT latch returns after it
+/// anyway until the input is raised.
 const CHARGE_RETRY_FAST_MS: u64 = 5_000;
 
-/// Первая выдержка повторного разгона HVDCP, мс.
+/// First delay of the HVDCP re-elevation, ms.
 ///
-/// Согласование идёт только по автостарту и по фронту входа
-/// ([`hvdcp::should_renegotiate_on_input_edge`]), поэтому потерянный QC-уровень
-/// сам не возвращается: блок откатился на 5 В, обход 1:1 закрыт защёлкой — и
-/// шина стоит на пяти вольтах до переподключения. Живой замер 19.09 14:45:
-/// `ac=1`, `chg=0`, mode 1, 39 мА, `LastEnableErr = -4`, `FAULT1 = 0x21`.
-/// Здесь мы повторяем то, что делает переподключение, не дожидаясь оператора.
+/// Negotiation only happens on autostart and on the input edge
+/// ([`hvdcp::should_renegotiate_on_input_edge`]), so a lost QC level does not
+/// come back by itself: the brick fell back to 5 V, the 1:1 bypass is closed by
+/// the latch - and the bus sits at five volts until the cable is re-plugged.
+/// Live measurement 19.09 14:45: `ac=1`, `chg=0`, mode 1, 39 mA,
+/// `LastEnableErr = -4`, `FAULT1 = 0x21`. Here we repeat what re-plugging does,
+/// without waiting for the operator.
 const RE_ELEVATE_FIRST_MS: u64 = 60_000;
 
-/// Предел выдержки повторного разгона, мс.
+/// Limit of the re-elevation delay, ms.
 ///
-/// На честном пяти­вольтовом источнике (DCP-зарядник, порт без QC) разгон
-/// бесполезен, а стоит транзакций SPMI и сброса детекта входа, поэтому каждая
-/// неудача удваивает выдержку до этого предела.
+/// On an honest five-volt source (DCP charger, port without QC) elevation is
+/// useless, and it costs SPMI transactions and an input detection reset, so
+/// every failure doubles the delay up to this limit.
 const RE_ELEVATE_BACKOFF_MAX_MS: u64 = 300_000;
 
-/// Банка, выше которой повторный разгон не нужен, мкВ.
+/// Cell level above which re-elevation is not needed, µV.
 ///
-/// У верха заряда ток и так ограничен тапером, а лишний сброс входа на
-/// заполненной банке мешает дозаряду.
+/// At the top of the charge the current is already limited by the taper, and an
+/// extra input reset on a full cell only hinders top-off charging.
 const RE_ELEVATE_MAX_VBAT_UV: u32 = 4_350_000;
 
-/// Шаг поля FCC бака (buck) SMB5 PM8150B, мкА на разряд.
+/// Step of the FCC field of the SMB5 PM8150B buck, µA per bit.
 ///
-/// `.step_u` параметра PM8150B в вендорной шапке
+/// `.step_u` of the PM8150B parameter in the vendor header
 /// (`drivers_power_supply_qcom_qpnp-smb5.c:128-134`: `min_u = 0`,
-/// `max_u = 8 000 000`, `step_u = 50 000`); там же и регистр —
-/// `CHGR_FAST_CHARGE_CURRENT_CFG_REG`. Живой замер 19.09 дал `ChgrFccRaw = 30`,
-/// то есть 1,50 А, — это и есть заводской предел бака на нашем планшете.
+/// `max_u = 8 000 000`, `step_u = 50 000`); the register is there too:
+/// `CHGR_FAST_CHARGE_CURRENT_CFG_REG`. A live measurement on 19.09 gave
+/// `ChgrFccRaw = 30`, that is 1,50 A, - and that is the factory buck limit on
+/// our tablet.
 const FCC_STEP_UA: u32 = 50_000;
 
-/// Имя параметра реестра, которым включается политика FCC бака: сырое значение
-/// поля FCC регистра `0x1061` (50 мА на разряд), которое драйвер ставит, пока
-/// насос несёт ток.
+/// Name of the registry parameter that enables the buck FCC policy: the raw
+/// value of the FCC field of register `0x1061` (50 mA per bit) that the driver
+/// sets while the pump is carrying current.
 ///
-/// Параметра нет или он равен нулю — политики нет вовсе: регистр за загрузку не
-/// трогается ни разу. Это умолчание и вместе с тем поведение сборки `.652`, с
-/// которой снят базовый замер. Значение `N > 0` включает подъём до сырого `N`;
-/// потолок [`FCC_WRITE_MAX_UA`] применяет [`raw_for`], и другой дорогой его не
-/// обойти.
+/// No parameter or a zero value means no policy at all: the register is never
+/// touched during a boot. This is the default and at the same time the
+/// behaviour of build `.652`, from which the baseline measurement was taken.
+/// A value `N > 0` enables raising up to the raw `N`; the ceiling
+/// [`FCC_WRITE_MAX_UA`] is applied by [`raw_for`], and there is no other way
+/// around it.
 ///
-/// Ручка появилась не из осторожности, а из живого замера 19.09, который
-/// опрокинул исходное предположение. Сборка `.655` поднимала предел бака до
-/// 2,5 А (`FccRaw = 50`) на том основании, что заводские 1,5 А (`ChgrFccRaw =
-/// 30`, `FgIbatUa` ≈ 2,9 А, `SysStsRaw = 0x04`) душат перенос, — и скорость
-/// заряда банки упала вдвое: 0,409 %/мин на `.652` без подъёма против
-/// 0,249 %/мин на `.655`, а доля тактов в режиме 2:1 — с 85 % (34 отсчёта из
-/// 40) до 39 % (13 из 33). Механизм виден в том же замере: перенос делит
-/// восемнадцать ватт адаптера между насосом и баком, и разрешённые баку 2,5 А
-/// этот бюджет вычерпывают — адаптер теряет поднятый уровень QC3 (`FAULT1 =
-/// 0x21` защёлкивается, `SuMode` падает до 1, шина 4,5 В), после чего насос
-/// сваливается на пяти­вольтовый путь, где банка получает около 0,7 А. Предел
-/// при этом работает: пока насос удерживает 2:1, ток в банку доходит до
-/// −2,5…−3,2 А, то есть вредит не он, а исчерпанный бюджет конкретного блока,
-/// и на другом адаптере ответ может быть обратным. Проверяется это только
-/// A/B на железе, а он не должен стоить пересборки: значение и стало
-/// параметром. Верхняя граница вендорного DT планшета — 5,9 А
-/// (`qcom,fcc-max-ua = <5900000>`,
-/// `arch/arm64/boot/dts/qcom/xiaomi/overlay/nabu/nabu-sm8150.dtsi:68`), но
-/// канала температуры банки, которому можно верить, у драйвера нет, поэтому
-/// потолок записи оставлен ниже — на [`FCC_WRITE_MAX_UA`].
+/// This knob appeared not out of caution but from a live measurement on 19.09
+/// that overturned the original assumption. Build `.655` raised the buck limit
+/// to 2,5 A (`FccRaw = 50`) on the grounds that the factory 1,5 A (`ChgrFccRaw =
+/// 30`, `FgIbatUa` ≈ 2,9 A, `SysStsRaw = 0x04`) choke the transfer, - and the
+/// cell charge rate fell by half: 0,409 %/min on `.652` without the raise
+/// against 0,249 %/min on `.655`, and the share of ticks in 2:1 mode - from
+/// 85 % (34 samples out of 40) to 39 % (13 out of 33). The mechanism is visible
+/// in the same measurement: the transfer divides the adapter's eighteen watts
+/// between the pump and the buck, and the 2,5 A allowed to the buck drain that
+/// budget - the adapter loses the raised QC3 level (`FAULT1 = 0x21` latches,
+/// `SuMode` drops to 1, bus 4,5 V), after which the pump falls back to the
+/// five-volt path, where the cell gets about 0,7 A. The limit itself works:
+/// while the pump holds 2:1, the current into the cell reaches −2,5…−3,2 A,
+/// that is it is not the limit that hurts but the exhausted budget of a
+/// particular brick, and on another adapter the answer may be the opposite.
+/// This is only verified by A/B on hardware, and that must not cost a rebuild:
+/// so the value became a parameter. The upper bound of the tablet's vendor DT
+/// is 5,9 A (`qcom,fcc-max-ua = <5900000>`,
+/// `arch/arm64/boot/dts/qcom/xiaomi/overlay/nabu/nabu-sm8150.dtsi:68`), but the
+/// driver has no trustworthy cell temperature channel, so the write ceiling is
+/// left lower - at [`FCC_WRITE_MAX_UA`].
 const FCC_POLICY_VALUE_NAME: &str = "FccRaw";
 
-/// Уставка одноразовой пробы записи FCC бака, мкА.
+/// Setpoint of the one-shot buck FCC write probe, µA.
 ///
-/// Проба нужна потому, что путь записи в CHGR до сих пор не исполнялся ни разу:
-/// живой замер 19.09 — 92 % банки, 4,375 В, `ChgrFccRaw = 30` — лежит выше ворот
-/// политики, а насос при этом тока не несёт, то есть ни одно условие подъёма не
-/// выполняется и вопрос «принимает ли периферия CHGR запись вообще» остаётся без
-/// ответа. Снаружи его не решить: `\Device\Spmi\SUPERUSER` — имя уровня ядра, у
-/// него нет пользовательской символической ссылки, и открытие из user mode
-/// возвращает `STATUS_OBJECT_PATH_NOT_FOUND`; драйвер — единственный путь к шине,
-/// поэтому и проба живёт в драйвере.
+/// The probe is needed because the CHGR write path has never been executed even
+/// once: the live measurement on 19.09 - 92 % cell, 4,375 V, `ChgrFccRaw = 30`
+/// - lies above the policy gate, and the pump is not carrying current, so not a
+/// single raise condition holds and the question "does the CHGR peripheral
+/// accept a write at all" stays unanswered. It cannot be resolved from the
+/// outside: `\Device\Spmi\SUPERUSER` is a kernel-level name, it has no user
+/// symbolic link, and opening it from user mode returns
+/// `STATUS_OBJECT_PATH_NOT_FOUND`; the driver is the only path to the bus, so
+/// the probe lives in the driver too.
 ///
-/// 1,00 А (сырое 20) — строго ниже заводского значения на этой плате (30, то есть
-/// 1,50 А), и это не осторожность, а требование к пробе: вниз ошибка безопасна
-/// (такая уставка не может поднять ток в банку), вверх — нет. На 92 % бак ведёт
-/// тапер и отдаёт куда меньше ампера, так что на доли секунды, пока уставка
-/// стоит, она не ограничивает перенос; заводское возвращается в том же такте.
+/// 1,00 A (raw 20) is strictly below the factory value on this board (30, that
+/// is 1,50 A), and this is not caution but a requirement on the probe: an error
+/// downwards is safe (such a setpoint cannot raise the current into the cell),
+/// upwards it is not. At 92 % the buck is driven by the taper and delivers far
+/// less than an ampere, so for the fractions of a second while the setpoint
+/// stands it does not limit the transfer; the factory value returns in the same
+/// tick.
 const FCC_PROBE_UA: u32 = 1_000_000;
 
-/// Грация перед возвратом FCC к исходному значению после остановки насоса, мс.
+/// Grace before the FCC returns to its original value after the pump stops, ms.
 ///
-/// Насос гаснет на тактах петли QC3 (шаг шины, тапер, отказ режима), и
-/// мгновенная реакция на каждый такой такт означала бы запись в SPMI по
-/// несколько раз в минуту. Две минуты держат поднятый предел через короткие
-/// перерывы переноса и всё равно возвращают исходное раньше, чем оператор
-/// успел бы снять журнал.
+/// The pump goes out on QC3 loop ticks (bus step, taper, mode failure), and an
+/// instant reaction to every such tick would mean an SPMI write several times a
+/// minute. Two minutes hold the raised limit through short transfer gaps and
+/// still return the original sooner than an operator could take the journal.
 const FCC_RESTORE_GRACE_MS: u64 = 120_000;
 
-/// Потолок записи FCC: выше него драйвер не пишет ни при каких условиях, мкА.
+/// FCC write ceiling: above it the driver does not write under any conditions, µA.
 ///
-/// Ниже вендорного `qcom,fcc-max-ua` (5,9 А) с запасом. 3 А — это шестьдесят
-/// разрядов 8-битного поля; дальше начинается область, где цена ошибки в шаге
-/// выше выигрыша от снятого потолка.
+/// Below the vendor `qcom,fcc-max-ua` (5,9 A) with margin. 3 A is sixty steps
+/// of the 8-bit field; beyond that begins the region where the cost of a mistake
+/// in the step is higher than the gain from a lifted ceiling.
 const FCC_WRITE_MAX_UA: u32 = 3_000_000;
 
-/// Сырое значение FCC для уставки в мкА.
+/// Raw FCC value for a setpoint in µA.
 ///
-/// Единственное место, которое знает кодирование регистра `0x1061`, — и для
-/// подъёма, и для возврата: исходный байт возвращается в микроамперы и снова
-/// проходит через эту функцию, так что потолок [`FCC_WRITE_MAX_UA`] нельзя
-/// обойти другой дорогой. Деление насыщающее: уставка выше поля должна
-/// упереться в потолок, а не обрезаться по модулю 256 — обрезанное значение
-/// записало бы в чип ток **меньше** задуманного.
+/// The only place that knows the encoding of register `0x1061` - both for the
+/// raise and for the return: the original byte is converted back to microamps
+/// and passes through this function again, so the ceiling [`FCC_WRITE_MAX_UA`]
+/// cannot be bypassed another way. The division saturates: a setpoint above the
+/// field must hit the ceiling rather than wrap modulo 256 - a wrapped value
+/// would write **less** current into the chip than intended.
 const fn raw_for(ua: u32) -> u8 {
     let raw = ua / FCC_STEP_UA;
     let cap = FCC_WRITE_MAX_UA / FCC_STEP_UA;
@@ -273,64 +283,67 @@ const fn raw_for(ua: u32) -> u8 {
     }
 }
 
-/// Минимальный выигрыш отклонения шины от цели, считающийся прогрессом, мкВ.
+/// Minimum bus deviation from the target counted as progress, µV.
 ///
-/// Меньше шага QC3 (200 мВ) с запасом: 50 мВ отделяет настоящий сдвиг от
-/// дрожания АЦП, но не требует угадать реальную крутизну импульса.
+/// Below the QC3 step (200 mV) with margin: 50 mV separates a real shift from
+/// ADC jitter, but does not require guessing the real pulse slope.
 const WINDOW_PROGRESS_UV: u32 = 50_000;
 
-/// Сколько коррекций без прогресса терпит петля окна до редкого повтора.
+/// How many corrections without progress the window loop tolerates before a rare repeat.
 const WINDOW_STALL_MAX: u32 = 4;
 
-/// Интервал коррекции шины в застое, мс.
+/// Bus correction interval during a stall, ms.
 ///
-/// Застой означает, что импульсы QC3 не меняют вход (не-QC3 адаптер) либо шаг
-/// блока мельче ожидаемого. Редкий повтор оставляет попытку, но снимает
-/// постоянную нагрузку на SPMI.
+/// A stall means the QC3 pulses do not change the input (non-QC3 adapter) or
+/// the brick step is finer than expected. A rare repeat keeps the attempt but
+/// removes the constant load on SPMI.
 const WINDOW_STALL_MS: u64 = 60_000;
 
-/// Окно наблюдения пика входного тока для метки `MaxIinUa`, мс.
+/// Observation window of the input current peak for the `MaxIinUa` mark, ms.
 const IIN_WINDOW_MS: u64 = 5_000;
-/// Период опроса топливного счётчика PM8150B, мс.
+/// Poll period of the PM8150B fuel counter, ms.
 ///
-/// Счётчик — медленная величина: один сырой шаг это ~0,4 % ёмкости, а одна
-/// транзакция SUPERUSER на этой платформе идёт около двух секунд. Опрос каждые
-/// 250 мс (сборка `.627`) занимал шину почти постоянно: сторонний user-mode
-/// читатель получал `ERROR_GEN_FAILURE` в 79 попытках из 100 (замер 18.09), и
-/// приёмка оставалась без `0x1307`/`0x1506`. Раз в 30 с шина свободна ~94 %,
-/// а индикатору заряда этого хватает с запасом.
+/// The counter is a slow quantity: one raw step is ~0,4 % of capacity, and one
+/// SUPERUSER transaction on this platform takes about two seconds. Polling every
+/// 250 ms (build `.627`) occupied the bus almost constantly: a third-party
+/// user-mode reader got `ERROR_GEN_FAILURE` in 79 attempts out of 100
+/// (measurement 18.09), and acceptance was left without `0x1307`/`0x1506`.
+/// Once every 30 s the bus is free ~94 % of the time, and the charge indicator
+/// is more than satisfied with that.
 const GAUGE_POLL_MS: u32 = 30_000;
 
-// Короткие числовые коды метки `EngageState` — состояние «есть ли вход и режим».
-/// Входа нет (`Vin` ниже порога присутствия).
+// Short numeric codes of the `EngageState` mark - the state "is there input and mode".
+/// No input (`Vin` below the presence threshold).
 const ENGAGE_NO_INPUT: u32 = 0;
-/// Вход есть, заряда/режима нет (standby).
+/// Input present, no charge/mode (standby).
 const ENGAGE_STANDBY: u32 = 1;
-/// Включён обход 1:1.
+/// 1:1 bypass enabled.
 const ENGAGE_BYPASS: u32 = 2;
-/// Включён режим 2:1.
+/// 2:1 mode enabled.
 const ENGAGE_SWITCHING: u32 = 3;
-/// Вход повышен, но 2:1 физически не тянет (`Vin < 2*Vbat + 250 мВ`),
-/// а обход при таком напряжении запрещён.
+/// Input is elevated, but 2:1 physically cannot carry it
+/// (`Vin < 2*Vbat + 250 mV`), and bypass at such a voltage is forbidden.
 const ENGAGE_NO_HEADROOM: u32 = 4;
 
-/// Сколько отказов подряд считать защёлкнутым состоянием чипа.
+/// How many consecutive failures count as a latched chip state.
 ///
-/// Чип защёлкивает отказ, если режим запрошен при невалидном входе, и после этого
-/// отказывает даже при нормальном входе. Штатный выход — программный сброс
-/// и повторная настройка, как это делает эталонный драйвер при потере обмена.
+/// The chip latches a failure if a mode is requested with an invalid input, and
+/// after that it fails even with a normal input. The stock way out is a software
+/// reset and reconfiguration, as the reference driver does on loss of
+/// communication.
 const CHARGE_FAILS_BEFORE_RESET: u32 = 3;
 
-/// Значение метки `ProfSel`, когда параметра `ProtectionProfile` в реестре нет.
+/// `ProfSel` mark value when there is no `ProtectionProfile` parameter in the
+/// registry.
 const PROFILE_NOT_SET: u32 = u32::MAX;
 
-/// Состояние драйвера: единственный экземпляр устройства.
+/// Driver state: the single device instance.
 ///
-/// # Инварианты
+/// # Invariants
 ///
-/// Поля трогает либо последовательная очередь управляющих запросов, либо
-/// таймер телеметрии; WDF сериализует их между собой, поэтому одновременного
-/// доступа нет. Именно поэтому `Sync` объявляется вручную.
+/// The fields are touched either by the sequential control-request queue or by
+/// the telemetry timer; WDF serializes them against each other, so there is no
+/// concurrent access. That is exactly why `Sync` is declared by hand.
 struct DriverState {
     pump: Option<Pump<SpbBus>>,
     telemetry: Telemetry,
@@ -339,34 +352,35 @@ struct DriverState {
     reads: u32,
     last_error: i32,
     actions: u32,
-    /// Период телеметрии из реестра, мс.
+    /// Telemetry period from the registry, ms.
     telemetry_ms: u32,
-    /// Время последней попытки автозапуска заряда, мс.
+    /// Time of the last charge autostart attempt, ms.
     last_charge_attempt_ms: u64,
-    /// Напряжение входа при последней попытке, мкВ.
+    /// Input voltage at the last attempt, µV.
     last_attempt_vbus_uv: u32,
-    /// Сколько раз автозапуск включал заряд.
+    /// How many times autostart enabled the charge.
     auto_starts: u32,
-    /// Отказов заряда подряд: считаем, чтобы понять про защёлкнутое состояние.
+    /// Consecutive charge failures: counted to detect a latched state.
     failed_attempts: u32,
-    /// Сколько всего попыток включить заряд (`ChargeAttemptN`).
+    /// Total number of attempts to enable the charge (`ChargeAttemptN`).
     charge_attempts: u32,
-    /// Монотонное время последней попытки включить заряд (`LastEnableMs`).
+    /// Monotonic time of the last attempt to enable the charge (`LastEnableMs`).
     last_enable_ms: u64,
-    /// Пик входного тока за текущее окно наблюдения, мкА (`MaxIinUa`).
+    /// Input current peak over the current observation window, µA (`MaxIinUa`).
     max_iin_ua: u32,
-    /// Начало текущего окна наблюдения пика тока, мс.
+    /// Start of the current current-peak observation window, ms.
     iin_window_start_ms: u64,
-    /// Сколько тактов подряд защита просит 1:1, а Vin его не допускает.
+    /// How many ticks in a row protection asks for 1:1 while Vin does not allow it.
     ///
-    /// Нужен, чтобы на повышенном Vin не крутить standby каждый такт: первый такт
-    /// снижает ток, со следующего (`BYPASS_DENIED_STRIKES_BEFORE_STOP`) — останов.
+    /// Needed so that at elevated Vin standby is not spun every tick: the first
+    /// tick reduces the current, from the next one
+    /// (`BYPASS_DENIED_STRIKES_BEFORE_STOP`) - stop.
     bypass_denied_strikes: u32,
     /// Usbin SPMI connection id from `_CRS` (`None` on stock ACPI; HVDCP uses SUPERUSER).
     usbin_id: Option<u64>,
     /// Soft HVDCP / QC pulse state (software `pulse_cnt`).
     hvdcp: hvdcp::HvdcpState,
-    /// SUPERUSER open failed at PrepareHardware — retry from telemetry.
+    /// SUPERUSER open failed at PrepareHardware - retry from telemetry.
     hvdcp_retry_pending: bool,
     /// How many SUPERUSER retries have been attempted.
     hvdcp_retry_attempts: u32,
@@ -376,80 +390,85 @@ struct DriverState {
     last_input_present: bool,
     /// Edge detect armed after PrepareHardware autostart (avoids double-negotiate).
     hvdcp_edge_armed: bool,
-    /// Монотонное время последней коррекции шины под окно 2:1, мс.
+    /// Monotonic time of the last bus correction towards the 2:1 window, ms.
     ///
-    /// Окно едет за банкой (полоса `[2*Vbat+200, 2*Vbat+400]` мВ), поэтому без
-    /// периодической коррекции шина остаётся там, где её оставило согласование:
-    /// при росте Vbat она уходит выше полосы, режим 3 сохраняется, а перенос
-    /// падает до 39 мА. Интервал — [`hvdcp::WINDOW_NUDGE_MS`], чтобы не грузить
-    /// SPMI на каждом такте.
+    /// The window follows the cell (band `[2*Vbat+200, 2*Vbat+400]` mV), so
+    /// without periodic correction the bus stays where negotiation left it: as
+    /// Vbat rises it goes above the band, mode 3 is retained, and the transfer
+    /// drops to 39 mA. The interval is [`hvdcp::WINDOW_NUDGE_MS`], so as not to
+    /// load SPMI on every tick.
     last_window_nudge_ms: u64,
-    /// Лучшее (наименьшее) отклонение шины от цели в текущем эпизоде, мкВ.
+    /// Best (smallest) bus deviation from the target in the current episode, µV.
     ///
-    /// `u32::MAX` — эпизод не начат (шина в полосе). Нужно, чтобы отличить
-    /// коррекцию, которая работает, от застоя: у PD-адаптера импульсы QC3
-    /// ничего не меняют, и петля должна перейти на редкий повтор, а не сыпать
-    /// импульсами в SPMI вечно.
+    /// `u32::MAX` - episode not started (bus inside the band). Needed to tell a
+    /// correction that works from a stall: with a PD adapter the QC3 pulses
+    /// change nothing, and the loop must switch to a rare repeat instead of
+    /// pouring pulses into SPMI forever.
     window_best_err_uv: u32,
-    /// Коррекций без прогресса подряд в текущем эпизоде.
+    /// Consecutive corrections without progress in the current episode.
     window_stall_n: u32,
-    /// Сколько раз повторяли разгон HVDCP без переподключения.
+    /// How many times HVDCP elevation was repeated without re-plugging.
     re_elevate_attempts: u32,
-    /// Монотонный срок следующего повторного разгона, мс (0 — не запланирован).
+    /// Monotonic deadline of the next re-elevation, ms (0 - not scheduled).
     re_elevate_next_ms: u64,
-    /// Текущая выдержка повторного разгона, мс.
+    /// Current re-elevation delay, ms.
     re_elevate_backoff_ms: u64,
-    /// Монотонное время последней публикации регистров PM8150B (`Chgr*`), мс.
+    /// Monotonic time of the last publication of the PM8150B registers (`Chgr*`), ms.
     ///
-    /// Ноль — снимок ещё не публиковался. Отметка ставится и при отказе чтения
-    /// (`ChgrErr=1`), иначе недоступная периферия тянула бы шину на каждом такте
-    /// телеметрии. Период — [`GAUGE_POLL_MS`]: снимок идёт по той же шине SPMI и
-    /// через тот же слот SUPERUSER, что и опрос счётчика.
+    /// Zero - the snapshot has not been published yet. The mark is also set when
+    /// the read fails (`ChgrErr=1`), otherwise an unavailable peripheral would
+    /// pull the bus on every telemetry tick. The period is [`GAUGE_POLL_MS`]: the
+    /// snapshot goes over the same SPMI bus and through the same SUPERUSER slot
+    /// as the counter poll.
     last_chgr_mark_ms: u64,
-    /// Сырое FCC из параметра [`FCC_POLICY_VALUE_NAME`] — то, до чего политика
-    /// поднимает предел бака, пока насос несёт ток. Ноль — политика выключена,
-    /// и тогда регистр `0x1061` не трогает никто.
+    /// Raw FCC from the [`FCC_POLICY_VALUE_NAME`] parameter - what the policy
+    /// raises the buck limit to while the pump is carrying current. Zero - the
+    /// policy is off, and then nobody touches register `0x1061`.
     ///
-    /// Читается один раз при старте устройства ([`read_parameters`]), потому что
-    /// это ручка A/B между загрузками, а не уставка на ходу; марка `FccCfgRaw`
-    /// публикует применённое значение, чтобы режим был виден со стороны планшета.
-    /// Захват [`Self::fcc_boot_raw`] от этой ручки не зависит и идёт всегда — он
-    /// нужен и сам по себе, как диагностика (`ChgrFccRaw`). Отсюда и известная
-    /// ловушка: если прошлая загрузка оставила регистр поднятым, следующая
-    /// захватит поднятое как «заводское», и вернуть банк будет некуда. Увидеть
-    /// это можно только по паре марок — `FccCfgRaw` (что просили) и `ChgrFccRaw`
-    /// (что реально стоит), — и потому обе публикуются всегда, включая ноль.
+    /// Read once at device start ([`read_parameters`]), because this is an A/B
+    /// knob between boots, not a setpoint for on-the-fly changes; the mark
+    /// `FccCfgRaw` publishes the applied value so that the mode is visible from
+    /// the tablet side. The capture of [`Self::fcc_boot_raw`] does not depend on
+    /// this knob and always runs - it is needed on its own too, as diagnostics
+    /// (`ChgrFccRaw`). Hence the well-known pitfall: if the previous boot left
+    /// the register raised, the next one captures the raised value as
+    /// "factory", and there is nowhere to return the buck to. This can only be
+    /// seen from the pair of marks - `FccCfgRaw` (what was asked) and
+    /// `ChgrFccRaw` (what is really there) - and that is why both are always
+    /// published, including zero.
     fcc_cfg_raw: u32,
-    /// FCC бака, который стоял в `0x1061` до нашей первой записи, 50 мА/разряд.
+    /// Buck FCC that stood in `0x1061` before our first write, 50 mA per bit.
     ///
-    /// Ноль — значение ещё не захвачено: живой замер 19.09 дал 30 (1,50 А), так
-    /// что настоящий ноль в регистре эту роль выполнять не может, зато ноль в
-    /// этой роли означает «возвращать нечего» — и поднимать предел тогда нельзя
-    /// (вернуть банк к исходному было бы нечем), и уж точно нельзя возвращать
-    /// ноль, который запретил бы заряд баку совсем.
+    /// Zero - the value has not been captured yet: a live measurement on 19.09
+    /// gave 30 (1,50 A), so a real zero in the register cannot play this role,
+    /// but a zero in this role means "there is nothing to return" - and then the
+    /// limit must not be raised (there would be nothing to return the buck to),
+    /// and certainly a zero must not be returned, which would forbid charging
+    /// the buck altogether.
     fcc_boot_raw: u8,
-    /// Поднят ли FCC бака политикой (`FccRaw`): только тогда [`Self::fcc_boot_raw`]
-    /// возвращается через [`FCC_RESTORE_GRACE_MS`].
+    /// Whether the buck FCC has been raised by the policy (`FccRaw`): only then
+    /// does [`Self::fcc_boot_raw`] return through [`FCC_RESTORE_GRACE_MS`].
     fcc_raised: bool,
-    /// Монотонный срок возврата FCC к [`Self::fcc_boot_raw`], мс.
+    /// Monotonic deadline for the FCC to return to [`Self::fcc_boot_raw`], ms.
     ///
-    /// Ноль — возврат не запланирован. Срок ставится в тот такт, когда перенос
-    /// пропал, и снимается, если насос снова взялся за ток: короткие перерывы
-    /// переноса не должны дёргать регистр туда-обратно.
+    /// Zero - no return is scheduled. The deadline is set on the tick when the
+    /// transfer disappeared and cleared if the pump picks up the current again:
+    /// short transfer gaps must not pull the register back and forth.
     fcc_restore_at_ms: u64,
-    /// Выполнена ли одноразовая проба записи FCC ([`FCC_PROBE_UA`]).
+    /// Whether the one-shot FCC write probe has been performed ([`FCC_PROBE_UA`]).
     ///
-    /// Один раз за загрузку драйвера: проба проверяет, принимает ли периферия
-    /// CHGR запись, а этот ответ за загрузку не меняется. Флаг ставится при любом
-    /// исходе — и при отказе записи, и когда заводское значение уже не выше пробы:
-    /// повторять молчаливый отказ на каждом такте незачем, а в журнале исход
-    /// остаётся (`ChgrProbeOk`). Не ставится только тогда, когда проба вообще не
-    /// могла идти: сорванный снимок SPMI, критичный отказ чипа или снимок ещё ни
-    /// разу не удался (`fcc_boot_raw == 0`).
+    /// Once per driver boot: the probe checks whether the CHGR peripheral accepts
+    /// a write, and that answer does not change during a boot. The flag is set
+    /// on any outcome - both on a write failure and when the factory value is
+    /// already not above the probe: there is no point repeating a silent failure
+    /// every tick, and the outcome stays in the journal (`ChgrProbeOk`). It is
+    /// only not set when the probe could not run at all: a broken SPMI snapshot,
+    /// a critical chip failure, or a snapshot that never succeeded
+    /// (`fcc_boot_raw == 0`).
     fcc_probe_done: bool,
 }
 
-// SAFETY: см. инварианты выше — доступ сериализован WDF.
+// SAFETY: see the invariants above - access is serialized by WDF.
 unsafe impl Sync for DriverState {}
 
 impl DriverState {
@@ -495,63 +514,64 @@ impl DriverState {
     }
 }
 
-/// Единственный экземпляр состояния драйвера.
+/// The single instance of the driver state.
 static mut STATE: DriverState = DriverState::new();
 
-/// Доступ к состоянию драйвера.
+/// Access to the driver state.
 ///
 /// # Safety
 ///
-/// Вызывается только пока драйвер держит [`lock_state`]: очередь сериализует
-/// одни IOCTL, а таймер телеметрии и `EvtDevicePrepareHardware` идут своими
-/// контекстами.
+/// Called only while the driver holds [`lock_state`]: the queue serializes the
+/// IOCTLs, while the telemetry timer and `EvtDevicePrepareHardware` run in their
+/// own contexts.
 unsafe fn state() -> &'static mut DriverState {
-    // SAFETY: см. инварианты `DriverState`.
+    // SAFETY: see the invariants of `DriverState`.
     unsafe { &mut *core::ptr::addr_of_mut!(STATE) }
 }
 
-/// Мьютекс состояния: шина и `STATE` — на одного пользователя.
+/// State mutex: the bus and `STATE` have one user at a time.
 ///
-/// KMUTEX, а не WDFWAITLOCK: уровень обратного вызова устройства не задан
-/// (`WdfDeviceInitSetExecutionLevel` в биндингах нет), а KMUTEX документирован
-/// и для `PASSIVE_LEVEL`, и для `APC_LEVEL` — вызовы драйвера заведомо не выше,
-/// они делают синхронную отправку WDF.
+/// A KMUTEX, not a WDFWAITLOCK: the device callback execution level is not set
+/// (`WdfDeviceInitSetExecutionLevel` is absent from the bindings), and a KMUTEX
+/// is documented for both `PASSIVE_LEVEL` and `APC_LEVEL` - the driver calls are
+/// certainly not higher, they do a synchronous WDF send.
 static mut STATE_LOCK: wdk_sys::KMUTEX = unsafe { core::mem::zeroed() };
 
-/// Мьютекс инициализирован. До инициализации брать его нельзя: нулевая
-/// структура диспетчера — ещё не объект ожидания.
+/// The mutex has been initialized. It must not be taken before initialization: a
+/// zeroed dispatcher structure is not yet a waitable object.
 static STATE_LOCK_READY: AtomicBool = AtomicBool::new(false);
 
-/// Монотонное время последнего опроса топливного счётчика, мс (0 — не было).
+/// Monotonic time of the last fuel counter poll, ms (0 - never).
 ///
-/// Отдельный атомик, а не поле [`DriverState`]: счётчик читается **до** захвата
-/// [`STATE_LOCK`] — транзакция SUPERUSER идёт около двух секунд, и держать на
-/// это время мьютекс значит тормозить и управление зарядом, и `IOCTL_STATUS`,
-/// которым пользуется приёмка. Сравнение с обменом (CAS) заодно не даёт двум
-/// тактам таймера читать шину одновременно.
+/// A separate atomic rather than a [`DriverState`] field: the counter is read
+/// **before** taking [`STATE_LOCK`] - a SUPERUSER transaction takes about two
+/// seconds, and holding the mutex that long would slow down both charge control
+/// and the `IOCTL_STATUS` the acceptance protocol uses. The compare-and-swap
+/// also keeps two timer ticks from reading the bus at the same time.
 static GAUGE_LAST_MS: AtomicU64 = AtomicU64::new(0);
 
-/// Железо подготовлено: счётчик можно опрашивать.
+/// The hardware is prepared: the counter may be polled.
 ///
-/// `read_gauge_if_due` вызывается до захвата [`STATE_LOCK`] и потому не защищён
-/// мьютексом от гонки с `evt_release_hardware`; этот флаг и есть та защита.
+/// `read_gauge_if_due` is called before taking [`STATE_LOCK`] and is therefore
+/// not protected by the mutex against a race with `evt_release_hardware`; this
+/// flag is that protection.
 static GAUGE_READY: AtomicBool = AtomicBool::new(false);
 
-/// Что дал такт опроса счётчика — три разных исхода, которые нельзя смешивать.
+/// What a counter poll tick yielded - three distinct outcomes that must not be mixed.
 enum GaugePoll {
-    /// Такт пропущен по расписанию: читать рано.
+    /// The tick was skipped by the schedule: too early to read.
     Skipped,
-    /// Сырое значение счётчика.
+    /// The raw counter value.
     Raw(u8),
-    /// Чтение не удалось: шина занята, счётчик не ответил, копии не совпали.
+    /// The read failed: bus busy, counter did not answer, copies did not match.
     Failed,
 }
 
-/// Читает топливный счётчик не чаще [`GAUGE_POLL_MS`] и только из одного такта.
+/// Reads the fuel counter no more often than [`GAUGE_POLL_MS`] and from a single tick.
 ///
 /// # Safety
 ///
-/// Пассивный уровень; вызывается до захвата [`STATE_LOCK`], состояние не трогает.
+/// Passive level; called before taking [`STATE_LOCK`], does not touch the state.
 unsafe fn read_gauge_if_due() -> GaugePoll {
     if !GAUGE_READY.load(Ordering::Acquire) {
         return GaugePoll::Skipped;
@@ -569,36 +589,36 @@ unsafe fn read_gauge_if_due() -> GaugePoll {
         .compare_exchange(last, now, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
-        // Другой такт уже взял это окно себе.
+        // Another tick has already taken this window.
         return GaugePoll::Skipped;
     }
-    // SAFETY: `device` жив (проверено выше), уровень пассивный.
+    // SAFETY: `device` is live (checked above), the level is passive.
     match unsafe { crate::spb::read_batt_soc_raw(device) } {
         Some(raw) => GaugePoll::Raw(raw),
         None => GaugePoll::Failed,
     }
 }
 
-/// Инициализирует мьютекс состояния. Один раз, из `evt_device_add`.
+/// Initializes the state mutex. Once, from `evt_device_add`.
 unsafe fn init_state_lock() {
     if STATE_LOCK_READY.load(Ordering::Acquire) {
         return;
     }
-    // SAFETY: `Level` зарезервирован и обязан быть нулём.
+    // SAFETY: `Level` is reserved and must be zero.
     unsafe { wdk_sys::ntddk::KeInitializeMutex(core::ptr::addr_of_mut!(STATE_LOCK), 0) };
     STATE_LOCK_READY.store(true, Ordering::Release);
 }
 
-/// Держит мьютекс состояния и отпускает его при выходе из области видимости.
+/// Holds the state mutex and releases it when the scope ends.
 struct StateGuard {
-    /// Мьютекс захвачен этим потоком.
+    /// The mutex is held by this thread.
     held: bool,
 }
 
 impl Drop for StateGuard {
     fn drop(&mut self) {
         if self.held {
-            // SAFETY: мьютекс захвачен этим же потоком в `lock_state`.
+            // SAFETY: the mutex was taken by this very thread in `lock_state`.
             unsafe {
                 let _ = wdk_sys::ntddk::KeReleaseMutex(core::ptr::addr_of_mut!(STATE_LOCK), 0);
             }
@@ -606,39 +626,40 @@ impl Drop for StateGuard {
     }
 }
 
-/// Мьютекс брошен завершившимся потоком. Владение всё равно достаётся нам,
-/// и отпускать его надо так же, как обычный захват.
+/// The mutex was abandoned by an exited thread. Ownership still passes to us,
+/// and it must be released the same way as a normal acquisition.
 const STATUS_ABANDONED: i32 = 0x0000_0080;
 
-/// Захватывает мьютекс состояния, дожидаясь другого контекста.
+/// Takes the state mutex, waiting for another context.
 ///
-/// Без него таймер телеметрии, `EvtDevicePrepareHardware` и обработчики IOCTL
-/// ходят в один и тот же кэшированный `WDFREQUEST` внутри `SpbBus`, а WDF
-/// запрещает отправлять запрос дважды: 18.09 это дало три дампа
-/// `WDF_VIOLATION (0x10D)` с `Arg2 = 3` («запрос уже отправлен I/O-таргету»).
+/// Without it the telemetry timer, `EvtDevicePrepareHardware` and the IOCTL
+/// handlers reach the same cached `WDFREQUEST` inside `SpbBus`, and WDF forbids
+/// sending a request twice: on 18.09 this produced three
+/// `WDF_VIOLATION (0x10D)` dumps with `Arg2 = 3` ("the request has already been
+/// sent to the I/O target").
 ///
-/// Возврат ожидания нельзя толковать как «успех — всё, что не отрицательно».
-/// Нулевой относительный таймаут (указатель на `QuadPart = 0`) означает не
-/// «ждать вечно», а «опросить и вернуться сразу»: при занятом мьютексе вызов
-/// отдаёт `STATUS_TIMEOUT` (`0x102`) — положительный код, но владения нет. На
-/// этом драйвер и упал 18.09 в 17:08: `KeReleaseMutex` на чужом мьютексе
-/// поднимает `STATUS_MUTANT_NOT_OWNED` (`0xC0000046`), что в контексте
-/// `powershell.exe` дало `SYSTEM_SERVICE_EXCEPTION (0x3B)` со стеком
-/// `nt!KeReleaseMutantEx` ← `nt!KeReleaseMutex` ← `ln8000_kmdf+0xb774`.
-/// Поэтому таймаут — `NULL` (ждать, пока держатель отпустит; держатель всегда
-/// отпускает сам, а обмен по шине ограничен секундой), а захватом считается
-/// только `STATUS_SUCCESS` или `STATUS_ABANDONED`.
+/// The wait return value must not be read as "success is anything not negative".
+/// A zero relative timeout (a pointer to `QuadPart = 0`) does not mean "wait
+/// forever" but "poll and return at once": with the mutex busy the call returns
+/// `STATUS_TIMEOUT` (`0x102`) - a positive code, but with no ownership. That is
+/// how the driver crashed on 18.09 at 17:08: `KeReleaseMutex` on a mutex owned by
+/// someone else raises `STATUS_MUTANT_NOT_OWNED` (`0xC0000046`), which in the
+/// `powershell.exe` context produced `SYSTEM_SERVICE_EXCEPTION (0x3B)` with the
+/// stack `nt!KeReleaseMutantEx` ← `nt!KeReleaseMutex` ← `ln8000_kmdf+0xb774`.
+/// Therefore the timeout is `NULL` (wait until the holder releases; the holder
+/// always releases on its own, and a bus transfer is bounded by a second), and
+/// only `STATUS_SUCCESS` or `STATUS_ABANDONED` count as acquisition.
 fn lock_state() -> StateGuard {
     if !STATE_LOCK_READY.load(Ordering::Acquire) {
         return StateGuard { held: false };
     }
-    // SAFETY: мьютекс инициализирован; режим ядра, без APC, пассивный уровень;
-    // `NULL` вместо таймаута — ждать без ограничения.
+    // SAFETY: the mutex is initialized; kernel mode, no APCs, passive level;
+    // `NULL` instead of a timeout - wait without a limit.
     let status = unsafe {
         wdk_sys::ntddk::KeWaitForSingleObject(
             core::ptr::addr_of_mut!(STATE_LOCK).cast(),
             wdk_sys::_KWAIT_REASON::Executive,
-            // `KernelMode` из `_MODE` — `i32`, а `KPROCESSOR_MODE` — `CCHAR`.
+            // `KernelMode` from `_MODE` is an `i32`, while `KPROCESSOR_MODE` is a `CCHAR`.
             wdk_sys::_MODE::KernelMode as core::ffi::c_char,
             0,
             core::ptr::null_mut(),
@@ -649,39 +670,41 @@ fn lock_state() -> StateGuard {
     }
 }
 
-/// Символическая ссылка для пользовательского режима: `\\.\nabu_ln8000`.
+/// Symbolic link for user mode: `\\.\nabu_ln8000`.
 ///
-/// Ширина буфера была 20 символов при имени в 22 — имя молча обрезалось
-/// до `\DosDevices\nabu_ln8`, и утилита не могла открыть устройство.
+/// The buffer width was 20 characters for a 22-character name - the name was
+/// silently truncated to `\DosDevices\nabu_ln8`, and the CLI could not open the
+/// device.
 const SYMLINK_CHARS: usize = 24;
 const SYMLINK_NAME: &str = "/DosDevices/nabu_ln8000";
 const SYMLINK: [u16; SYMLINK_CHARS] = utf16_lit(SYMLINK_NAME);
 
-/// Длина имени симлинка в байтах: без завершающего нуля.
+/// Length of the symlink name in bytes: without the terminating zero.
 const SYMLINK_BYTES: u16 = (SYMLINK_NAME.len() as u16) * 2;
 
-/// Имя обязано помещаться в буфер — иначе оно обрежется и устройство не откроется.
+/// The name must fit the buffer - otherwise it is truncated and the device will
+/// not open.
 const _: () = assert!(
     SYMLINK_NAME.len() <= SYMLINK_CHARS,
-    "имя симлинка длиннее буфера"
+    "symlink name longer than the buffer"
 );
 
-/// Этапы добавления устройства: пишутся в реестр меткой, чтобы сбой запуска
-/// был виден удалённо, а не только в отладочном выводе драйвера.
+/// Device-add stages: written to the registry as a mark so that a start failure
+/// is visible remotely, not only in the driver's debug output.
 const STAGE_ENTER: u32 = 10;const STAGE_DEVICE: u32 = 11;
 const STAGE_INTERFACE: u32 = 12;
 const STAGE_SYMLINK: u32 = 13;
 const STAGE_QUEUE: u32 = 14;
 const STAGE_TIMER: u32 = 15;
 const STAGE_DONE: u32 = 0xFF;
-/// Этапы подготовки железа: видно, где именно отвалилась шина или чип.
+/// Hardware prepare stages: shows exactly where the bus or the chip fell over.
 const STAGE_PREPARE: u32 = 30;
 const STAGE_PREPARE_BUS: u32 = 31;
 const STAGE_PREPARE_CHIP: u32 = 32;
 const STAGE_PREPARE_CONFIG: u32 = 33;
 const STAGE_READY: u32 = 0xFE;
 
-/// Собирает UTF-16 без завершающего нуля: символы `'/'` заменяются на `'\\'`.
+/// Builds UTF-16 without a terminating zero: `'/'` characters become `'\\'`.
 const fn utf16_lit(ascii: &str) -> [u16; SYMLINK_CHARS] {
     let bytes = ascii.as_bytes();
     let mut out = [0_u16; SYMLINK_CHARS];
@@ -694,20 +717,20 @@ const fn utf16_lit(ascii: &str) -> [u16; SYMLINK_CHARS] {
     out
 }
 
-/// Права на чтение ключа реестра (`KEY_READ`).
+/// Read rights for a registry key (`KEY_READ`).
 const KEY_READ: ULONG = 0x0002_0019;
 
-/// Имена параметров и их значения из реестра: то, что читает драйвер.
+/// Parameter names and their values from the registry: what the driver reads.
 struct DriverParams {
     config: PumpConfig,
     limits: GuardLimits,
     telemetry_ms: u32,
-    /// Сырое значение FCC из параметра [`FCC_POLICY_VALUE_NAME`] (0 — политика
-    /// выключена: и когда параметра нет, и когда он равен нулю).
+    /// Raw FCC value from the [`FCC_POLICY_VALUE_NAME`] parameter (0 - the policy
+    /// is off: both when the parameter is absent and when it is zero).
     fcc_raw: u32,
 }
 
-/// Заполняет буфер символами строки и возвращает длину.
+/// Fills the buffer with the characters of a string and returns the length.
 fn utf16_into(buffer: &mut [u16], text: &str) -> usize {
     let mut len = 0_usize;
     for byte in text.as_bytes() {
@@ -719,11 +742,11 @@ fn utf16_into(buffer: &mut [u16], text: &str) -> usize {
     len
 }
 
-/// Читает один параметр типа `REG_DWORD` из открытого ключа.
+/// Reads a single `REG_DWORD` parameter from an open key.
 ///
 /// # Safety
 ///
-/// `key` — валидный дескриптор ключа, открытый на чтение.
+/// `key` is a valid key handle opened for reading.
 unsafe fn query_ulong(key: WDFKEY, name: &str) -> Option<u32> {
     let mut buffer = [0_u16; 32];
     let len = utf16_into(&mut buffer, name);
@@ -737,17 +760,18 @@ unsafe fn query_ulong(key: WDFKEY, name: &str) -> Option<u32> {
         Buffer: buffer.as_mut_ptr(),
     };
     let mut value: u32 = 0;
-    // SAFETY: ключ и буфер имени живут до конца вызова; значение — локальная переменная.
+    // SAFETY: the key and the name buffer live until the end of the call; the
+    // value is a local variable.
     let status = unsafe {
         call_unsafe_wdf_function_binding!(WdfRegistryQueryULong, key, &raw const value_name, &raw mut value)
     };
     if status < 0 { None } else { Some(value) }
 }
 
-/// Права на запись ключа реестра (`KEY_SET_VALUE`).
+/// Write rights for a registry key (`KEY_SET_VALUE`).
 const KEY_SET_VALUE: ULONG = 0x0002;
 
-/// Пишет одно числовое значение в уже открытый ключ.
+/// Writes a single numeric value into an already open key.
 fn write_one(key: WDFKEY, name: &str, value: u32) {
     let mut buffer = [0_u16; 32];
     let len = utf16_into(&mut buffer, name);
@@ -760,7 +784,7 @@ fn write_one(key: WDFKEY, name: &str, value: u32) {
         MaximumLength: length,
         Buffer: buffer.as_mut_ptr(),
     };
-    // SAFETY: ключ открыт на запись, имя — локальный буфер.
+    // SAFETY: the key is opened for writing, the name is a local buffer.
     unsafe {
         let _ = call_unsafe_wdf_function_binding!(
             WdfRegistryAssignULong,
@@ -771,20 +795,20 @@ fn write_one(key: WDFKEY, name: &str, value: u32) {
     }
 }
 
-/// Пишет пару числовых меток в уже открытый ключ.
+/// Writes a pair of numeric marks into an already open key.
 fn write_marker(key: WDFKEY, stage_name: &str, status_name: &str, stage: u32, status: NTSTATUS) {
     write_one(key, stage_name, stage);
     write_one(key, status_name, status as u32);
 }
 
-/// Метка этапа добавления устройства — в ключ устройства.
+/// Device-add stage mark - into the device key.
 ///
-/// В отладочный вывод драйвера без отладчика не заглянуть, поэтому ход
-/// добавления устройства виден в `Device Parameters` узла: `AddStage` —
-/// где остановились, `AddStatus` — с каким кодом. Успех — `AddStage = 0xFF`.
+/// The driver's debug output is unreachable without a debugger, so the progress
+/// of device add is visible in the node's `Device Parameters`: `AddStage` -
+/// where we stopped, `AddStatus` - with which code. Success is `AddStage = 0xFF`.
 fn mark_stage(device: WDFDEVICE, stage: u32, status: NTSTATUS) {
     let mut key: WDFKEY = WDF_NO_HANDLE.cast();
-    // SAFETY: устройство создано WDF; ключ открывается на запись.
+    // SAFETY: the device was created by WDF; the key is opened for writing.
     let opened = unsafe {
         call_unsafe_wdf_function_binding!(
             WdfDeviceOpenRegistryKey,
@@ -799,20 +823,21 @@ fn mark_stage(device: WDFDEVICE, stage: u32, status: NTSTATUS) {
         return;
     }
     write_marker(key, "AddStage", "AddStatus", stage, status);
-    // SAFETY: ключ открыт выше и больше не нужен.
+    // SAFETY: the key was opened above and is no longer needed.
     unsafe {
         call_unsafe_wdf_function_binding!(WdfRegistryClose, key);
     }
 }
 
-/// Метка загрузки драйвера — в ключ `Parameters` службы драйвера.
+/// Driver load mark - into the driver service `Parameters` key.
 ///
-/// `DriverStage = 1` означает, что `DriverEntry` дошёл до конца и вызвал
-/// `WdfDriverCreate`. Это отличает «драйвер не загрузился» от «упал при
-/// добавлении устройства»: во втором случае метка есть, а устройство — нет.
+/// `DriverStage = 1` means `DriverEntry` reached the end and called
+/// `WdfDriverCreate`. This distinguishes "the driver did not load" from "it
+/// crashed during device add": in the second case the mark is there but the
+/// device is not.
 fn mark_driver(driver: WDFDRIVER, stage: u32, status: NTSTATUS) {
     let mut key: WDFKEY = WDF_NO_HANDLE.cast();
-    // SAFETY: дескриптор драйвера создан WDF.
+    // SAFETY: the driver handle was created by WDF.
     let opened = unsafe {
         call_unsafe_wdf_function_binding!(
             WdfDriverOpenParametersRegistryKey,
@@ -826,16 +851,16 @@ fn mark_driver(driver: WDFDRIVER, stage: u32, status: NTSTATUS) {
         return;
     }
     write_marker(key, "DriverStage", "DriverStatus", stage, status);
-    // SAFETY: ключ открыт выше и больше не нужен.
+    // SAFETY: the key was opened above and is no longer needed.
     unsafe {
         call_unsafe_wdf_function_binding!(WdfRegistryClose, key);
     }
 }
 
-/// Записывает одно значение в ключ `Parameters` драйвера — для разовой диагностики.
+/// Writes a single value into the driver `Parameters` key - for one-off diagnostics.
 fn mark_driver_value(driver: WDFDRIVER, name: &str, value: u32) {
     let mut key: WDFKEY = WDF_NO_HANDLE.cast();
-    // SAFETY: дескриптор драйвера создан WDF.
+    // SAFETY: the driver handle was created by WDF.
     let opened = unsafe {
         call_unsafe_wdf_function_binding!(
             WdfDriverOpenParametersRegistryKey,
@@ -849,16 +874,16 @@ fn mark_driver_value(driver: WDFDRIVER, name: &str, value: u32) {
         return;
     }
     write_one(key, name, value);
-    // SAFETY: ключ открыт выше и больше не нужен.
+    // SAFETY: the key was opened above and is no longer needed.
     unsafe {
         call_unsafe_wdf_function_binding!(WdfRegistryClose, key);
     }
 }
 
-/// Записывает одно значение в ключ устройства — для разовой диагностики.
+/// Writes a single value into the device key - for one-off diagnostics.
 pub(crate) fn mark_device_value(device: WDFDEVICE, name: &str, value: u32) {
     let mut key: WDFKEY = WDF_NO_HANDLE.cast();
-    // SAFETY: устройство создано WDF; ключ открывается на запись.
+    // SAFETY: the device was created by WDF; the key is opened for writing.
     let opened = unsafe {
         call_unsafe_wdf_function_binding!(
             WdfDeviceOpenRegistryKey,
@@ -873,29 +898,29 @@ pub(crate) fn mark_device_value(device: WDFDEVICE, name: &str, value: u32) {
         return;
     }
     write_one(key, name, value);
-    // SAFETY: ключ открыт выше и больше не нужен.
+    // SAFETY: the key was opened above and is no longer needed.
     unsafe {
         call_unsafe_wdf_function_binding!(WdfRegistryClose, key);
     }
 }
 
-/// Длина входа запроса подключения (восемь байт, как у эталонного клиента).
+/// Length of the connection request input (eight bytes, as in the reference client).
 const ATTACH_INPUT_LEN: usize = 8;
 
-/// Отправляет запрос подключения (`0x32C004`) в цель родителя устройства.
+/// Sends the connection request (`0x32C004`) to the device's parent target.
 ///
-/// Эталонный клиент делает этот шаг до доступа к регистрам, и отправляет его
-/// не в узел Resource Hub, а в собственную цель устройства. Возвращает статус;
-/// первые слова ответа пишутся в реестр как доказательство.
+/// The reference client does this step before touching the registers, and sends
+/// it not to the Resource Hub node but to its own device target. Returns the
+/// status; the first words of the response are written to the registry as proof.
 unsafe fn parent_attach_probe(device: WDFDEVICE) -> i32 {
-    // SAFETY: устройство создано; цель принадлежит WDF.
+    // SAFETY: the device was created; the target belongs to WDF.
     let target: WDFIOTARGET = unsafe { call_unsafe_wdf_function_binding!(WdfDeviceGetIoTarget, device) };
     if target.is_null() {
         return -3;
     }
 
     let mut request: WDFREQUEST = WDF_NO_HANDLE.cast();
-    // SAFETY: цель валидна; дескрипторы — локальные переменные под выход.
+    // SAFETY: the target is valid; the handles are local out-variables.
     let status = unsafe {
         call_unsafe_wdf_function_binding!(
             WdfRequestCreate,
@@ -910,7 +935,7 @@ unsafe fn parent_attach_probe(device: WDFDEVICE) -> i32 {
 
     let mut in_ptr: *mut core::ffi::c_void = core::ptr::null_mut();
     let mut in_mem: WDFMEMORY = WDF_NO_HANDLE.cast();
-    // SAFETY: вход подключения — восемь байт в невыгружаемом пуле.
+    // SAFETY: the connection input is eight bytes in non-paged pool.
     let status = unsafe {
         call_unsafe_wdf_function_binding!(
             WdfMemoryCreate,
@@ -927,7 +952,7 @@ unsafe fn parent_attach_probe(device: WDFDEVICE) -> i32 {
     }
     let mut out_ptr: *mut core::ffi::c_void = core::ptr::null_mut();
     let mut out_mem: WDFMEMORY = WDF_NO_HANDLE.cast();
-    // SAFETY: ответ подключения — 1024 байта в невыгружаемом пуле.
+    // SAFETY: the connection response is 1024 bytes in non-paged pool.
     let status = unsafe {
         call_unsafe_wdf_function_binding!(
             WdfMemoryCreate,
@@ -943,14 +968,14 @@ unsafe fn parent_attach_probe(device: WDFDEVICE) -> i32 {
         return status;
     }
 
-    // Эталонный клиент кладёт во вход магию и четырёхбайтовое значение.
-    // SAFETY: вход — восемь байт, запись в его пределах.
+    // The reference client puts a magic and a four-byte value into the input.
+    // SAFETY: the input is eight bytes, the write stays within it.
     unsafe {
         core::ptr::write_volatile(in_ptr.cast::<u32>(), spb_abi::ATTACH_MAGIC);
         core::ptr::write_volatile(in_ptr.add(4).cast::<u32>(), 1);
     }
 
-    // SAFETY: цель, запрос и буферы валидны.
+    // SAFETY: the target, the request and the buffers are valid.
     let status = unsafe {
         call_unsafe_wdf_function_binding!(
             WdfIoTargetFormatRequestForIoctl,
@@ -972,7 +997,7 @@ unsafe fn parent_attach_probe(device: WDFDEVICE) -> i32 {
     options.Flags =
         (WDF_REQUEST_SEND_OPTION_SYNCHRONOUS | WDF_REQUEST_SEND_OPTION_TIMEOUT) as ULONG;
     options.Timeout = -10_000_000_i64;
-    // SAFETY: синхронная отправка на пассивном уровне.
+    // SAFETY: synchronous send at passive level.
     let sent = unsafe {
         call_unsafe_wdf_function_binding!(
             WdfRequestSend,
@@ -984,16 +1009,17 @@ unsafe fn parent_attach_probe(device: WDFDEVICE) -> i32 {
     if sent == 0 {
         return -1;
     }
-    // SAFETY: запрос завершён, читаем статус и первые слова ответа.
+    // SAFETY: the request has completed, we read the status and the first words
+    // of the response.
     let status = unsafe { call_unsafe_wdf_function_binding!(WdfRequestGetStatus, request) };
     if status >= 0 {
         for (index, name) in [(0_usize, "Par0"), (1, "Par1"), (2, "Par2"), (3, "Par3")] {
-            // SAFETY: ответ 1024 байта; читаем первые четыре слова.
+            // SAFETY: the response is 1024 bytes; we read the first four words.
             let word = unsafe { core::ptr::read_volatile(out_ptr.add(index * 4).cast::<u32>()) };
             mark_device_value(device, name, word);
         }
     }
-    // SAFETY: объекты созданы здесь и больше не нужны.
+    // SAFETY: the objects were created here and are no longer needed.
     unsafe {
         call_unsafe_wdf_function_binding!(WdfObjectDelete, request.cast());
         call_unsafe_wdf_function_binding!(WdfObjectDelete, in_mem.cast());
@@ -1002,18 +1028,18 @@ unsafe fn parent_attach_probe(device: WDFDEVICE) -> i32 {
     status
 }
 
-/// Класс и типы ресурсов подключения из заголовка WDM.
+/// Connection resource class and types from the WDM header.
 const CONNECTION_CLASS_SERIAL: u32 = 0x02;
 const CONNECTION_TYPE_SERIAL_I2C: u32 = 0x01;
 const CONNECTION_TYPE_SERIAL_SPI: u32 = 0x02;
-/// Vendor SerialBusType SPMI в сыром ACPI (`0xC1`); после трансляции RH
-/// часто сохраняется как Type подключения.
+/// Vendor SerialBusType SPMI in raw ACPI (`0xC1`); after the RH translation it
+/// often survives as the connection Type.
 const CONNECTION_TYPE_SERIAL_SPMI_VENDOR: u32 = 0xC1;
 
-/// Адрес `APSD_STATUS` на периферии USBIN PM8150B (SID 2).
+/// Address of `APSD_STATUS` on the PM8150B USBIN peripheral (SID 2).
 const USBIN_APSD_STATUS: u16 = 0x1307;
 
-/// Пишет сведения о ресурсе подключения в реестр (разбор на железе).
+/// Writes connection resource details into the registry (on-hardware analysis).
 fn mark_connection(device: WDFDEVICE, index: usize, id: u64, class: u32, kind: u32) {
     let (class_name, type_name, id_name) = match index {
         0 => ("C0Class", "C0Type", "C0Low"),
@@ -1026,26 +1052,26 @@ fn mark_connection(device: WDFDEVICE, index: usize, id: u64, class: u32, kind: u
     mark_device_value(device, id_name, id as u32);
 }
 
-/// Собирает все ресурсы подключения из `_CRS` в порядке объявления.
+/// Collects all connection resources from `_CRS` in declaration order.
 ///
 /// # Safety
 ///
-/// Список ресурсов валиден; `out` — локальный буфер вызывающего.
+/// The resource list is valid; `out` is the caller's local buffer.
 unsafe fn collect_connections(resources: WDFCMRESLIST, out: &mut [(u64, u32, u32); 4]) -> usize {
     let mut index: ULONG = 0;
     let mut found = 0_usize;
     loop {
-        // SAFETY: список ресурсов неизменен на время перебора.
+        // SAFETY: the resource list is immutable during the iteration.
         let descriptor = unsafe {
             call_unsafe_wdf_function_binding!(WdfCmResourceListGetDescriptor, resources, index)
         };
         if descriptor.is_null() {
             break;
         }
-        // SAFETY: дескриптор получен из списка ресурсов.
+        // SAFETY: the descriptor came from the resource list.
         let kind = unsafe { (*descriptor).Type };
         if u32::from(kind) == CmResourceTypeConnection {
-            // SAFETY: для типа Connection поле `Connection` заполнено.
+            // SAFETY: for the Connection type the `Connection` field is filled in.
             let class = unsafe { (*descriptor).u.Connection.Class };
             let connection_kind = unsafe { (*descriptor).u.Connection.Type };
             let low = unsafe { (*descriptor).u.Connection.IdLowPart };
@@ -1064,11 +1090,11 @@ unsafe fn collect_connections(resources: WDFCMRESLIST, out: &mut [(u64, u32, u32
     found
 }
 
-/// Выбирает идентификатор I²C-подключения для LN8000.
+/// Selects the I²C connection identifier for the LN8000.
 ///
-/// Классы и типы — из `wdm.h`: `CLASS_SERIAL` = 0x02, `TYPE_SERIAL_I2C` = 0x01.
-/// Сначала ищем I²C; если его нет — любой serial (SPI), чтобы не ломать
-/// диагностику на нестандартных оверлеях.
+/// The classes and types are from `wdm.h`: `CLASS_SERIAL` = 0x02,
+/// `TYPE_SERIAL_I2C` = 0x01. We look for I²C first; if there is none, any serial
+/// (SPI), so as not to break diagnostics on non-standard overlays.
 fn select_i2c_connection(connections: &[(u64, u32, u32); 4], count: usize) -> Option<u64> {
     for (id, class, kind) in connections.iter().take(count) {
         if *class == CONNECTION_CLASS_SERIAL && *kind == CONNECTION_TYPE_SERIAL_I2C {
@@ -1083,10 +1109,12 @@ fn select_i2c_connection(connections: &[(u64, u32, u32); 4], count: usize) -> Op
     None
 }
 
-/// Выбирает второе serial-подключение — кандидат на USBIN SPMI после ACPI-оверлея.
+/// Selects the second serial connection - a USBIN SPMI candidate after the ACPI
+/// overlay.
 ///
-/// В стоковом DSDT у PEIC только I²C → возвращает `None`. После SSDT с дескриптором
-/// SID=2 / periph `0x13` появляется второе подключение (часто Type=`0xC1`).
+/// In the stock DSDT PEIC has only I²C → returns `None`. After the SSDT with the
+/// SID=2 / periph `0x13` descriptor a second connection appears (often
+/// Type=`0xC1`).
 fn select_usbin_connection(
     connections: &[(u64, u32, u32); 4],
     count: usize,
@@ -1108,19 +1136,20 @@ fn select_usbin_connection(
     None
 }
 
-/// Пробует SPMI-чтение `APSD_STATUS` (0x1307) через второе подключение PEIC.
+/// Tries an SPMI read of `APSD_STATUS` (0x1307) through the second PEIC connection.
 ///
-/// Без ACPI-оверлея `usbin_id` = `None` → только метка `UsbinOpen=0xFFFFFFFF`.
+/// Without the ACPI overlay `usbin_id` = `None` → only the
+/// `UsbinOpen=0xFFFFFFFF` mark.
 ///
 /// # Safety
 ///
-/// Пассивный уровень; устройство создано.
+/// Passive level; the device has been created.
 unsafe fn probe_usbin_spmi(device: WDFDEVICE, usbin_id: Option<u64>) {
     let Some(id) = usbin_id else {
         mark_device_value(device, "UsbinOpen", 0xFFFF_FFFF);
         return;
     };
-    // SAFETY: пассивный уровень, устройство создано.
+    // SAFETY: passive level, the device has been created.
     let mut bus = match unsafe { SpbBus::open(device, id, true) } {
         Ok(bus) => {
             mark_device_value(device, "UsbinOpen", 1);
@@ -1149,20 +1178,21 @@ unsafe fn probe_usbin_spmi(device: WDFDEVICE, usbin_id: Option<u64>) {
     }
 }
 
-/// Пробует прочитать регистр чипа, отправив последовательность SPB в цель
-/// родителя устройства (стек контроллера), а не в узел Resource Hub.
+/// Tries to read a chip register by sending an SPB sequence to the device's
+/// parent target (the controller stack) rather than to the Resource Hub node.
 ///
-/// Эталонный клиент хранит дескриптор цели в глобальной переменной и строит
-/// список передач так же, как мы; вопрос был именно в том, куда идёт запрос.
+/// The reference client keeps the target handle in a global variable and builds
+/// the transfer list the same way we do; the question was exactly where the
+/// request goes.
 unsafe fn parent_sequence_probe(device: WDFDEVICE, address: u8) -> i32 {
-    // SAFETY: устройство создано; цель принадлежит WDF.
+    // SAFETY: the device was created; the target belongs to WDF.
     let target: WDFIOTARGET = unsafe { call_unsafe_wdf_function_binding!(WdfDeviceGetIoTarget, device) };
     if target.is_null() {
         return -3;
     }
 
     let mut request: WDFREQUEST = WDF_NO_HANDLE.cast();
-    // SAFETY: цель валидна; дескриптор — локальная переменная под выход.
+    // SAFETY: the target is valid; the handle is a local out-variable.
     let status = unsafe {
         call_unsafe_wdf_function_binding!(
             WdfRequestCreate,
@@ -1175,11 +1205,11 @@ unsafe fn parent_sequence_probe(device: WDFDEVICE, address: u8) -> i32 {
         return status;
     }
 
-    // Список передач: ровно столько, сколько передач — как в эталоне.
+    // Transfer list: exactly as many entries as there are transfers - as in the reference.
     let list_len = spb_abi::SpbTransferList::area_size(2);
     let mut list_ptr: *mut core::ffi::c_void = core::ptr::null_mut();
     let mut list_mem: WDFMEMORY = WDF_NO_HANDLE.cast();
-    // SAFETY: выделяем невыгружаемый буфер под список передач.
+    // SAFETY: we allocate a non-paged buffer for the transfer list.
     let status = unsafe {
         call_unsafe_wdf_function_binding!(
             WdfMemoryCreate,
@@ -1197,7 +1227,7 @@ unsafe fn parent_sequence_probe(device: WDFDEVICE, address: u8) -> i32 {
 
     let mut data_ptr: *mut core::ffi::c_void = core::ptr::null_mut();
     let mut data_mem: WDFMEMORY = WDF_NO_HANDLE.cast();
-    // SAFETY: буфер данных — регистр плюс байт ответа.
+    // SAFETY: the data buffer is the register plus the response byte.
     let status = unsafe {
         call_unsafe_wdf_function_binding!(
             WdfMemoryCreate,
@@ -1213,7 +1243,7 @@ unsafe fn parent_sequence_probe(device: WDFDEVICE, address: u8) -> i32 {
         return status;
     }
 
-    // SAFETY: оба буфера выделены выше и имеют достаточный размер.
+    // SAFETY: both buffers were allocated above and are large enough.
     unsafe {
         core::ptr::write_volatile(data_ptr.cast::<u8>(), address);
         let list = list_ptr.cast::<spb_abi::SpbTransferList>();
@@ -1233,7 +1263,7 @@ unsafe fn parent_sequence_probe(device: WDFDEVICE, address: u8) -> i32 {
         );
     }
 
-    // SAFETY: цель, запрос и буферы валидны.
+    // SAFETY: the target, the request and the buffers are valid.
     let status = unsafe {
         call_unsafe_wdf_function_binding!(
             WdfIoTargetFormatRequestForIoctl,
@@ -1255,7 +1285,7 @@ unsafe fn parent_sequence_probe(device: WDFDEVICE, address: u8) -> i32 {
     options.Flags =
         (WDF_REQUEST_SEND_OPTION_SYNCHRONOUS | WDF_REQUEST_SEND_OPTION_TIMEOUT) as ULONG;
     options.Timeout = -10_000_000_i64;
-    // SAFETY: синхронная отправка на пассивном уровне.
+    // SAFETY: synchronous send at passive level.
     let sent = unsafe {
         call_unsafe_wdf_function_binding!(
             WdfRequestSend,
@@ -1267,14 +1297,14 @@ unsafe fn parent_sequence_probe(device: WDFDEVICE, address: u8) -> i32 {
     if sent == 0 {
         return -1;
     }
-    // SAFETY: запрос завершён; читаем статус и прочитанный байт.
+    // SAFETY: the request has completed; we read the status and the byte read.
     let status = unsafe { call_unsafe_wdf_function_binding!(WdfRequestGetStatus, request) };
     if status >= 0 {
-        // SAFETY: буфер данных — 8 байт; ответ лежит вторым.
+        // SAFETY: the data buffer is 8 bytes; the response lies second.
         let value = unsafe { core::ptr::read_volatile(data_ptr.add(1).cast::<u8>()) };
         mark_device_value(device, "ParSeqValue", u32::from(value));
     }
-    // SAFETY: объекты созданы здесь и больше не нужны.
+    // SAFETY: the objects were created here and are no longer needed.
     unsafe {
         call_unsafe_wdf_function_binding!(WdfObjectDelete, request.cast());
         call_unsafe_wdf_function_binding!(WdfObjectDelete, list_mem.cast());
@@ -1283,32 +1313,33 @@ unsafe fn parent_sequence_probe(device: WDFDEVICE, address: u8) -> i32 {
     status
 }
 
-/// Читает параметры профиля из реестра устройства (`HKR, Parameters, ...`).
+/// Reads profile parameters from the device registry (`HKR, Parameters, ...`).
 ///
-/// Так тот, кто ставит драйвер, может менять пороги, не пересобирая его: INF
-/// задаёт значения по умолчанию, а здесь они применяются с проверкой границ.
-/// Неверное значение не портит профиль — оно отклоняется и остаётся прежнее.
+/// This is how whoever installs the driver can change the thresholds without
+/// rebuilding it: the INF sets the defaults, and here they are applied with
+/// bounds checking. An invalid value does not spoil the profile - it is rejected
+/// and the previous one stays.
 ///
 /// # Safety
 ///
-/// Пассивный уровень IRQL, устройство уже создано.
+/// Passive IRQL, the device has already been created.
 unsafe fn read_parameters(device: WDFDEVICE) -> DriverParams {
     let mut config = PumpConfig::for_qc35_class_b();
     let mut limits = GuardLimits::standard();
-    // Профильный лимит тока для возврата после полосы среза: снимок `config`,
-    // потому что `set_iin_limit` перезаписывает `config.iin_limit_ua` каждой
-    // уставкой (защита, ICL сессии) и «профильное» значение теряется.
+    // Profile current limit for the return after the fold-back band: a snapshot
+    // of `config`, because `set_iin_limit` overwrites `config.iin_limit_ua` with
+    // every setpoint (protection, session ICL) and the "profile" value is lost.
     limits.iin_profile_ua = config.iin_limit_ua;
     let mut telemetry_ms = 250_u32;
-    // Применённое значение `FccRaw`: `0` — параметра нет или он ноль, то есть
-    // политика FCC выключена и регистр `0x1061` за загрузку не трогается.
+    // Applied `FccRaw` value: `0` - the parameter is absent or zero, that is the
+    // FCC policy is off and register `0x1061` is not touched during the boot.
     let mut fcc_raw = 0_u32;
-    // Применённое значение `ProtectionProfile`: `None` — параметра в реестре нет
-    // и остаётся профиль кода (`for_qc35_class_b`, петли включены).
+    // Applied `ProtectionProfile` value: `None` - there is no parameter in the
+    // registry and the code profile stays (`for_qc35_class_b`, loops enabled).
     let mut protection_profile: Option<u32> = None;
 
     let mut device_key: WDFKEY = WDF_NO_HANDLE.cast();
-    // SAFETY: устройство создано; ключ читается только на чтение.
+    // SAFETY: the device was created; the key is only opened for reading.
     let status = unsafe {
         call_unsafe_wdf_function_binding!(
             WdfDeviceOpenRegistryKey,
@@ -1320,10 +1351,11 @@ unsafe fn read_parameters(device: WDFDEVICE) -> DriverParams {
         )
     };
     if status < 0 {
-        println!("ln8000-kmdf: ключ устройства не открылся ({status:#010X}); беру профиль по умолчанию");
-        // Политики FCC в этом исходе нет по построению (параметр не прочитан),
-        // но марка публикуется и здесь: иначе отсутствие `FccCfgRaw` в дампе
-        // было бы неотличимо от «драйвер до этих марок не дошёл».
+        println!("ln8000-kmdf: device key did not open ({status:#010X}); using the default profile");
+        // There is no FCC policy in this outcome by construction (the parameter
+        // was not read), but the mark is published here too: otherwise the
+        // absence of `FccCfgRaw` in a dump would be indistinguishable from "the
+        // driver never got to these marks".
         mark_device_value(device, "FccCfgRaw", 0);
         mark_profile(device, &config, protection_profile);
         return DriverParams {
@@ -1343,7 +1375,7 @@ unsafe fn read_parameters(device: WDFDEVICE) -> DriverParams {
         MaximumLength: length,
         Buffer: buffer.as_mut_ptr(),
     };
-    // SAFETY: ключ устройства валиден; имя — локальный буфер.
+    // SAFETY: the device key is valid; the name is a local buffer.
     let status = unsafe {
         call_unsafe_wdf_function_binding!(
             WdfRegistryOpenKey,
@@ -1355,8 +1387,8 @@ unsafe fn read_parameters(device: WDFDEVICE) -> DriverParams {
         )
     };
     if status < 0 {
-        println!("ln8000-kmdf: раздел Parameters не открылся ({status:#010X}); беру профиль по умолчанию");
-        // SAFETY: ключ открыт выше и больше не нужен.
+        println!("ln8000-kmdf: Parameters subkey did not open ({status:#010X}); using defaults");
+        // SAFETY: the key was opened above and is no longer needed.
         unsafe {
             call_unsafe_wdf_function_binding!(WdfRegistryClose, device_key);
         }
@@ -1371,9 +1403,10 @@ unsafe fn read_parameters(device: WDFDEVICE) -> DriverParams {
     }
 
     for name in [
-        // Профиль защиты применяется первым: он задаёт шаблон целиком,
-        // и без этого явные уставки (ток, напряжение, порог) затирались бы
-        // значениями шаблона — проверено на устройстве.
+        // The protection profile is applied first: it defines the whole
+        // template, and without this explicit setpoints (current, voltage,
+        // threshold) would be overwritten by the template values - verified on
+        // the device.
         "ProtectionProfile",
         "IinLimitUa",
         "VbatFloatUv",
@@ -1381,63 +1414,65 @@ unsafe fn read_parameters(device: WDFDEVICE) -> DriverParams {
         "NtcAlarmCfg",
         "WatchdogEnabled",
     ] {
-        // SAFETY: ключ Parameters открыт на чтение.
+        // SAFETY: the Parameters key is open for reading.
         if let Some(value) = unsafe { query_ulong(params_key, name) } {
             if config.apply_parameter(name, value) {
                 if name == "ProtectionProfile" {
                     protection_profile = Some(value);
                 }
             } else {
-                println!("ln8000-kmdf: параметр {name} = {value} отклонён, остаётся значение по умолчанию");
+                println!("ln8000-kmdf: parameter {name} = {value} rejected, the default stays");
             }
         }
     }
-    // `IinLimitUa` из реестра — это и есть профильный лимит: к нему защита
-    // возвращает ток после того, как напряжение и температура ушли из полосы.
+    // `IinLimitUa` from the registry is the profile limit itself: protection
+    // returns the current to it after the voltage and temperature leave the band.
     limits.iin_profile_ua = config.iin_limit_ua;
-    // SAFETY: ключ Parameters открыт на чтение.
+    // SAFETY: the Parameters key is open for reading.
     if let Some(ms) = unsafe { query_ulong(params_key, "TelemetryMs") } {
         if (100..=60_000).contains(&ms) {
             telemetry_ms = ms;
         } else {
-            println!("ln8000-kmdf: период телеметрии {ms} мс вне границ 100..60000, оставляю {telemetry_ms}");
+            println!("ln8000-kmdf: telemetry period {ms} ms outside the 100..60000 bounds, keeping {telemetry_ms}");
         }
     }
 
-    // Политика FCC бака: `FccRaw` — сырое значение поля FCC регистра `0x1061`,
-    // которое драйвер ставит, пока насос несёт ток. О том, почему это параметр,
-    // а не константа, и что показал живой замер, — в [`FCC_POLICY_VALUE_NAME`].
-    // Границ у значения нет намеренно: любое `N > 0` значит «поднимать до N
-    // разрядов», потолок [`FCC_WRITE_MAX_UA`] применяет `raw_for`, поэтому
-    // завышенное N упрётся в потолок, а не обрежется по модулю поля.
-    // SAFETY: ключ Parameters открыт на чтение.
+    // Buck FCC policy: `FccRaw` is the raw value of the FCC field of register
+    // `0x1061` that the driver sets while the pump is carrying current. On why
+    // this is a parameter rather than a constant, and what the live measurement
+    // showed, see [`FCC_POLICY_VALUE_NAME`]. The value deliberately has no
+    // bounds: any `N > 0` means "raise up to N bits", the ceiling
+    // [`FCC_WRITE_MAX_UA`] is applied by `raw_for`, so an inflated N hits the
+    // ceiling instead of wrapping modulo the field.
+    // SAFETY: the Parameters key is open for reading.
     if let Some(raw) = unsafe { query_ulong(params_key, FCC_POLICY_VALUE_NAME) } {
         fcc_raw = raw;
     }
-    // Марка публикуется и нулём: по ней в дампе видно, какая ветка политики
-    // работает, и её же нужно смотреть рядом с `ChgrFccRaw`, когда встаёт вопрос
-    // о заводском значении регистра (см. `DriverState::fcc_cfg_raw`).
+    // The mark is published as a zero too: it shows in a dump which policy branch
+    // is active, and it is the mark to look at next to `ChgrFccRaw` when the
+    // question of the factory register value comes up (see
+    // `DriverState::fcc_cfg_raw`).
     mark_device_value(device, "FccCfgRaw", fcc_raw);
     if fcc_raw == 0 {
-        println!("ln8000-kmdf: политика FCC бака выключена (FccRaw не задан или равен нулю)");
+        println!("ln8000-kmdf: buck FCC policy off (FccRaw not set or zero)");
     } else {
         println!(
-            "ln8000-kmdf: политика FCC бака включена: FccRaw = {fcc_raw} ({} мА, потолок {} мА)",
+            "ln8000-kmdf: buck FCC policy on: FccRaw = {fcc_raw} ({} mA, ceiling {} mA)",
             fcc_raw.saturating_mul(FCC_STEP_UA / 1000),
             FCC_WRITE_MAX_UA / 1000
         );
     }
 
-    // Пороги защиты приходят набором, и порядок порогов проверяется **один раз
-    // в конце**: `apply_parameter` проверяет согласованность после каждого
-    // значения, поэтому набор, меняющий сразу несколько порогов, не применялся
-    // никогда — первое же значение сравнивалось с ещё не обновлёнными соседями.
-    // Живой случай 19.09: `TempReduceDc=600` отвергался против старого
-    // `TempBypassDc=480` при любом порядке, и защита оставалась на 43,0/48,0 °C,
-    // то есть ниже температуры покоя кристалла (46,1 °C).
+    // Protection thresholds arrive as a set, and the order of the thresholds is
+    // checked **once at the end**: `apply_parameter` checks consistency after
+    // every value, so a set that changes several thresholds at once was never
+    // applied - the first value was compared against neighbours not yet updated.
+    // Live case 19.09: `TempReduceDc=600` was rejected against the old
+    // `TempBypassDc=480` in any order, and protection stayed at 43,0/48,0 °C,
+    // that is below the crystal idle temperature (46,1 °C).
     //
-    // Снимок `before` нужен, чтобы отвергнутый набор не оставил пороги
-    // частично обновлёнными: либо весь набор, либо прежний.
+    // The `before` snapshot is needed so that a rejected set does not leave the
+    // thresholds partially updated: either the whole set or the previous one.
     let before = limits;
     for name in [
         "TempReduceDc",
@@ -1448,38 +1483,38 @@ unsafe fn read_parameters(device: WDFDEVICE) -> DriverParams {
         "IinFloorUa",
         "VbatReduceUv",
     ] {
-        // SAFETY: ключ Parameters открыт на чтение.
+        // SAFETY: the Parameters key is open for reading.
         if let Some(value) = unsafe { query_ulong(params_key, name) } {
             if !limits.apply_parameter_lenient(name, value) {
-                println!("ln8000-kmdf: порог {name} = {value} отклонён (вне диапазона)");
+                println!("ln8000-kmdf: threshold {name} = {value} rejected (out of range)");
             }
         }
     }
     if !limits.validate() {
         println!(
-            "ln8000-kmdf: набор порогов несогласован ({} / {} / {}); беру прежний",
+            "ln8000-kmdf: threshold set inconsistent ({} / {} / {}); keeping the previous one",
             limits.temp_reduce_dc, limits.temp_bypass_dc, limits.temp_stop_dc
         );
         limits = before;
     }
 
     println!(
-        "ln8000-kmdf: пороги защиты: {} / {} / {} (0.1 °C), ток {} мкА, цель {} мкА",
+        "ln8000-kmdf: protection thresholds: {} / {} / {} (0.1 °C), current {} µA, target {} µA",
         limits.temp_reduce_dc, limits.temp_bypass_dc, limits.temp_stop_dc, limits.iin_max_ua, limits.iin_target_ua
     );
 
     println!(
-        "ln8000-kmdf: профиль из реестра: ток {} мкА, напряжение {} мкВ, защитные петли насоса {}",
+        "ln8000-kmdf: profile from the registry: current {} µA, voltage {} µV, pump protection loops {}",
         config.iin_limit_ua,
         config.vbat_float_uv,
         if config.tdie_prot_disabled {
-            "выключены (как в Device Tree)"
+            "off (as in the Device Tree)"
         } else {
-            "включены"
+            "on"
         }
     );
 
-    // SAFETY: оба ключа открыты выше и больше не нужны.
+    // SAFETY: both keys were opened above and are no longer needed.
     unsafe {
         call_unsafe_wdf_function_binding!(WdfRegistryClose, params_key);
         call_unsafe_wdf_function_binding!(WdfRegistryClose, device_key);
@@ -1495,11 +1530,11 @@ unsafe fn read_parameters(device: WDFDEVICE) -> DriverParams {
     }
 }
 
-/// Точка входа драйвера.
+/// Driver entry point.
 ///
 /// # Safety
 ///
-/// Вызывается ядром; аргументы валидны по контракту WDF.
+/// Called by the kernel; the arguments are valid per the WDF contract.
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "INIT")]
 pub unsafe extern "system" fn DriverEntry(
@@ -1520,7 +1555,7 @@ pub unsafe extern "system" fn DriverEntry(
     config.Size = size_of_ulong::<WDF_DRIVER_CONFIG>();
 
     let mut driver_handle: WDFDRIVER = WDF_NO_HANDLE.cast();
-    // SAFETY: конфигурация заполнена, дескриптор — локальная переменная.
+    // SAFETY: the configuration is filled in, the handle is a local variable.
     let status = unsafe {
         call_unsafe_wdf_function_binding!(
             WdfDriverCreate,
@@ -1532,38 +1567,38 @@ pub unsafe extern "system" fn DriverEntry(
         )
     };
     if status < 0 {
-        println!("ln8000-kmdf: WdfDriverCreate не удался: {status:#010X}");
+        println!("ln8000-kmdf: WdfDriverCreate failed: {status:#010X}");
     } else {
-        // В поле состояния пишем секунды с загрузки системы: по ним видно,
-        // относится метка к текущему запуску или осталась с прошлого.
+        // The state field holds seconds since system boot: they show whether the
+        // mark refers to the current run or was left over from the previous one.
         let mut stamp: u64 = 0;
-        // SAFETY: KeQueryInterruptTimePrecise — документированная функция ядра.
+        // SAFETY: KeQueryInterruptTimePrecise is a documented kernel function.
         let ticks = unsafe { wdk_sys::ntddk::KeQueryInterruptTimePrecise(&raw mut stamp) };
         mark_driver(driver_handle, 1, (ticks / 10_000_000) as i32);
     }
     status
 }
 
-/// Создаёт устройство, интерфейс и очередь управляющих запросов.
+/// Creates the device, the interface and the control-request queue.
 ///
 /// # Safety
 ///
-/// Вызывается WDF на пассивном уровне.
+/// Called by WDF at passive level.
 unsafe extern "C" fn evt_device_add(
     driver: WDFDRIVER,
     mut device_init: PWDFDEVICE_INIT,
 ) -> NTSTATUS {
-    // SAFETY: самый первый обратный вызов драйвера: мьютекс нужен раньше, чем
-    // заработают таймер телеметрии и очередь IOCTL.
+    // SAFETY: the very first driver callback: the mutex is needed before the
+    // telemetry timer and the IOCTL queue start working.
     unsafe { init_state_lock() };
-    // Первая метка идёт в ключ драйвера: он доступен ещё до создания
-    // устройства, поэтому виден даже отказ самого первого вызова.
+    // The first mark goes into the driver key: it is available even before the
+    // device is created, so it shows even a failure of the very first call.
     mark_driver(driver, STAGE_ENTER, 0);
-    // Проба: размер структуры атрибутов, которую строит драйвер. Значение
-    // нужно, чтобы видеть, чем именно наша структура не подошла KMDF.
+    // Probe: the size of the attributes structure the driver builds. The value is
+    // needed to see exactly what our structure failed KMDF on.
     mark_driver_value(driver, "AttrSize", size_of_ulong::<WDF_OBJECT_ATTRIBUTES>());
 
-    // Обработчики PnP: подготовка и освобождение ресурсов.
+    // PnP handlers: hardware preparation and release.
     let mut pnp = WDF_PNPPOWER_EVENT_CALLBACKS {
         Size: size_of_ulong::<WDF_PNPPOWER_EVENT_CALLBACKS>(),
         EvtDevicePrepareHardware: Some(evt_prepare_hardware),
@@ -1571,7 +1606,7 @@ unsafe extern "C" fn evt_device_add(
         ..unsafe { core::mem::zeroed() }
     };
     pnp.Size = size_of_ulong::<WDF_PNPPOWER_EVENT_CALLBACKS>();
-    // SAFETY: `device_init` предоставлен WDF до создания устройства.
+    // SAFETY: `device_init` is provided by WDF before the device is created.
     unsafe {
         call_unsafe_wdf_function_binding!(
             WdfDeviceInitSetPnpPowerEventCallbacks,
@@ -1590,10 +1625,10 @@ unsafe extern "C" fn evt_device_add(
     }
 
     let mut device: WDFDEVICE = WDF_NO_HANDLE.cast();
-    // Атрибуты не передаём: NULL — штатный вариант WDF. Нашу структуру KMDF
-    // здесь отвергает со STATUS_WDF_OBJECT_ATTRIBUTES_INVALID (0xC0200209),
-    // проверено на планшете; ни контекст, ни колбэки устройству не нужны.
-    // SAFETY: `device_init` валиден.
+    // We do not pass attributes: NULL is the stock WDF variant. KMDF rejects our
+    // structure here with STATUS_WDF_OBJECT_ATTRIBUTES_INVALID (0xC0200209),
+    // verified on the tablet; the device needs neither a context nor callbacks.
+    // SAFETY: `device_init` is valid.
     let status = unsafe {
         call_unsafe_wdf_function_binding!(
             WdfDeviceCreate,
@@ -1603,14 +1638,14 @@ unsafe extern "C" fn evt_device_add(
         )
     };
     if status < 0 {
-        println!("ln8000-kmdf: WdfDeviceCreate не удался: {status:#010X}");
+        println!("ln8000-kmdf: WdfDeviceCreate failed: {status:#010X}");
         mark_driver(driver, STAGE_DEVICE, status);
         return status;
     }
     mark_driver(driver, STAGE_DEVICE, 0);
 
-    // Интерфейс, по которому пользовательский режим находит драйвер.
-    // SAFETY: устройство создано; GUID — статическая константа.
+    // The interface through which user mode finds the driver.
+    // SAFETY: the device was created; the GUID is a static constant.
     let status = unsafe {
         call_unsafe_wdf_function_binding!(
             WdfDeviceCreateDeviceInterface,
@@ -1620,19 +1655,19 @@ unsafe extern "C" fn evt_device_add(
         )
     };
     if status < 0 {
-        println!("ln8000-kmdf: не удалось создать интерфейс: {status:#010X}");
+        println!("ln8000-kmdf: failed to create the interface: {status:#010X}");
         mark_driver(driver, STAGE_INTERFACE, status);
         return status;
     }
 
-    // Символическая ссылка: диагностической утилите достаточно открыть
-    // \\.\nabu_ln8000 — без перечисления интерфейсов через SetupAPI.
+    // Symbolic link: for the diagnostic CLI it is enough to open
+    // \\.\nabu_ln8000 - without enumerating interfaces through SetupAPI.
     let mut link = UNICODE_STRING {
         Length: SYMLINK_BYTES,
         MaximumLength: SYMLINK_BYTES,
         Buffer: SYMLINK.as_ptr().cast_mut(),
     };
-    // SAFETY: имя — статический буфер UTF-16, устройство создано.
+    // SAFETY: the name is a static UTF-16 buffer, the device has been created.
     let status = unsafe {
         call_unsafe_wdf_function_binding!(
             WdfDeviceCreateSymbolicLink,
@@ -1641,19 +1676,20 @@ unsafe extern "C" fn evt_device_add(
         )
     };
     if status < 0 {
-        // Симлинк — удобство, а не условие работы: драйвер живёт и без него.
-        println!("ln8000-kmdf: символическая ссылка не создана: {status:#010X}");
+        // The symlink is a convenience, not a condition of operation: the driver
+        // lives without it too.
+        println!("ln8000-kmdf: symbolic link not created: {status:#010X}");
         mark_driver(driver, STAGE_SYMLINK, status);
-        // Отдельное имя: основная метка перезаписывается следующими этапами.
+        // A separate name: the main mark is overwritten by the following stages.
         mark_driver_value(driver, "LinkStatus", status as u32);
     }
 
-    // Очередь управляющих запросов и таймер телеметрии.
+    // Control-request queue and telemetry timer.
     let mut queue_config = WDF_IO_QUEUE_CONFIG {
         Size: size_of_ulong::<WDF_IO_QUEUE_CONFIG>(),
-        // Очередь по умолчанию: сюда попадают управляющие запросы клиента.
-        // Без этого флага они уходят в очередь WDF по умолчанию и завершаются
-        // статусом «неизвестная функция» (клиент видит код ошибки 1).
+        // Default queue: the client's control requests land here. Without this
+        // flag they go to the default WDF queue and complete with the "unknown
+        // function" status (the client sees error code 1).
         DefaultQueue: 1,
         DispatchType: WdfIoQueueDispatchSequential,
         PowerManaged: WdfTrue,
@@ -1663,7 +1699,7 @@ unsafe extern "C" fn evt_device_add(
     queue_config.Size = size_of_ulong::<WDF_IO_QUEUE_CONFIG>();
 
     let mut queue: WDFQUEUE = WDF_NO_HANDLE.cast();
-    // SAFETY: конфигурация заполнена, устройство создано.
+    // SAFETY: the configuration is filled in, the device has been created.
     let status = unsafe {
         call_unsafe_wdf_function_binding!(
             WdfIoQueueCreate,
@@ -1674,7 +1710,7 @@ unsafe extern "C" fn evt_device_add(
         )
     };
     if status < 0 {
-        println!("ln8000-kmdf: WdfIoQueueCreate не удался: {status:#010X}");
+        println!("ln8000-kmdf: WdfIoQueueCreate failed: {status:#010X}");
         mark_driver(driver, STAGE_QUEUE, status);
         return status;
     }
@@ -1689,7 +1725,7 @@ unsafe extern "C" fn evt_device_add(
         ..unsafe { core::mem::zeroed() }
     };
     timer_config.Size = size_of_ulong::<WDF_TIMER_CONFIG>();
-    // Автоматическая сериализация: колбэк не пересекается с очередью.
+    // Automatic serialization: the callback does not overlap with the queue.
     timer_config.AutomaticSerialization = 1;
 
     let mut timer_attributes = WDF_OBJECT_ATTRIBUTES {
@@ -1700,11 +1736,11 @@ unsafe extern "C" fn evt_device_add(
         ..unsafe { core::mem::zeroed() }
     };
     timer_attributes.Size = size_of_ulong::<WDF_OBJECT_ATTRIBUTES>();
-    // Владелец обязателен: без ParentObject WDF отказывает со
-    // STATUS_WDF_PARENT_NOT_SPECIFIED (0xC0200212) — проверено на планшете.
+    // A parent is mandatory: without ParentObject WDF fails with
+    // STATUS_WDF_PARENT_NOT_SPECIFIED (0xC0200212) - verified on the tablet.
 
     let mut timer: WDFTIMER = WDF_NO_HANDLE.cast();
-    // SAFETY: конфигурация и атрибуты заполнены.
+    // SAFETY: the configuration and the attributes are filled in.
     let status = unsafe {
         call_unsafe_wdf_function_binding!(
             WdfTimerCreate,
@@ -1714,50 +1750,51 @@ unsafe extern "C" fn evt_device_add(
         )
     };
     if status < 0 {
-        // Таймер — не условие работы: без него управление и диагностика живы,
-        // опрос идёт по запросу. Причина отказа в заголовке wdftimer.h:
-        // автоматическая сериализация требует совместимости с DISPATCH, а обмену
-        // по шине нужен PASSIVE. Правильный вариант — таймер уровня DISPATCH со
-        // отложенной работой на PASSIVE; это отдельная доработка.
-        println!("ln8000-kmdf: WdfTimerCreate не удался: {status:#010X}");
+        // The timer is not a condition of operation: without it control and
+        // diagnostics are alive, polling happens on request. The reason for the
+        // failure is in the wdftimer.h header: automatic serialization requires
+        // compatibility with DISPATCH, while a bus transfer needs PASSIVE. The
+        // right variant is a DISPATCH-level timer with work deferred to PASSIVE;
+        // that is a separate piece of work.
+        println!("ln8000-kmdf: WdfTimerCreate failed: {status:#010X}");
         mark_driver(driver, STAGE_TIMER, status);
     }
 
-    // Запоминаем таймер в статике: его запускает prepare_hardware, когда шина готова.
-    // SAFETY: единственный экземпляр устройства, доступ сериализован.
+    // Remember the timer in a static: prepare_hardware starts it when the bus is ready.
+    // SAFETY: a single device instance, access is serialized.
     unsafe {
         TIMER = timer;
         DEVICE = device;
     }
 
-    println!("ln8000-kmdf: устройство готово");
+    println!("ln8000-kmdf: device ready");
     mark_driver(driver, STAGE_DONE, 0);
     mark_stage(device, STAGE_DONE, 0);
     wdk_sys::STATUS_SUCCESS
 }
 
-/// Таймер телеметрии: единственный экземпляр на драйвер.
+/// Telemetry timer: a single instance per driver.
 static mut TIMER: WDFTIMER = core::ptr::null_mut();
-/// Устройство для колбэка таймера (родитель таймера = device; храним явно).
+/// Device for the timer callback (timer parent = device; stored explicitly).
 static mut DEVICE: WDFDEVICE = core::ptr::null_mut();
 
-/// Разбирает `_CRS`, открывает шину и настраивает LN8000.
+/// Parses `_CRS`, opens the bus and configures the LN8000.
 ///
 /// # Safety
 ///
-/// Вызывается WDF на пассивном уровне; списки ресурсов валидны.
+/// Called by WDF at passive level; the resource lists are valid.
 unsafe extern "C" fn evt_prepare_hardware(
     device: WDFDEVICE,
     _resources_raw: WDFCMRESLIST,
     resources_translated: WDFCMRESLIST,
 ) -> NTSTATUS {
-    // Держим состояние и шину до конца подготовки: таймер телеметрии уже
-    // создан и может тикать параллельно.
+    // We hold the state and the bus until prepare finishes: the telemetry timer
+    // has already been created and may tick in parallel.
     let _state = lock_state();
-    // 1. Ищем ресурс подключения (I²C) и забираем идентификатор.
+    // 1. Look for the connection resource (I²C) and take the identifier.
     mark_stage(device, STAGE_PREPARE, 0);
     let mut connections = [(0_u64, 0_u32, 0_u32); 4];
-    // SAFETY: список ресурсов валиден, буфер — локальный.
+    // SAFETY: the resource list is valid, the buffer is local.
     let connection_count = unsafe { collect_connections(resources_translated, &mut connections) };
     mark_device_value(device, "ConnCount", u32::try_from(connection_count).unwrap_or(0));
     for (index, (id, class, kind)) in connections.iter().take(connection_count).enumerate() {
@@ -1766,7 +1803,7 @@ unsafe extern "C" fn evt_prepare_hardware(
     let peripheral_id = match select_i2c_connection(&connections, connection_count) {
         Some(id) => id,
         None => {
-            println!("ln8000-kmdf: в _CRS нет последовательного подключения (I2C/SPI)");
+            println!("ln8000-kmdf: no serial connection (I2C/SPI) in _CRS");
             mark_stage(device, STAGE_PREPARE_BUS, wdk_sys::STATUS_DEVICE_NOT_READY);
             return wdk_sys::STATUS_DEVICE_NOT_READY;
         }
@@ -1780,17 +1817,17 @@ unsafe extern "C" fn evt_prepare_hardware(
         }
         None => mark_device_value(device, "UsbinConn", 0),
     }
-    println!("ln8000-kmdf: подключение {peripheral_id:#018X}");
-    // SAFETY: пассивный уровень, устройство создано.
+    println!("ln8000-kmdf: connection {peripheral_id:#018X}");
+    // SAFETY: passive level, the device has been created.
     let mut bus = match unsafe { SpbBus::open(device, peripheral_id, false) } {
         Ok(bus) => {
             let path = bus.path_string();
             let text = core::str::from_utf8(&path).unwrap_or("?");
-            println!("ln8000-kmdf: шина {text}");
+            println!("ln8000-kmdf: bus {text}");
             bus
         }
         Err(err) => {
-            println!("ln8000-kmdf: шина недоступна: {err}");
+            println!("ln8000-kmdf: bus unavailable: {err}");
             let st = unsafe { state() };
             st.last_error = -1;
             mark_stage(device, STAGE_PREPARE_BUS, wdk_sys::STATUS_DEVICE_NOT_READY);
@@ -1798,28 +1835,30 @@ unsafe extern "C" fn evt_prepare_hardware(
         }
     };
 
-    // 3. Опознаём чип и настраиваем его.
-    // Профиль берётся из реестра устройства: `HKR, Parameters, ...` из INF.
-    // Значения проверяются по границам; неверное значение не меняет профиль.
-    // SAFETY: пассивный уровень, устройство создано.
+    // 3. Identify the chip and configure it.
+    // The profile is taken from the device registry: `HKR, Parameters, ...` from
+    // the INF. The values are checked against bounds; an invalid value does not
+    // change the profile.
+    // SAFETY: passive level, the device has been created.
     let params = unsafe { read_parameters(device) };
     let config = params.config;
     let guard_limits = params.limits;
 
-    // Проба чипа до опознания: сырой обмен с регистром DEVICE_ID (0x00).
-    // Перебираем варианты оформления запроса к узлу шины и пишем результат
-    // каждого в реестр: без отладчика это единственный способ понять, что
-    // именно отклоняет узел, — и заодно найти работающий вариант.
+    // Chip probe before identification: a raw exchange with the DEVICE_ID
+    // register (0x00). We iterate over request layouts for the bus node and write
+    // the result of each into the registry: without a debugger this is the only
+    // way to understand exactly what the node rejects - and at the same time to
+    // find a working variant.
     mark_device_value(device, "ConnLow", peripheral_id as u32);
     mark_device_value(device, "ConnHigh", (peripheral_id >> 32) as u32);
     mark_device_value(device, "RegAddr", u32::from(ln8000::regs::DEVICE_ID));
-    // Подключение к периферии через цель родителя устройства: именно так это
-    // делает эталонный клиент Qualcomm, и именно туда (а не в узел) уходит
-    // запрос 0x32C004.
+    // Connecting to the peripheral through the device's parent target: this is
+    // exactly how the Qualcomm reference client does it, and it is exactly there
+    // (and not to the node) that the 0x32C004 request goes.
     let parent_attach = unsafe { parent_attach_probe(device) };
     mark_device_value(device, "ParAttachStatus", parent_attach as u32);
     mark_device_value(device, "ParAttachOk", if parent_attach >= 0 { 1 } else { 0 });
-    // Последовательность в цель родителя: та же операция, но другой адресат.
+    // A sequence to the parent target: the same operation, but a different destination.
     let parent_sequence = unsafe { parent_sequence_probe(device, ln8000::regs::DEVICE_ID) };
     mark_device_value(device, "ParSeqStatus", parent_sequence as u32);
     mark_device_value(device, "ParSeqOk", if parent_sequence >= 0 { 1 } else { 0 });
@@ -1856,8 +1895,8 @@ unsafe extern "C" fn evt_prepare_hardware(
         mark_device_value(device, "Variant", u32::from(variant));
     }
 
-    // Проверяем, влияет ли удержание соединения: та же последовательность,
-    // но уже на занятом соединении. Если занятие ломает обмен — увидим разницу.
+    // Check whether holding the connection matters: the same sequence, but now on
+    // a busy connection. If holding breaks the exchange, we will see the difference.
     let lock = bus.lock_connection();
     mark_device_value(device, "LockStatus", lock as u32);
     mark_device_value(device, "LockOk", if lock >= 0 { 1 } else { 0 });
@@ -1872,8 +1911,8 @@ unsafe extern "C" fn evt_prepare_hardware(
     }
     mark_device_value(device, "LockedStatus", bus.last_status() as u32);
 
-    // Читаем несколько регистров напрямую: если чип отвечает, увидим его
-    // опознавательный код (ожидаем 0x42 в регистре 0x00).
+    // Read a few registers directly: if the chip answers, we will see its
+    // identification code (we expect 0x42 in register 0x00).
     for (address, name) in [(0x00_u8, "Reg00"), (0x03, "Reg03"), (0x31, "Reg31")] {
         bus.set_variant(0);
         match bus.transact(address, None) {
@@ -1882,8 +1921,8 @@ unsafe extern "C" fn evt_prepare_hardware(
         }
     }
 
-    // Матрица возможностей узла: какие управляющие запросы SPB он принимает.
-    // Это отделяет «узел не умеет последовательности» от «недоволен запросом».
+    // Node capability matrix: which SPB control requests it accepts. This
+    // separates "the node cannot do sequences" from "it is unhappy with the request".
     for (name, code) in [
         ("Io0", spb_abi::IOCTL_SPB_LOCK_CONTROLLER),
         ("Io1", spb_abi::IOCTL_SPB_UNLOCK_CONTROLLER),
@@ -1897,8 +1936,8 @@ unsafe extern "C" fn evt_prepare_hardware(
         mark_device_value(device, name, status as u32);
     }
 
-    // Матрица на узле Resource Hub с маской доступа штатного драйвера:
-    // если узел теперь принимает последовательности, это и есть рабочий путь.
+    // The same matrix on the Resource Hub node with the stock driver's access
+    // mask: if the node now accepts sequences, that is the working path.
     let mut hub_bus = unsafe { SpbBus::open(device, peripheral_id, true) }.ok();
     let mut hub_working: Option<u8> = None;
     if let Some(hub) = hub_bus.as_mut() {
@@ -1929,12 +1968,13 @@ unsafe extern "C" fn evt_prepare_hardware(
         mark_device_value(device, "Hub0", 0xFFFF_FFFF);
     }
 
-    // Перебор идентификаторов узла ресурсов: какие подключения хаб отдаёт
-    // вообще. Наш узел получил идентификатор 1 — проверяем соседние и адреса
-    // периферий ADC из ACPI (0x131/0x135 = VADC/ADC_TM на SID2 PM8150B), чтобы
-    // понять, есть ли среди них подключение к регистрам зарядника.
-    // Результат каждого шага пишем в реестр: иначе с устройства этого не
-    // увидеть, а без ответа дальше двигаться нечем.
+    // Iterating over resource-node identifiers: which connections the hub exposes
+    // at all. Our node got identifier 1 - we check the neighbouring ones and the
+    // ADC peripheral addresses from ACPI (0x131/0x135 = VADC/ADC_TM on SID2
+    // PM8150B) to understand whether any of them carries a connection to the
+    // charger registers.
+    // We write the result of every step into the registry: otherwise it cannot be
+    // seen from the device, and without an answer there is nothing to move on with.
     if hub_bus.is_some() {
         const CANDIDATES: [(u64, (&str, &str, &str)); 13] = [
             (2, ("Sc2Open", "Sc2St", "Sc2Val")),
@@ -1951,9 +1991,9 @@ unsafe extern "C" fn evt_prepare_hardware(
             (0x135, ("Sc135Open", "Sc135St", "Sc135Val")),
             (0x213, ("Sc213Open", "Sc213St", "Sc213Val")),
         ];
-        // 0x13/0x131/0x135 — peripheral ID из ACPI, не ConnectionId RH.
+        // 0x13/0x131/0x135 are peripheral IDs from ACPI, not RH ConnectionIds.
         for (candidate, names) in CANDIDATES {
-            // SAFETY: пассивный уровень, устройство создано.
+            // SAFETY: passive level, the device has been created.
             match unsafe { SpbBus::open(device, candidate, true) } {
                 Ok(mut probe) => {
                     mark_device_value(device, names.0, 1);
@@ -1974,13 +2014,13 @@ unsafe extern "C" fn evt_prepare_hardware(
         }
     }
 
-    // Рабочий маршрут к насосу — через узел ресурсов: только он несёт адрес
-    // устройства (0x51). Родительский маршрут запросы принимает, но данных не
-    // отдаёт, поэтому насос на нём не опознаётся. Если узел недоступен,
-    // остаёмся на прежнем маршруте, чтобы не терять диагностику.
-    // Узел ресурсов уже открыт выше; повторно его не открываем — второе
-    // открытие не проходит. Берём готовую цель, иначе остаёмся на прежнем
-    // маршруте, чтобы не терять диагностику.
+    // The working route to the pump is through the resource node: only it carries
+    // the device address (0x51). The parent route accepts requests but does not
+    // return data, so the pump is not identified on it. If the node is
+    // unavailable, we stay on the previous route so as not to lose diagnostics.
+    // The resource node is already open above; we do not open it again - a second
+    // open does not succeed. We take the ready target, otherwise we stay on the
+    // previous route so as not to lose diagnostics.
     let pump_bus = match hub_bus {
         Some(hub) => {
             mark_device_value(device, "PumpBusOpen", 1);
@@ -1991,13 +2031,13 @@ unsafe extern "C" fn evt_prepare_hardware(
             bus
         }
     };
-    // Проба перебирала варианты оформления и остановилась на последнем.
-    // Перед работой с насосом возвращаем рабочий вариант: иначе опознание
-    // идёт заведомо неподдерживаемым запросом и падает.
-    // Проба доступа к шине SPMI: единственная неисследованная дорога к регистрам
-    // PMIC. Из пользовательского режима такие объекты не видны — проверяем из ядра.
-    // Коды штатные: 0 — открылось, 0xC0000034 — объекта нет,
-    // 0xC0000022 — доступ запрещён, 0xC0000001 — прочий отказ.
+    // The probe iterated over request layouts and stopped on the last one.
+    // Before working with the pump we restore the working variant: otherwise
+    // identification goes out with a request known to be unsupported and fails.
+    // SPMI bus access probe: the only unexplored road to the PMIC registers.
+    // Such objects are not visible from user mode - we check from the kernel.
+    // The codes are stock ones: 0 - opened, 0xC0000034 - no such object,
+    // 0xC0000022 - access denied, 0xC0000001 - other failure.
     for (mark, name) in [
         ("SpmiProbeSuperuser", "\\Device\\Spmi\\SUPERUSER"),
         ("SpmiProbeSpmi", "\\Device\\Spmi"),
@@ -2005,14 +2045,15 @@ unsafe extern "C" fn evt_prepare_hardware(
         ("SpmiProbeLowerName", "\\Device\\spmi"),
         ("SpmiProbeArb", "\\Device\\SpmiArb"),
     ] {
-        // SAFETY: устройство создано, уровень пассивный.
+        // SAFETY: the device has been created, the level is passive.
         let status = unsafe { crate::spb::probe_named_target(device, name, 0x001F_01FF) };
         mark_device_value(device, mark, status as u32);
     }
 
-    // Объект шины SPMI для периферии PMIC: его открывают драйверы qcpmic8150,
-    // qcpmicext8150 и qcpmicgpio8150, значит он есть в системе. Прежняя проба
-    // вернула отказ — проверяем, не в маске ли доступа дело.
+    // The SPMI bus object for the PMIC peripheral: it is opened by the
+    // qcpmic8150, qcpmicext8150 and qcpmicgpio8150 drivers, so it exists in the
+    // system. The previous probe returned a failure - we check whether the access
+    // mask is to blame.
     for (mark, access) in [
         ("SpmiSuAcc0", 0x0000_0000_u32),
         ("SpmiSuAcc1", 0x0000_0001_u32),
@@ -2023,17 +2064,18 @@ unsafe extern "C" fn evt_prepare_hardware(
         ("SpmiSuAcc6", 0xC000_0000_u32),
         ("SpmiSuAcc7", 0x0001_0000_u32),
     ] {
-        // SAFETY: устройство создано, уровень пассивный.
+        // SAFETY: the device has been created, the level is passive.
         let status = unsafe {
             crate::spb::probe_named_target(device, "\\Device\\Spmi\\SUPERUSER", access)
         };
         mark_device_value(device, mark, status as u32);
     }
 
-    // Следующий рычаг QC: SUPERUSER уже отвергнут при ShareAccess=0. Штатные
-    // qcpmic/qcADC держат свои объекты — пробуем с FILE_SHARE_* и публичные
-    // символические имена, через которые идёт доступ к PMIC/ADC на этой платформе.
-    // Если любое открытие вернёт 0 — это канал к SID2 / CMD_HVDCP_2 (0x1343).
+    // The next QC lever: SUPERUSER has already been refused with ShareAccess=0.
+    // The stock qcpmic/qcADC hold their objects - we try FILE_SHARE_* and the
+    // public symbolic names through which access to the PMIC/ADC works on this
+    // platform. If any open returns 0, that is a channel to SID2 /
+    // CMD_HVDCP_2 (0x1343).
     for (mark, name) in [
         ("PmicOpenQcompmic", "\\DosDevices\\Global\\QCOMPMIC"),
         ("PmicOpenBattmgr", "\\DosDevices\\Global\\QCOMBATTMGR"),
@@ -2046,7 +2088,7 @@ unsafe extern "C" fn evt_prepare_hardware(
         ("AdcOpenQcomAdc3", "\\??\\QCOM_ADC3"),
         ("HubOpenBare", "\\Device\\RESOURCE_HUB"),
     ] {
-        // SAFETY: устройство создано, уровень пассивный.
+        // SAFETY: the device has been created, the level is passive.
         let status = unsafe {
             crate::spb::probe_named_target_ex(
                 device,
@@ -2057,8 +2099,8 @@ unsafe extern "C" fn evt_prepare_hardware(
         };
         mark_device_value(device, mark, status as u32);
     }
-    // SUPERUSER ещё раз — с совместным доступом (если qcpmic уже держит объект).
-    // SAFETY: устройство создано, уровень пассивный.
+    // SUPERUSER once more - with shared access (in case qcpmic already holds the object).
+    // SAFETY: the device has been created, the level is passive.
     let su_share = unsafe {
         crate::spb::probe_named_target_ex(
             device,
@@ -2069,18 +2111,19 @@ unsafe extern "C" fn evt_prepare_hardware(
     };
     mark_device_value(device, "SpmiSuShare", su_share as u32);
 
-    // Если слот SUPERUSER свободен (<3 держателей) — читаем APSD_STATUS (0x1307).
-    // SAFETY: пассивный уровень; устройство создано.
+    // If the SUPERUSER slot is free (<3 holders) - we read APSD_STATUS (0x1307).
+    // SAFETY: passive level; the device has been created.
     let apsd = unsafe { crate::spb::probe_superuser_apsd(device) };
     mark_device_value(device, "SuOpen", apsd.open_status as u32);
     mark_device_value(device, "SuGrant", apsd.grant_status as u32);
     mark_device_value(device, "SuApsdSt", apsd.read_status as u32);
     mark_device_value(device, "SuApsdVal", u32::from(apsd.value));
 
-    // Если ACPI-оверлей добавил SPMI USBIN (SID2 / 0x13) на PEIC — пробуем
-    // прочитать APSD_STATUS (0x1307). Успех (UsbinBeSt/UsbinLeSt = 0) = путь к
-    // CMD_HVDCP_2. Без оверлея UsbinConn=0 и этот блок только пишет UsbinOpen=0xFFFFFFFF.
-    // SAFETY: пассивный уровень; устройство создано.
+    // If the ACPI overlay added SPMI USBIN (SID2 / 0x13) to PEIC - we try to read
+    // APSD_STATUS (0x1307). Success (UsbinBeSt/UsbinLeSt = 0) = a path to
+    // CMD_HVDCP_2. Without the overlay UsbinConn=0 and this block only writes
+    // UsbinOpen=0xFFFFFFFF.
+    // SAFETY: passive level; the device has been created.
     unsafe { probe_usbin_spmi(device, usbin_id) };
     // Gate for WS-C HVDCP: stock ACPI keeps `None`; negotiate prefers SUPERUSER.
     // SAFETY: prepare is serialized with IOCTL/timer by WDF.
@@ -2093,7 +2136,7 @@ unsafe extern "C" fn evt_prepare_hardware(
     let mut pump = match Pump::open(pump_bus, config) {
         Ok(pump) => pump,
         Err(err) => {
-            println!("ln8000-kmdf: LN8000 не опознан: {err}");
+            println!("ln8000-kmdf: LN8000 not identified: {err}");
             let st = unsafe { state() };
             st.last_error = -2;
             mark_device_value(device, "PumpOpen", 0);
@@ -2103,7 +2146,7 @@ unsafe extern "C" fn evt_prepare_hardware(
         }
     };
     if let Err(err) = pump.configure() {
-        println!("ln8000-kmdf: конфигурация не удалась: {err}");
+        println!("ln8000-kmdf: configuration failed: {err}");
         let st = unsafe { state() };
         st.last_error = -3;
         mark_stage(device, STAGE_PREPARE_CONFIG, 0);
@@ -2136,10 +2179,10 @@ unsafe extern "C" fn evt_prepare_hardware(
         let mut vbus = 0i32;
         let mut iin = 0i32;
         let mut vac_unplug = false;
-        // Годность отсчётов входа для решения о питании (см. такт телеметрии и
-        // `battery_policy::online_raw_with_evidence`).
+        // Suitability of the input samples for the power decision (see the
+        // telemetry tick and `battery_policy::online_raw_with_evidence`).
         let mut input_readings_usable = false;
-        // First ADC right after HVDCP can return 0; retry — a zero sample must
+        // First ADC right after HVDCP can return 0; retry - a zero sample must
         // not pin tray SoC at 0% (see battery::update_from_telemetry).
         for _ in 0..3 {
             if let Some(pump) = st.pump.as_mut() {
@@ -2148,13 +2191,14 @@ unsafe extern "C" fn evt_prepare_hardware(
                 vbat = vbat_read.unwrap_or_default();
                 vbus = vbus_read.unwrap_or_default();
                 iin = pump.read_adc(AdcChannel::Iin).unwrap_or_default();
-                // Ноль канала — это «нет отсчёта», а не «0 В»: отказ шины даёт
-                // ноль, и уснувший АЦП читается успешно, но тоже нулём.
+                // A zero channel means "no sample", not "0 V": a bus failure
+                // gives a zero, and a sleeping ADC reads successfully but also
+                // returns zero.
                 input_readings_usable =
                     vbat_read.is_ok() && vbus_read.is_ok() && vbat > 0 && vbus > 0;
-                // Тот же аппаратный признак, что и в такте телеметрии: без него
-                // отражение `2 · VBAT` после отключения блока снова сошло бы за
-                // живой вход на этом пути публикации.
+                // The same hardware flag as in the telemetry tick: without it the
+                // reflected `2 · VBAT` after the brick is unplugged would again
+                // pass for a live input on this publication path.
                 vac_unplug = pump
                     .read_register(ln8000::regs::FAULT1_STS)
                     .is_ok_and(|f1| f1 & ln8000::regs::FAULT1_VAC_UNPLUG != 0);
@@ -2168,7 +2212,7 @@ unsafe extern "C" fn evt_prepare_hardware(
                 u32::try_from(vbat.max(0)).unwrap_or(0),
                 u32::try_from(vbus.max(0)).unwrap_or(0),
                 u32::try_from(iin.max(0)).unwrap_or(0),
-                // Окно пика ещё не начато: единственный отсчёт и есть пик.
+                // The peak window has not started yet: the single sample is the peak.
                 st.max_iin_ua
                     .max(u32::try_from(iin.max(0)).unwrap_or(0)),
                 vac_unplug,
@@ -2181,20 +2225,21 @@ unsafe extern "C" fn evt_prepare_hardware(
         mark_device_value(device, "BattPwr", battery::last_power_state());
     }
 
-    // 4d. Держим систему в S0, пока устройство работает: экран гаснет по своему
-    //     таймауту, но Connected Standby не наступает (см. `sysreq`). Без этого
-    //     планшет умирал на idle через 4-12 минут (`Kernel-Power 41`,
-    //     `BugcheckCode=0`, `ConnectedStandbyInProgress=true`).
-    // SAFETY: prepare-hardware идёт на PASSIVE_LEVEL, FDO существует.
+    // 4d. Hold the system in S0 while the device works: the screen turns off on
+    //     its own timeout, but Connected Standby does not set in (see `sysreq`).
+    //     Without this the tablet died on idle after 4-12 minutes
+    //     (`Kernel-Power 41`, `BugcheckCode=0`, `ConnectedStandbyInProgress=true`).
+    // SAFETY: prepare-hardware runs at PASSIVE_LEVEL, the FDO exists.
     let req_st = unsafe { sysreq::acquire(device) };
     mark_device_value(device, "SysReqSt", req_st as u32);
     mark_device_value(device, "SysReqOk", u32::from(req_st >= 0));
 
-    // 5. Запускаем телеметрию с периодом из реестра (one-shot + re-arm).
+    // 5. Start telemetry with the period from the registry (one-shot + re-arm).
     arm_telemetry_timer();
-    // Железо готово: с этого такта счётчик можно опрашивать. Флаг ставится
-    // после шины и до первого тика — `read_gauge_if_due` идёт **до** мьютекса,
-    // то есть не защищён от гонки с `evt_release_hardware`.
+    // The hardware is ready: from this tick the counter may be polled. The flag is
+    // set after the bus and before the first tick - `read_gauge_if_due` runs
+    // **before** the mutex, that is it is not protected against a race with
+    // `evt_release_hardware`.
     GAUGE_READY.store(true, Ordering::Release);
 
     mark_stage(device, STAGE_READY, 0);
@@ -2217,11 +2262,11 @@ fn arm_telemetry_timer() {
     }
 }
 
-/// Короткий код состояния «есть ли вход и режим» для метки `EngageState`.
+/// Short state code "is there input and mode" for the `EngageState` mark.
 ///
-/// 0 — нет входа, 1 — standby, 2 — bypass, 3 — switching,
-/// 4 — вход повышен, но 2:1 не проходит по физике (`Vin < 2*Vbat + 250 мВ`),
-/// а обход 1:1 при таком входе запрещён.
+/// 0 - no input, 1 - standby, 2 - bypass, 3 - switching,
+/// 4 - input is elevated but 2:1 does not pass physically (`Vin < 2*Vbat + 250 mV`),
+/// and the 1:1 bypass is forbidden at such an input.
 fn engage_state(input_present: bool, vin_uv: i32, vbat_uv: u32, mode: OpMode) -> u32 {
     if !input_present {
         return ENGAGE_NO_INPUT;
@@ -2236,8 +2281,8 @@ fn engage_state(input_present: bool, vin_uv: i32, vbat_uv: u32, mode: OpMode) ->
     }
 }
 
-/// Пишет метки одной попытки включения заряда: `ChargeAttemptN`,
-/// `LastEnableErr` (0 = успех) и `LastEnableMs` (монотонные миллисекунды).
+/// Writes the marks of a single charge-enable attempt: `ChargeAttemptN`,
+/// `LastEnableErr` (0 = success) and `LastEnableMs` (monotonic milliseconds).
 fn mark_charge_attempt(
     device: WDFDEVICE,
     attempts: u32,
@@ -2257,34 +2302,34 @@ fn mark_charge_attempt(
     );
 }
 
-/// Пишет метки фактического профиля защиты: `ProfLoops` и `ProfSel`.
+/// Writes the marks of the effective protection profile: `ProfLoops` and `ProfSel`.
 ///
-/// `ProfLoops` — 1, если в итоговом профиле петли регулирования насоса включены
-/// (и `V_FLOAT`, и `IIN`); иначе 0: тогда напряжение батареи ничем, кроме
-/// аппаратного `VBAT_OV`, не ограничено, и это надо видеть в постмортеме.
-/// `ProfSel` — применённое значение `ProtectionProfile` из реестра
-/// (`PROFILE_NOT_SET` — параметра не было, остался профиль кода).
+/// `ProfLoops` is 1 if the pump regulation loops are enabled in the resulting
+/// profile (both `V_FLOAT` and `IIN`); otherwise 0: then the battery voltage is
+/// limited by nothing but the hardware `VBAT_OV`, and that must be visible in the
+/// post-mortem. `ProfSel` is the applied `ProtectionProfile` value from the
+/// registry (`PROFILE_NOT_SET` - there was no parameter, the code profile stayed).
 fn mark_profile(device: WDFDEVICE, config: &PumpConfig, selected: Option<u32>) {
     let loops = u32::from(!config.vbat_reg_disabled && !config.iin_reg_disabled);
     mark_device_value(device, "ProfLoops", loops);
     mark_device_value(device, "ProfSel", selected.unwrap_or(PROFILE_NOT_SET));
 }
 
-/// Итог [`recover_ln_shutdown`].
+/// Outcome of [`recover_ln_shutdown`].
 enum ShutdownRecovery {
-    /// Чип не был в shutdown — восстанавливать нечего.
+    /// The chip was not in shutdown - there is nothing to recover.
     NotInShutdown,
-    /// Чип пересобран (`soft_reset` + `configure`) и сразу получил попытку
-    /// `set_charging(true)`; внутри — её результат.
+    /// The chip was rebuilt (`soft_reset` + `configure`) and immediately got a
+    /// `set_charging(true)` attempt; it holds that attempt's result.
     Recovered(Result<OpMode, PumpError>),
 }
 
-/// Пауза POR после `soft_reset`.
+/// POR pause after `soft_reset`.
 ///
-/// Сброс запускает POR, и до [`regs::SOFT_RESET_DELAY_MS`] любой обмен по I²C
-/// вешает чип (на этом уже ловили живое зависание). Пауза передаётся в
-/// `set_charging`, чтобы 5-вольтовый путь восстановления (`soft_reset` →
-/// `configure`) не трогал шину раньше времени.
+/// The reset starts a POR, and before [`regs::SOFT_RESET_DELAY_MS`] any I²C
+/// exchange hangs the chip (a live hang was caught on this). The pause is passed
+/// into `set_charging` so that the five-volt recovery path (`soft_reset` →
+/// `configure`) does not touch the bus ahead of time.
 fn por_delay() {
     let delay = u32::try_from(regs::SOFT_RESET_DELAY_MS)
         .unwrap_or(10)
@@ -2308,30 +2353,32 @@ fn recover_ln_shutdown(pump: &mut Pump<SpbBus>) -> ShutdownRecovery {
     if sys & regs::SYS_STS_SHUTDOWN == 0 {
         return ShutdownRecovery::NotInShutdown;
     }
-    println!("ln8000-kmdf: SYS_STS=0x{sys:02X} shutdown — soft_reset + reconfigure");
+    println!("ln8000-kmdf: SYS_STS=0x{sys:02X} shutdown - soft_reset + reconfigure");
     let _ = pump.soft_reset();
     por_delay();
     let _ = pump.configure();
     ShutdownRecovery::Recovered(pump.set_charging(true, &mut por_delay))
 }
 
-/// Останавливает телеметрию и переводит устройство в безопасное состояние.
+/// Stops telemetry and puts the device into a safe state.
 ///
 /// # Safety
 ///
-/// Вызывается WDF при удалении устройства.
+/// Called by WDF when the device is removed.
 unsafe extern "C" fn evt_release_hardware(
     _device: WDFDEVICE,
     _resources_translated: WDFCMRESLIST,
 ) -> NTSTATUS {
-    // Счётчик больше не опрашиваем: `read_gauge_if_due` идёт до мьютекса и не
-    // увидел бы, что шина вот-вот уйдёт из-под него. Флаг снимается до остановки
-    // таймера, чтобы уже начатое чтение осталось единственным.
+    // We no longer poll the counter: `read_gauge_if_due` runs before the mutex and
+    // would not see that the bus is about to go away from under it. The flag is
+    // cleared before stopping the timer so that an already started read stays the
+    // only one.
     GAUGE_READY.store(false, Ordering::Release);
-    // Мьютекс берём до остановки таймера: `WdfTimerStop` с нулём не ждёт
-    // текущий вызов, поэтому он мог бы работать с `STATE` одновременно с нами.
+    // We take the mutex before stopping the timer: `WdfTimerStop` with a zero does
+    // not wait for the current call, so it could work with `STATE` at the same
+    // time as we do.
     let _state = lock_state();
-    // SAFETY: `STATE` и шина защищены мьютексом состояния.
+    // SAFETY: `STATE` and the bus are protected by the state mutex.
     let timer = unsafe { TIMER };
     if !timer.is_null() {
         unsafe {
@@ -2340,13 +2387,14 @@ unsafe extern "C" fn evt_release_hardware(
     }
     // SAFETY: detach BattC before tearing down the FDO path.
     unsafe { battery::unload() };
-    // SAFETY: запрос питания наш и ещё не снят; снимаем вместе с устройством.
+    // SAFETY: the power request is ours and has not been released yet; we release
+    // it together with the device.
     unsafe { sysreq::release() };
-    // SAFETY: см. инварианты `DriverState`.
+    // SAFETY: see the invariants of `DriverState`.
     let st = unsafe { state() };
     if let Some(pump) = st.pump.as_mut() {
         if let Err(err) = pump.standby() {
-            println!("ln8000-kmdf: не удалось уйти в standby: {err}");
+            println!("ln8000-kmdf: failed to go to standby: {err}");
         }
         pump.close();
     }
@@ -2361,70 +2409,71 @@ unsafe extern "C" fn evt_release_hardware(
     wdk_sys::STATUS_SUCCESS
 }
 
-/// Пишет FCC бака SMB5 и публикует исход записи; `true` — в регистре
-/// действительно оказалось запрошенное значение.
+/// Writes the SMB5 buck FCC and publishes the write outcome; `true` - the
+/// requested value really ended up in the register.
 ///
-/// Отдельная функция, потому что путей записи два (подъём и возврат), а
-/// проверка одна: сравнение с обратным чтением. Запись без сверки повторяла бы
-/// историю с `BypassPorSpent` — молчаливый отказ выглядел бы как успех.
-/// `ChgrFccErr` снимается нулём на успехе, иначе прошлая неудача висела бы в
-/// журнале до перезагрузки.
+/// A separate function because there are two write paths (raise and return) but
+/// one check: comparison with the read-back. A write without a cross-check would
+/// repeat the `BypassPorSpent` story - a silent failure would look like success.
+/// `ChgrFccErr` is cleared with a zero on success, otherwise the previous failure
+/// would hang in the journal until a reboot.
 ///
 /// # Safety
 ///
-/// `PASSIVE_LEVEL`; `device` жив.
+/// `PASSIVE_LEVEL`; `device` is alive.
 unsafe fn write_fcc_and_publish(device: WDFDEVICE, want: u8) -> bool {
-    // SAFETY: пассивный уровень; `device` жив (проверяет вызывающий).
+    // SAFETY: passive level; `device` is alive (checked by the caller).
     match unsafe { crate::spb::write_fcc_raw(device, want) } {
         Some(written) => {
             mark_device_value(device, "ChgrFccSet", u32::from(written));
             if written == want {
                 mark_device_value(device, "ChgrFccErr", 0);
                 println!(
-                    "ln8000-kmdf: FCC бака = {} x 50 мА = {} мА",
+                    "ln8000-kmdf: buck FCC = {} x 50 mA = {} mA",
                     written,
                     u32::from(written).saturating_mul(50)
                 );
                 true
             } else {
-                // Чип принял запись, но оставил своё: уставка выше его текущего
-                // потолка (тапер, JEITA) или периферия не выдана.
+                // The chip accepted the write but kept its own value: the setpoint
+                // is above its current ceiling (taper, JEITA) or the peripheral is
+                // not exposed.
                 mark_device_value(device, "ChgrFccErr", 1);
                 println!(
-                    "ln8000-kmdf: FCC бака не встал: просили {want}, в регистре {written}"
+                    "ln8000-kmdf: buck FCC did not take: asked for {want}, register holds {written}"
                 );
                 false
             }
         }
         None => {
             mark_device_value(device, "ChgrFccErr", 1);
-            println!("ln8000-kmdf: запись FCC бака (0x1061 = {want}) не прошла");
+            println!("ln8000-kmdf: buck FCC write (0x1061 = {want}) failed");
             false
         }
     }
 }
 
-/// Периодический сбор телеметрии, журналирование и защита.
+/// Periodic telemetry collection, journalling and protection.
 ///
 /// # Safety
 ///
-/// Вызывается WDF из таймера на пассивном уровне.
+/// Called by WDF from the timer at passive level.
 unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
-    // Топливный счётчик читается до мьютекса: одна транзакция SUPERUSER идёт
-    // около двух секунд, а под мьютексом стоят и управление зарядом, и
-    // `IOCTL_STATUS`. Пока опрос шёл под мьютексом каждые 250 мс, сторонний
-    // читатель SUPERUSER не мог открыть шину в 79 попытках из 100.
-    // SAFETY: пассивный уровень, состояние не трогаем.
+    // The fuel counter is read before the mutex: one SUPERUSER transaction takes
+    // about two seconds, and both charge control and `IOCTL_STATUS` sit under the
+    // mutex. While polling ran under the mutex every 250 ms, a third-party
+    // SUPERUSER reader could not open the bus in 79 attempts out of 100.
+    // SAFETY: passive level, we do not touch the state.
     let gauge = unsafe { read_gauge_if_due() };
-    // Таймер идёт своим контекстом, очередь WDF его не сериализует: шину и
-    // `STATE` защищает мьютекс состояния.
+    // The timer runs in its own context, the WDF queue does not serialize it: the
+    // bus and `STATE` are protected by the state mutex.
     let _state = lock_state();
     // Pump borrow must end before HVDCP reopen (retry / re-plug).
     let (want_replug, want_retry, want_reelevate) = {
-    // SAFETY: доступ сериализован WDF (автоматическая сериализация таймера).
+    // SAFETY: access is serialized by WDF (automatic timer serialization).
     let st = unsafe { state() };
     let Some(pump) = st.pump.as_mut() else {
-        // Hardware released — do not re-arm (ReleaseHardware already stopped us).
+        // Hardware released - do not re-arm (ReleaseHardware already stopped us).
         return;
     };
 
@@ -2432,18 +2481,18 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
         Ok(status) => status,
         Err(err) => {
             st.last_error = -10;
-            println!("ln8000-kmdf: статус недоступен: {err}");
+            println!("ln8000-kmdf: status unavailable: {err}");
             arm_telemetry_timer();
             return;
         }
     };
 
-    // Отказ чтения канала даёт ноль, который неотличим от настоящего нуля,
-    // поэтому достоверность едет в отсчёте отдельными признаками: по мусору
-    // защита не имеет права ни резать ток, ни возвращать его к профилю.
-    // Признак — только результат шинного чтения; правдоподобность значения
-    // проверяет сама защита (`guard::die_temp_usable`: нулевой сырой код АЦП
-    // декодируется в +160,0 °C и отсекается по `DIE_TEMP_MAX_PLAUSIBLE_DC`).
+    // A failed channel read gives a zero that is indistinguishable from a real
+    // zero, so validity travels in the sample as separate flags: protection has
+    // no right to cut the current or return it to the profile based on garbage.
+    // The flag is only the result of the bus read; the plausibility of the value
+    // is checked by protection itself (`guard::die_temp_usable`: a zero raw ADC
+    // code decodes to +160,0 °C and is cut off by `DIE_TEMP_MAX_PLAUSIBLE_DC`).
     let vbat_read = pump.read_adc(AdcChannel::Vbat);
     let vbus_read = pump.read_adc(AdcChannel::Vin);
     let iin_read = pump.read_adc(AdcChannel::Iin);
@@ -2456,16 +2505,17 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
     let vbat_uv = u32::try_from(vbat.max(0)).unwrap_or(0);
     let vbus_uv = u32::try_from(vbus.max(0)).unwrap_or(0);
     let iin_ua = u32::try_from(iin.max(0)).unwrap_or(0);
-    // `FAULT1` бит 4 (`LN8000_MASK_VAC_UNPLUG_STS`, вендорский
-    // `ln8000_charger.h:62`): железо само сообщает, что блок отключён. Вендор
-    // отвечает этим битом на вопрос «есть ли VBUS» (`POWER_SUPPLY_PROP_TI_VBUS_PRESENT`
-    // в `ln8000_charger.c`), поэтому признак не нужно выводить из АЦП.
+    // `FAULT1` bit 4 (`LN8000_MASK_VAC_UNPLUG_STS`, vendor
+    // `ln8000_charger.h:62`): the hardware itself reports that the brick is
+    // unplugged. The vendor answers the question "is VBUS present" with this bit
+    // (`POWER_SUPPLY_PROP_TI_VBUS_PRESENT` in `ln8000_charger.c`), so the flag
+    // does not need to be derived from the ADC.
     let vac_unplug = status.fault1_sts & ln8000::regs::FAULT1_VAC_UNPLUG != 0;
-    // При отключённом кабеле узел VIN не нагружен, и АЦП читает `2 · VBAT`
-    // (живой замер 19.09: `Vin = 8,80 В` при банке `4,40 В`, ток на полу).
-    // По сырому `vbus > 0` такой вход выглядел живым, а от этого признака
-    // зависят защита, сессии и HVDCP. Ток и активный режим перебивают: они
-    // означают, что вход действительно работает.
+    // With the cable unplugged the VIN node is not loaded, and the ADC reads
+    // `2 · VBAT` (live measurement 19.09: `Vin = 8,80 V` with a cell at
+    // `4,40 V`, current at the floor). By raw `vbus > 0` such an input looked
+    // live, and protection, sessions and HVDCP depend on this flag. Current and
+    // an active mode override it: they mean the input really works.
     let phantom_input = iin_ua < hvdcp::IIN_DEAD_FLOOR_UA
         && status.op_mode != OpMode::Switching
         && status.op_mode != OpMode::Bypass
@@ -2483,12 +2533,13 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
     };
     st.telemetry.push(sample);
 
-    // Годны ли отсчёты входа для решения о питании. Ноль здесь означает «нет
-    // отсчёта», а не «0 В»: отказ чтения схлопывается в ноль выше, а АЦП уходит
-    // в автогибернацию через ~4 с покоя и читается успешно, но с `0x00` во всех
-    // каналах (`encoding::vbat_reading_usable`). Без этого признака 4 с покоя
-    // насоса плюс 8 с окна `ONLINE_HOLD_MS` давали Windows переход AC→DC→AC при
-    // неподвижном кабеле — то есть сброс политики подсветки по Kernel-Power 105.
+    // Whether the input samples are good enough for the power decision. A zero
+    // here means "no sample", not "0 V": a read failure collapses to zero above,
+    // and the ADC goes into auto-hibernation after ~4 s of idle and then reads
+    // successfully but with `0x00` in all channels
+    // (`encoding::vbat_reading_usable`). Without this flag 4 s of pump idle plus
+    // the 8 s `ONLINE_HOLD_MS` window made Windows switch AC→DC→AC with the cable
+    // motionless - that is, a backlight policy reset via Kernel-Power 105.
     let input_readings_usable = sample.vbat_valid && vbus_read.is_ok() && sample.vbus_uv > 0;
 
     // SAFETY: BattC status notify is DISPATCH-safe; we run at PASSIVE.
@@ -2506,16 +2557,16 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
     let device = unsafe { DEVICE };
     if !device.is_null() {
         mark_device_value(device, "BattPwr", battery::last_power_state());
-        // Живые Vin/Iin/режим для операторских скриптов (читают `SuVinUv`,
-        // `SuIin`, `SuMode`); раньше эти имена никто не писал.
+        // Live Vin/Iin/mode for operator scripts (they read `SuVinUv`, `SuIin`,
+        // `SuMode`); previously nobody wrote these names.
         mark_device_value(device, "SuVinUv", sample.vbus_uv);
         mark_device_value(device, "SuIin", sample.iin_ua);
         mark_device_value(device, "SuMode", u32::from(status.op_mode.code()));
-        // Битовая маска достоверности каналов (0 — все прочитаны): в дампе
-        // отказ чтения больше не выглядит как настоящий ноль. Бит 0 покрывает и
-        // гибернацию АЦП: уснувший чип читается успешно, но отдаёт ноль, а ноль
-        // вольт на живой банке невозможен (`encoding::vbat_reading_usable`).
-        // бит 0 — VBAT, бит 1 — DieTemp, бит 2 — Iin, бит 3 — Vin.
+        // Bit mask of channel validity (0 - all read): in a dump a read failure
+        // no longer looks like a real zero. Bit 0 also covers ADC hibernation: a
+        // sleeping chip reads successfully but returns zero, and zero volts on a
+        // live cell is impossible (`encoding::vbat_reading_usable`).
+        // bit 0 - VBAT, bit 1 - DieTemp, bit 2 - Iin, bit 3 - Vin.
         mark_device_value(
             device,
             "AdcValid",
@@ -2524,12 +2575,14 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
                 | (u32::from(iin_read.is_err()) << 2)
                 | (u32::from(vbus_read.is_err()) << 3),
         );
-        // Годность отсчётов входа для решения о питании — вход ветки
-        // `online_raw_with_evidence`: по метке видно, работал ли на такте
-        // обычный путь или «нет отсчёта, но железо говорит, что VBUS на месте».
+        // Suitability of the input samples for the power decision - the input of
+        // the `online_raw_with_evidence` branch: the mark shows whether the
+        // ordinary path ran on this tick or "no sample, but the hardware says
+        // VBUS is present".
         mark_device_value(device, "InputUsable", u32::from(input_readings_usable));
-        // Пик тока за окно наблюдения: пишем раз в IIN_WINDOW_MS и начинаем
-        // новое окно, чтобы постфактум было видно, брал ли драйвер ток вообще.
+        // Current peak over the observation window: we write it once per
+        // IIN_WINDOW_MS and start a new window, so that afterwards it is visible
+        // whether the driver drew current at all.
         if sample.iin_ua > st.max_iin_ua {
             st.max_iin_ua = sample.iin_ua;
         }
@@ -2542,18 +2595,19 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
         }
     }
 
-    // Топливный счётчик PM8150B: единственный достоверный источник процента.
-    // Линейная оценка по VBAT на этой банке врала в обе стороны — на
-    // подключённом блоке давала 100 %, а там, где счётчик говорит 6 %, — 25 %.
-    // Само чтение сделано выше, до мьютекса (`read_gauge_if_due`); здесь только
-    // публикация. Отказ ничего не портит: остаётся прежнее значение (а если
-    // счётчик не отвечал ни разу — оценка по банке, `SocSrc=2`). Счётчик отказов
-    // живёт в модуле батареи: здесь `pump` держит изменяемую ссылку на
-    // состояние, и второй раз брать её нельзя.
-    // «Насос несёт ток»: активный 2:1 и перенос выше пола АЦП. Предикат поднят
-    // сюда, к публикации марок, потому что по нему же решается судьба FCC бака
-    // (ниже): поднимать предел бака имеет смысл, только пока насос реально
-    // переносит. Выбор режима ниже использует ту же величину.
+    // The PM8150B fuel counter: the only trustworthy source of the percentage. A
+    // linear estimate from VBAT on this cell lied in both directions - on a
+    // connected brick it gave 100 %, and where the counter says 6 %, it gave 25 %.
+    // The read itself was done above, before the mutex (`read_gauge_if_due`); here
+    // it is only publication. A failure spoils nothing: the previous value stays
+    // (and if the counter never answered, the cell estimate, `SocSrc=2`). The
+    // failure counter lives in the battery module: here `pump` holds a mutable
+    // reference to the state, and it must not be taken a second time.
+    // "The pump is carrying current": active 2:1 and a transfer above the ADC
+    // floor. The predicate is lifted here, to the mark publication, because the
+    // fate of the buck FCC (below) is decided by it as well: raising the buck
+    // limit only makes sense while the pump really transfers. The mode choice
+    // below uses the same quantity.
     let pump_alive = status.op_mode == OpMode::Switching
         && sample.iin_ua > hvdcp::IIN_DEAD_FLOOR_UA;
     let device = unsafe { DEVICE };
@@ -2571,77 +2625,84 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
         }
         mark_device_value(device, "SocSrc", battery::last_soc_source());
         mark_device_value(device, "BattPct", battery::last_percent());
-        // Живое напряжение банки с чипа, а не отсчёт, снятый один раз при
-        // запуске устройства: прежняя запись жила только в prepare-hardware и в
-        // IOCTL, поэтому марка замирала на значении первого такта (живой замер
-        // 19.09 12:0x: `BattVbat` 4 010 мВ при живых 4 230 мВ) и портила разбор
-        // полосы переноса, который считается от `vbat`. Во время 2:1 отсчёт
-        // идёт по середине шины преобразователя (≈ Vin/2), а не по банке —
-        // заряд берётся из счётчика PM8150B (`BattPct`).
+        // Live cell voltage from the chip, not a sample taken once at device
+        // start: the previous entry lived only in prepare-hardware and in the
+        // IOCTL, so the mark froze at the value of the first tick (live
+        // measurement 19.09 12:0x: `BattVbat` 4 010 mV against a live 4 230 mV)
+        // and spoiled the analysis of the transfer band, which is computed from
+        // `vbat`. During 2:1 the sample comes from the middle of the converter
+        // bus (≈ Vin/2), not from the cell - the charge is taken from the
+        // PM8150B counter (`BattPct`).
         mark_device_value(device, "BattVbat", sample.vbat_uv / 1000);
         mark_device_value(device, "BattPwr", battery::last_power_state());
-        // Возраст последнего удачного чтения: по нему видно, что счётчик не
-        // «залип», а опрашивается редко — раз в `GAUGE_POLL_MS`.
+        // Age of the last successful read: it shows that the counter is not
+        // stuck but polled rarely - once per `GAUGE_POLL_MS`.
         let gauge_last = GAUGE_LAST_MS.load(Ordering::Acquire);
         let age_ms = u32::try_from(sample.ts_ms.saturating_sub(gauge_last)).unwrap_or(u32::MAX);
         mark_device_value(device, "SocAgeMs", age_ms);
         mark_device_value(device, "GaugePollMs", GAUGE_POLL_MS);
-        // Сырые байты отказов публикуются как есть: у чипа есть групповой
-        // признак «напряженческих» отказов (`FAULT1` биты 6:0), который вендор
-        // тестирует целиком, а именованных битов в нём только пять. Живой
-        // `FAULT1=0x21` — два безымянных бита этой группы: `has_critical_fault`
-        // о них молчит, а вендорский `volt_qual` говорит «вход негоден». Без
-        // этих марок разница между «нет отказов» и «вход негоден» не видна.
+        // The raw failure bytes are published as they are: the chip has a group
+        // flag for "voltage" failures (`FAULT1` bits 6:0) that the vendor tests as
+        // a whole, while only five named bits exist in it. The live
+        // `FAULT1=0x21` is two nameless bits of that group: `has_critical_fault`
+        // stays silent about them, while the vendor's `volt_qual` says "input
+        // unusable". Without these marks the difference between "no failures" and
+        // "input unusable" is invisible.
         mark_device_value(device, "Fault1Sts", u32::from(status.fault1_sts));
         mark_device_value(device, "Fault2Sts", u32::from(status.fault2_sts));
         mark_device_value(device, "SysSts", u32::from(status.sys_sts));
-        // Тот же байт под вторым именем: в декодированном `OpMode` не видны
-        // биты петель — bit7 `IIN_LOOP` и bit6 `VFLOAT_LOOP`, — а именно они
-        // говорят, упёрся ли насос в предел тока входа или уже в потолок
-        // напряжения, и висит ли он без петли вовсе.
+        // The same byte under a second name: the loop bits are not visible in the
+        // decoded `OpMode` - bit7 `IIN_LOOP` and bit6 `VFLOAT_LOOP` - and it is
+        // exactly they that tell whether the pump has hit the input current limit
+        // or already the voltage ceiling, and whether it hangs without a loop at
+        // all.
         mark_device_value(device, "SysStsRaw", u32::from(status.sys_sts));
         mark_device_value(device, "SafetySts", u32::from(status.safety_sts));
-        // Вторая ступень вендора считается только при разрешённом заряде;
-        // «разрешён» — это принятый чипом рабочий режим, а не запрошенный.
+        // The vendor's second stage is only counted with charging enabled;
+        // "enabled" means the operating mode accepted by the chip, not the
+        // requested one.
         let charging = matches!(status.op_mode, OpMode::Switching | OpMode::Bypass);
         mark_device_value(device, "VoltQual", u32::from(status.volt_qual(charging)));
-        // Какая стадия 5-вольтового резерва сработала: `1` — чистая запись
-        // (то, что работало 17.09), `2` — POR, `3` — маска отказов. По этой
-        // марке видно, лечится ли блокировка режима снятием защёлки или вход
-        // действительно негоден.
+        // Which stage of the five-volt fallback worked: `1` - a clean write (what
+        // worked on 17.09), `2` - a POR, `3` - the failure mask. This mark shows
+        // whether the mode lock is cured by clearing the latch or the input is
+        // really unusable.
         mark_device_value(device, "BypassStage", u32::from(pump.bypass_stage()));
-        // `1` — POR-бюджет этого входа уже израсходован: драйвер упёрся в отказ
-        // и ждёт смены блока. По марке видно, что повторные тики не дёргают чип.
+        // `1` - the POR budget of this input has already been spent: the driver hit
+        // a failure and is waiting for the brick to be changed. The mark shows that
+        // the repeated ticks do not pull the chip.
         mark_device_value(device, "BypassPorSpent", u32::from(pump.por_spent()));
 
-        // Вторая зарядная ветка платформы — бак (buck) SMB5 (PM8150B) — и ток
-        // банки из топливного счётчика. До этих марок было не видно ни FCC,
-        // который оставила прошивка, ни реального тока в банку: насос меряет
-        // только свой вход, а 2:1 сам по себе не говорит, куда ушёл перенос.
-        // Раз в `GAUGE_POLL_MS`: снимок — это открытие SUPERUSER, три grant,
-        // семь однобайтовых чтений и три пары регистров (ток и напряжение
-        // банки), и на каждом такте
-        // телеметрии (250 мс) такая нагрузка на шину недопустима — при опросе
-        // счётчика раз в 250 мс сторонний читатель SUPERUSER получал отказ в
-        // 79 попытках из 100 (замер 18.09).
-        // Отказ чтения не тонет в нулях: он виден по `ChgrErr`, а сами значения
-        // тогда `0xFFFFFFFF`. Для `FgIbatUa` это значение недостижимо: разряд
-        // весит 488 мкА, и тока в 1 мкА счётчик выдать не может.
+        // The platform's second charging branch - the SMB5 buck (PM8150B) - and the
+        // cell current from the fuel counter. Before these marks it was impossible
+        // to see either the FCC the firmware left or the real current into the cell:
+        // the pump measures only its own input, and 2:1 by itself does not say where
+        // the transfer went. Once per `GAUGE_POLL_MS`: a snapshot is a SUPERUSER
+        // open, three grants, seven single-byte reads and three register pairs (cell
+        // current and voltage), and on every telemetry tick (250 ms) such a load on
+        // the bus is unacceptable - with the counter polled once per 250 ms a
+        // third-party SUPERUSER reader was refused in 79 attempts out of 100
+        // (measurement 18.09).
+        // A read failure does not drown in zeros: it is visible via `ChgrErr`, and
+        // the values themselves are then `0xFFFFFFFF`. For `FgIbatUa` that value is
+        // unreachable: one bit weighs 488 µA, and the counter cannot deliver a
+        // current of 1 µA.
         if st.last_chgr_mark_ms == 0
             || sample.ts_ms.saturating_sub(st.last_chgr_mark_ms) >= u64::from(GAUGE_POLL_MS)
         {
-            // Отметка ставится и при отказе: иначе недоступная периферия
-            // опрашивалась бы на каждом такте.
+            // The mark is set on failure too: otherwise an unavailable peripheral
+            // would be polled on every tick.
             st.last_chgr_mark_ms = sample.ts_ms;
-            // SAFETY: пассивный уровень; `device` жив (проверено выше).
+            // SAFETY: passive level; `device` is alive (checked above).
             match unsafe { crate::spb::read_charge_regs(device) } {
                 Some(regs) => {
-                    // Заводское значение FCC захватывается один раз: возвращать
-                    // после насоса нужно именно его. Сырой ноль означает «ещё не
-                    // захвачено», а не «ноль ампер», — на этой плате прошивка
-                    // оставляет 30 (живой замер 19.09), и по нулю в этой роли
-                    // видно, что поднимать предел нельзя: вернуть банк к
-                    // исходному было бы нечем (см. `DriverState::fcc_boot_raw`).
+                    // The factory FCC value is captured once: it is exactly what
+                    // must be returned after the pump. A raw zero means "not
+                    // captured yet", not "zero amperes" - on this board the
+                    // firmware leaves 30 (live measurement 19.09), and a zero in
+                    // this role shows that the limit must not be raised: there
+                    // would be nothing to return the buck to (see
+                    // `DriverState::fcc_boot_raw`).
                     if st.fcc_boot_raw == 0 {
                         st.fcc_boot_raw = regs.fcc_raw;
                     }
@@ -2653,124 +2714,131 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
                     mark_device_value(device, "ChgrIclRaw", u32::from(regs.icl_raw));
                     mark_device_value(device, "ChgrAllow", u32::from(regs.usbin_allow));
                     mark_device_value(device, "FgIbatUa", regs.ibatt_ua);
-                    // Два напряжения банки рядом, в одном снимке, — это и есть
-                    // смысл сборки: их расхождение проверяет гипотезу, что
-                    // `vbat` у нас не тот.
+                    // Two cell voltages side by side, in one snapshot - that is the
+                    // whole point of the build: their divergence tests the
+                    // hypothesis that our `vbat` is the wrong one.
                     //
-                    // Полоса переноса 2:1 считается от `vbat`
-                    // (`ln8000::encoding::window_target_uv`: `2·vbat + {200,300,400} мВ`),
-                    // поэтому ошибка в `vbat` двигает всю полосу. Живой замер
-                    // 19.09: шина стоит на 8,672 В, `SuMode = 3`, `SysStsRaw =
-                    // 0x04`, а вход берёт всего 0,787 А — при том, что тот же
-                    // блок на 9,136 В отдавал 1,25 А. Вывод «мы на полу полосы»
-                    // сделан по числу, взятому с `AdcChannel::Vbat`, а у самого
-                    // LN8000 есть оговорка (см. комментарий у `BattVbat` выше,
-                    // строка про 2:1): во время 2:1 этот канал читает середину
-                    // шины преобразователя (≈ Vin/2), а не банку. Если так, то
-                    // `vbat` занижен примерно вдвое, `2·vbat` тоже, и полоса
-                    // посчитана не там, где стоит шина.
+                    // The 2:1 transfer band is computed from `vbat`
+                    // (`ln8000::encoding::window_target_uv`: `2·vbat + {200,300,400} mV`),
+                    // so an error in `vbat` moves the whole band. Live measurement
+                    // 19.09: the bus sits at 8,672 V, `SuMode = 3`, `SysStsRaw =
+                    // 0x04`, while the input draws only 0,787 A - even though the
+                    // same brick at 9,136 V delivered 1,25 A. The conclusion "we are
+                    // at the floor of the band" was drawn from the number taken from
+                    // `AdcChannel::Vbat`, and the LN8000 itself has a caveat (see the
+                    // comment at `BattVbat` above, the line about 2:1): during 2:1
+                    // this channel reads the middle of the converter bus
+                    // (≈ Vin/2), not the cell. If so, `vbat` is understated roughly
+                    // by half, `2·vbat` too, and the band is computed for a place
+                    // where the bus is not.
                     //
-                    // `FgVbattMv` — независимый отсчёт: топливный счётчик
-                    // PM8150B, пара `0x41A0`/`0x41A6`, тот же путь SPMI, что и
-                    // у тока банки, никак не связанный с ADC насоса.
-                    // `VbatAdcMv` — то самое число, от которого считается
-                    // полоса (`sample.vbat_uv / 1000`; под именем `BattVbat` оно
-                    // публикуется выше и остаётся на месте — здесь оно повторено
-                    // затем, чтобы оба отсчёта читались из одной записи журнала
-                    // и не разъезжались по тактам). Сходятся — гипотеза снята;
-                    // расходятся вдвое — полоса считается от середины шины, и
-                    // двигать её нужно по `FgVbattMv`.
+                    // `FgVbattMv` is an independent sample: the PM8150B fuel
+                    // counter, the `0x41A0`/`0x41A6` pair, the same SPMI path as the
+                    // cell current, in no way connected to the pump ADC.
+                    // `VbatAdcMv` is that very number from which the band is
+                    // computed (`sample.vbat_uv / 1000`; under the name `BattVbat`
+                    // it is published above and stays there - it is repeated here so
+                    // that both samples are read from a single journal record and do
+                    // not drift apart across ticks). They agree - the hypothesis is
+                    // dismissed; they diverge twofold - the band is computed from
+                    // the middle of the bus, and it must be moved by `FgVbattMv`.
                     mark_device_value(device, "FgVbattMv", regs.fg_vbatt_uv / 1000);
                     mark_device_value(device, "VbatAdcMv", sample.vbat_uv / 1000);
                     mark_device_value(device, "ChgrErr", 0);
 
-                    // Одноразовая проба записи FCC бака — единственный способ
-                    // узнать, принимает ли периферия CHGR запись вообще. Живой
-                    // замер 19.09 (92 % банки, 4,375 В, `ChgrFccRaw = 30`) лежит
-                    // выше ворот политики ниже (`RE_ELEVATE_MAX_VBAT_UV`, 4,35 В),
-                    // а насос тока не несёт: ни одно условие подъёма не выполняется,
-                    // и путь записи не исполнится ни разу. Молчаливый отказ
-                    // периферии выглядел бы тогда как «предел подняли, а ток не
-                    // вырос». Снаружи это не проверить: `\Device\Spmi\SUPERUSER` —
-                    // имя уровня ядра, пользовательской символической ссылки у него
-                    // нет, и открытие из user mode даёт `STATUS_OBJECT_PATH_NOT_FOUND`.
+                    // The one-shot buck FCC write probe - the only way to find out
+                    // whether the CHGR peripheral accepts a write at all. The live
+                    // measurement on 19.09 (92 % cell, 4,375 V, `ChgrFccRaw = 30`)
+                    // lies above the policy gate below (`RE_ELEVATE_MAX_VBAT_UV`,
+                    // 4,35 V), and the pump is not carrying current: no raise
+                    // condition holds, and the write path would never execute. A
+                    // silent refusal by the peripheral would then look like "the
+                    // limit was raised but the current did not grow". This cannot be
+                    // checked from the outside: `\Device\Spmi\SUPERUSER` is a
+                    // kernel-level name, it has no user symbolic link, and opening
+                    // it from user mode gives `STATUS_OBJECT_PATH_NOT_FOUND`.
                     //
-                    // Проба идёт строго вниз — [`FCC_PROBE_UA`] (сырое 20) против
-                    // заводского 30 — и сразу возвращает заводское: понижение
-                    // предела не может поднять ток в банку, а на 92 % бак ведёт
-                    // тапер, и на доли секунды, пока уставка стоит, она не
-                    // ограничивает перенос. Исход остаётся в журнале
+                    // The probe goes strictly downwards - [`FCC_PROBE_UA`] (raw 20)
+                    // against the factory 30 - and immediately returns the factory
+                    // value: lowering the limit cannot raise the current into the
+                    // cell, and at 92 % the buck is driven by the taper, so for the
+                    // fractions of a second while the setpoint stands it does not
+                    // limit the transfer. The outcome stays in the journal
                     // (`ChgrProbeWrote`/`ChgrProbeRestored`/`ChgrProbeOk`/`ChgrProbeErr`),
-                    // а флаг [`DriverState::fcc_probe_done`] снимает повтор: отказ
-                    // записи не должен повторяться на каждом такте.
+                    // and the [`DriverState::fcc_probe_done`] flag stops the repeat:
+                    // a write failure must not repeat on every tick.
                     //
-                    // Один такт — одно перо: если регистром распоряжается политика
-                    // (предел уже поднят или будет поднят ниже по коду), проба
-                    // уступает и только отмечает это. Сорванный снимок SPMI сюда не
-                    // доходит вовсе — весь блок живёт в ветке успешного
-                    // `read_charge_regs`, — а критичный отказ чипа не тратит
-                    // одноразовый шанс: в перегретый или перенапряжённый чип не
-                    // пишет ни проба, ни политика.
+                    // One tick - one owner: if the register is held by the policy
+                    // (the limit is already raised or will be raised further down in
+                    // the code), the probe yields and only marks that. A broken SPMI
+                    // snapshot never reaches here at all - the whole block lives in
+                    // the successful `read_charge_regs` branch - and a critical chip
+                    // failure does not waste the one-shot chance: neither the probe
+                    // nor the policy writes into an overheated or overvolted chip.
                     if !st.fcc_probe_done
                         && st.fcc_boot_raw != 0
                         && !status.has_critical_fault()
                     {
-                        // Политика держит регистр, если насос несёт ток ниже ворот
-                        // или предел уже поднят её рукой — тогда проба не имеет
-                        // права писать: её запись затёрла бы подъём. Пара условий
-                        // здесь ровно та же, что у самого подъёма ниже, поэтому
-                        // «включена и ждёт» политика пробу не пропускает: без
-                        // `fcc_raised` её удерживает второе слагаемое. Выключенная
-                        // политика (`FccRaw` не задан или 0) держать регистр не
-                        // может, но уступать всё равно приходится — второе
-                        // слагаемое не знает про параметр, и проба дождётся первого
-                        // такта, где насос не несёт ток или банка выше ворот.
+                        // The policy holds the register if the pump is carrying
+                        // current below the gate or the limit has already been
+                        // raised by its hand - then the probe has no right to write:
+                        // its write would wipe out the raise. The pair of conditions
+                        // here is exactly the same as in the raise itself below, so
+                        // a policy that is "on and waiting" does not let the probe
+                        // through: without `fcc_raised` the second term holds it. A
+                        // disabled policy (`FccRaw` unset or 0) cannot hold the
+                        // register, but yielding still happens - the second term
+                        // knows nothing about the parameter, and the probe will wait
+                        // for the first tick where the pump carries no current or
+                        // the cell is above the gate.
                         let policy_owns = st.fcc_raised
                             || (pump_alive && sample.vbat_uv < RE_ELEVATE_MAX_VBAT_UV);
-                        // Потолок [`FCC_WRITE_MAX_UA`] применён внутри `raw_for`.
+                        // The [`FCC_WRITE_MAX_UA`] ceiling was applied inside `raw_for`.
                         let probe_raw = raw_for(FCC_PROBE_UA);
                         if policy_owns {
                             mark_device_value(device, "ChgrProbeOk", 3);
                             st.fcc_probe_done = true;
                         } else if probe_raw >= st.fcc_boot_raw {
-                            // Зажим пробы сделан пропуском, а не `min`: уставка,
-                            // равная заводской, ничего не доказывает, а выше
-                            // заводской проба не имеет права быть ни при каких
-                            // условиях.
+                            // The probe is clamped by skipping, not by `min`: a
+                            // setpoint equal to the factory value proves nothing,
+                            // and the probe has no right to be above the factory
+                            // value under any conditions.
                             mark_device_value(device, "ChgrProbeOk", 2);
                             st.fcc_probe_done = true;
                         } else {
-                            // SAFETY: пассивный уровень; `device` жив.
+                            // SAFETY: passive level; `device` is alive.
                             let wrote = unsafe { crate::spb::write_fcc_raw(device, probe_raw) };
-                            // Возврат пишется даже если проба вернула `None`: запись
-                            // могла лечь в регистр и не прочитаться обратно, а
-                            // заводское значение в регистре нужно в любом случае.
-                            // SAFETY: пассивный уровень; `device` жив.
+                            // The restore is written even if the probe returned
+                            // `None`: the write may have landed in the register and
+                            // not read back, and the factory value must be in the
+                            // register in any case.
+                            // SAFETY: passive level; `device` is alive.
                             let restored =
                                 unsafe { crate::spb::write_fcc_raw(device, st.fcc_boot_raw) };
-                            // Обратное чтение отдаётся в журнал как есть, а
-                            // недоступное — `0xFFFFFFFF`, как и у остальных марок
-                            // SMB5: значения этого байта такой величины не достигают.
+                            // The read-back is given to the journal as it is, and an
+                            // unavailable one as `0xFFFFFFFF`, as for the other SMB5
+                            // marks: values of this byte do not reach such a
+                            // magnitude.
                             let wrote_marks = wrote.map_or(u32::MAX, u32::from);
                             let restored_marks = restored.map_or(u32::MAX, u32::from);
-                            // `ChgrProbeErr` — сорвалась любая из двух записей
-                            // (открытие сессии, grant, сама запись или обратное
-                            // чтение); ноль означает, что обе прошли целиком.
+                            // `ChgrProbeErr` - either of the two writes broke
+                            // (session open, grant, the write itself or the
+                            // read-back); a zero means both went through whole.
                             let probe_err = u32::from(wrote.is_none() || restored.is_none());
-                            // `ChgrProbeOk`: `1` — обратное чтение вернуло ровно
-                            // запрошенное (20), `0` — чип оставил своё или запись
-                            // не прошла вовсе.
+                            // `ChgrProbeOk`: `1` - the read-back returned exactly
+                            // what was asked (20), `0` - the chip kept its own value
+                            // or the write did not go through at all.
                             let probe_ok = u32::from(wrote == Some(probe_raw));
                             mark_device_value(device, "ChgrProbeWrote", wrote_marks);
                             mark_device_value(device, "ChgrProbeRestored", restored_marks);
                             mark_device_value(device, "ChgrProbeErr", probe_err);
                             mark_device_value(device, "ChgrProbeOk", probe_ok);
-                            // Ни `fcc_boot_raw`, ни `fcc_raised` проба не трогает:
-                            // заводское остаётся тем, что прочитано при захвате, и
-                            // политика вернёт его как обычно. Сорванный возврат
-                            // оставляет регистр на 20 — ниже заводского, то есть
-                            // безопасно, и первая же удачная запись политики вернёт
-                            // его к 30.
+                            // The probe touches neither `fcc_boot_raw` nor
+                            // `fcc_raised`: the factory value stays what was read at
+                            // capture time, and the policy will return it as usual. A
+                            // broken restore leaves the register at 20 - below the
+                            // factory value, that is safe, and the first successful
+                            // policy write returns it to 30.
                             st.fcc_probe_done = true;
                         }
                     }
@@ -2789,58 +2857,62 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
                     ] {
                         mark_device_value(device, name, 0xFFFF_FFFF);
                     }
-                    // `VbatAdcMv` сюда не входит намеренно: он не из сорванного
-                    // чтения SPMI, а из ADC насоса, который живёт на своём такте
-                    // (`sample.vbat_uv`, та же величина, что и `BattVbat` выше).
-                    // Отправить его в сентинел значило бы соврать про ADC, а
-                    // ноль выглядел бы как настоящее измерение. Сентинел у
-                    // `FgVbattMv` недостижим и по величине: 65535 разрядов по
-                    // 122,07 мкВ — это 8 001 мВ, потолок банки, а не 4,29·10⁹.
+                    // `VbatAdcMv` is deliberately not included here: it does not
+                    // come from a broken SPMI read but from the pump ADC, which
+                    // lives on its own tick (`sample.vbat_uv`, the same quantity as
+                    // `BattVbat` above). Sending it to the sentinel would lie about
+                    // the ADC, and a zero would look like a real measurement. The
+                    // sentinel is unreachable for `FgVbattMv` by magnitude too:
+                    // 65535 bits at 122,07 µV is 8 001 mV, the cell ceiling, not
+                    // 4,29·10⁹.
                     mark_device_value(device, "VbatAdcMv", sample.vbat_uv / 1000);
                     mark_device_value(device, "ChgrErr", 1);
                 }
             }
 
-            // Предел бака (buck) SMB5 — вторая половина переноса, и заводские
-            // 1,5 А (`ChgrFccRaw = 30`) душат то, что платформа умеет: живой
-            // замер 19.09 дал 2,9 А в банку при этом пределе. Но подъём этого
-            // предела — не улучшение по умолчанию, а гипотеза, которую тот же
-            // замер опрокинул: сборка `.655` с подъёмом до 2,5 А дала вдвое
-            // меньший темп заряда банки (0,249 %/мин против 0,409 %/мин на
-            // `.652`) и втрое реже удержанный 2:1 (39 % против 85 %), потому
-            // что разрешённые баку амперы вычерпывают восемнадцать ватт
-            // адаптера и роняют его уровень QC3 (`FAULT1 = 0x21`, `SuMode = 1`,
-            // шина 4,5 В); механизм разобран в [`FCC_POLICY_VALUE_NAME`].
-            // Поэтому пишет политика только тогда, когда её включили параметром
-            // `FccRaw`: без параметра и при нуле регистр `0x1061` не трогает
-            // никто, и это умолчание воспроизводит `.652` — там подъёма не было.
-            // Захват `fcc_boot_raw` выше от политики не зависит: он нужен и как
-            // диагностика, а по паре `FccCfgRaw`/`ChgrFccRaw` видна ловушка с
-            // поднятым прошлой загрузкой «заводским» значением.
+            // The SMB5 buck limit is the other half of the transfer, and the
+            // factory 1,5 A (`ChgrFccRaw = 30`) choke what the platform is capable
+            // of: the live measurement on 19.09 gave 2,9 A into the cell at this
+            // limit. But raising this limit is not an improvement by default, it is
+            // a hypothesis that the same measurement overturned: build `.655` with
+            // the raise to 2,5 A gave half the cell charge rate (0,249 %/min
+            // against 0,409 %/min on `.652`) and three times less often held 2:1
+            // (39 % against 85 %), because the amperes allowed to the buck drain
+            // the adapter's eighteen watts and drop its QC3 level (`FAULT1 = 0x21`,
+            // `SuMode = 1`, bus 4,5 V); the mechanism is analysed in
+            // [`FCC_POLICY_VALUE_NAME`].
+            // Therefore the policy writes only when it was enabled by the `FccRaw`
+            // parameter: without the parameter and at zero nobody touches register
+            // `0x1061`, and this default reproduces `.652` - there was no raise
+            // there. The `fcc_boot_raw` capture above does not depend on the
+            // policy: it is needed as diagnostics too, and the pair
+            // `FccCfgRaw`/`ChgrFccRaw` reveals the pitfall with a "factory" value
+            // raised by the previous boot.
             //
-            // Подъём идёт только на живом 2:1 и ниже ворот
-            // [`RE_ELEVATE_MAX_VBAT_UV`]: поднятый на пяти вольтах или на полке
-            // предел висел бы, когда насос уже не переносит, и мешал бы
-            // следующему решению платформы. Возврат — через
-            // [`FCC_RESTORE_GRACE_MS`] после потери переноса, и только если
-            // исходное значение захвачено. Критичный отказ чипа останавливает
-            // обе записи: поднимать ток в банку, когда чип сообщает о перегреве
-            // или перенапряжении, нельзя.
+            // The raise only happens on a live 2:1 and below the gate
+            // [`RE_ELEVATE_MAX_VBAT_UV`]: a limit raised at five volts or at the
+            // plateau would hang on when the pump no longer transfers, and would
+            // hinder the next platform decision. The return goes through
+            // [`FCC_RESTORE_GRACE_MS`] after the loss of transfer, and only if the
+            // original value was captured. A critical chip failure stops both
+            // writes: raising the current into the cell while the chip reports
+            // overheating or overvoltage is not allowed.
             if !status.has_critical_fault() {
                 if pump_alive {
-                    // Насос снова взялся за ток — запланированный возврат снимаем.
+                    // The pump has picked up the current again - cancel the
+                    // scheduled return.
                     st.fcc_restore_at_ms = 0;
                     if st.fcc_cfg_raw != 0
                         && !st.fcc_raised
                         && st.fcc_boot_raw != 0
                         && sample.vbat_uv < RE_ELEVATE_MAX_VBAT_UV
                     {
-                        // `FccRaw` — сырое значение поля, а не микроамперы: в
-                        // микроамперы его переводит только эта строка, а потолок
-                        // [`FCC_WRITE_MAX_UA`] применяет `raw_for`, так что
-                        // обойти потолок другой дорогой нельзя.
+                        // `FccRaw` is the raw field value, not microamps: only this
+                        // line converts it to microamps, and the ceiling
+                        // [`FCC_WRITE_MAX_UA`] is applied by `raw_for`, so the
+                        // ceiling cannot be bypassed another way.
                         let want = raw_for(st.fcc_cfg_raw.saturating_mul(FCC_STEP_UA));
-                        // SAFETY: пассивный уровень; `device` жив.
+                        // SAFETY: passive level; `device` is alive.
                         if unsafe { write_fcc_and_publish(device, want) } {
                             st.fcc_raised = true;
                         }
@@ -2850,13 +2922,13 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
                         st.fcc_restore_at_ms =
                             sample.ts_ms.saturating_add(FCC_RESTORE_GRACE_MS);
                     } else if sample.ts_ms >= st.fcc_restore_at_ms {
-                        // Возврат идёт через то же кодирование, что и подъём:
-                        // исходный байт переводится в микроамперы и обратно,
-                        // поэтому потолок [`FCC_WRITE_MAX_UA`] действует и
-                        // здесь (для 30 это тождество — живой замер дал 1,5 А).
+                        // The return goes through the same encoding as the raise:
+                        // the original byte is converted to microamps and back, so
+                        // the [`FCC_WRITE_MAX_UA`] ceiling applies here too (for 30
+                        // this is an identity - the live measurement gave 1,5 A).
                         let want =
                             raw_for(u32::from(st.fcc_boot_raw).saturating_mul(FCC_STEP_UA));
-                        // SAFETY: пассивный уровень; `device` жив.
+                        // SAFETY: passive level; `device` is alive.
                         if unsafe { write_fcc_and_publish(device, want) } {
                             st.fcc_raised = false;
                             st.fcc_restore_at_ms = 0;
@@ -2867,31 +2939,35 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
         }
     }
 
-    // Эпизод перегрева закончился — счётчик отказов 1:1 обнуляется: иначе
-    // второй эпизод ≥ 48 °C остановил бы заряд сразу, без ступени снижения тока.
+    // The overheat episode is over - the 1:1 failure counter is zeroed: otherwise
+    // a second episode ≥ 48 °C would stop the charge at once, without the
+    // current step-down stage.
     if bypass_strikes_expired(&sample, &st.limits) {
         st.bypass_denied_strikes = 0;
     }
 
-    // Защита по температуре и току: решение принимается по последнему отсчёту.
-    // Действие разрешается с учётом Vin: 1:1 допустим только в окне обхода.
-    // Третий аргумент — уставка, которая **фактически стоит в чипе**: её читает
-    // `applied_iin_ua` (тапер у верха заряда пишет 1,2 А мимо профиля, и по
-    // профилю защита «снижала» бы ток, поднимая его). Регистр не прочитан —
-    // уставка неизвестна, решений о токе в этом такте не принимаем.
-    // Четвёртый — намеренная уставка тапера (`Pump::taper_setpoint_ua`): возврат
-    // к профилю обязан остановиться на ней и никогда не опускать лимит. Без неё
-    // в окне пересечения полос тапера и возврата защита каждые 250 мс отменяла бы
-    // намеренное снижение тока до 1,2 А.
+    // Temperature and current protection: the decision is made from the latest
+    // sample. The action is allowed taking Vin into account: 1:1 is only valid
+    // inside the bypass window.
+    // The third argument is the setpoint that **is actually in the chip**: it is
+    // read by `applied_iin_ua` (at the top of the charge the taper writes 1,2 A
+    // past the profile, and by the profile protection would "reduce" the current
+    // while raising it). The register was not read - the setpoint is unknown, we
+    // take no current decisions on this tick.
+    // The fourth is the deliberate taper setpoint (`Pump::taper_setpoint_ua`): the
+    // return to the profile must stop at it and never lower the limit. Without it,
+    // in the window where the taper and return bands overlap, protection would
+    // cancel the deliberate current reduction to 1,2 A every 250 ms.
     let applied_iin_ua = pump.applied_iin_ua();
     let ov_latched = status.fault1_sts & ln8000::regs::FAULT1_VBAT_OV != 0;
     let deliberate_iin_ua = pump.taper_setpoint_ua(sample.vbat_uv, sample.vbus_uv, ov_latched);
     let action = evaluate(&sample, &st.limits, applied_iin_ua, deliberate_iin_ua);
     if !device.is_null() {
-        // Кто снял режим: без этих марок падение 2:1 → standby неотличимо от
-        // отказа чипа. `GuardAct`: 0 нет, 1 снижение тока, 2 возврат, 3 переход
-        // в 1:1, 4 стоп. `DieTempDc` — температура кристалла, по которой принято
-        // решение (`0xFFFFFFFF` = канал недостоверен).
+        // Who removed the mode: without these marks the drop from 2:1 to standby
+        // is indistinguishable from a chip failure. `GuardAct`: 0 none, 1 reduce
+        // current, 2 restore, 3 switch to 1:1, 4 stop. `DieTempDc` - the die
+        // temperature the decision was made on (`0xFFFFFFFF` = channel
+        // unreliable).
         mark_device_value(
             device,
             "GuardAct",
@@ -2901,8 +2977,8 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
                 GuardAction::RestoreCurrent { .. } => 2,
                 GuardAction::FallbackToBypass { .. } => 3,
                 GuardAction::Stop { .. } => 4,
-                // `GuardAction` помечен `#[non_exhaustive]`: новая ступень
-                // защиты должна быть видна в марке, а не молча давать ноль.
+                // `GuardAction` is marked `#[non_exhaustive]`: a new protection
+                // stage must be visible in the mark rather than silently give zero.
                 _ => 5,
             },
         );
@@ -2927,7 +3003,7 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
         );
         st.actions = st.actions.saturating_add(1);
         println!(
-            "ln8000-kmdf: защита {} ({}) при {temp} dC и {iin} uA",
+            "ln8000-kmdf: protection {} ({}) at {temp} dC and {iin} uA",
             action.label(),
             match action {
                 GuardAction::ReduceCurrent { to_ua, .. }
@@ -2937,10 +3013,11 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
         );
     }
 
-    // Автозапуск / смена режима по Vin (cp_qc30): 2:1 при >=8 V, bypass при ~5 V.
-    // Если уже в bypass и Vin поднялся QC — обязательно апгрейд до 2:1 (не ждать
-    // 30 с). Soft-reset при elevated Vin не делаем: он роняет QC latch.
-    // Watchdog latch (FAULT1 bit7) forces standby — clear and retry without soft_reset.
+    // Autostart / mode change by Vin (cp_qc30): 2:1 at >=8 V, bypass at ~5 V.
+    // If already in bypass and Vin has risen via QC - an upgrade to 2:1 is
+    // mandatory (do not wait 30 s). We do not do a soft-reset at elevated Vin: it
+    // drops the QC latch.
+    // Watchdog latch (FAULT1 bit7) forces standby - clear and retry without soft_reset.
     // Near-float VBAT_OV (bit6) likewise blocks mode until soft-cleared by set_charging.
     if status.fault1_sts
         & (ln8000::regs::FAULT1_WATCHDOG | ln8000::regs::FAULT1_VBAT_OV)
@@ -2949,24 +3026,26 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
         let _ = pump.clear_latched_faults();
         if status.fault1_sts & ln8000::regs::FAULT1_WATCHDOG != 0 {
             let _ = pump.service_watchdog();
-            println!("ln8000-kmdf: сброс защёлки watchdog");
+            println!("ln8000-kmdf: watchdog latch cleared");
         }
         if status.fault1_sts & ln8000::regs::FAULT1_VBAT_OV != 0 {
-            println!("ln8000-kmdf: FAULT1_VBAT_OV latched — retry via set_charging");
+            println!("ln8000-kmdf: FAULT1_VBAT_OV latched - retry via set_charging");
         }
     }
     let vbus_uv = u32::try_from(vbus.max(0)).unwrap_or(0);
     let vbat_uv = sample.vbat_uv;
-    // Выбор режима — по Vin И Vbat (cp_qc30: 2:1 только при Vin >= 2*Vbat + 250 мВ).
-    // Повышенный Vin без запаса даёт None: обход 1:1 там запрещён, а standby-цикл
-    // не крутим — состояние видно в `EngageState=4`.
-    // Работающий перенос не понижаем по просадке: под нагрузкой шина садится
-    // на 100–250 мВ, и живой замер даёт 8,176 В при банке 3,985 В, где
-    // `charge_mode` требует `2*Vbat + 250 мВ` = 8,22 В — то есть обход. Понижение
-    // по мгновенному отсчёту рвало работающий 2:1 каждые ~5 с (живой замер
-    // 19.09 11:28 на MDY-11-EP: mode 1→3→1 при 0,42 А, `ChargeAttemptN` +1 на
-    // каждый разрыв). Липкое решение держится на абсолютном поле 2:1 (8,0 В):
-    // просадка — это следствие нагрузки, а не потеря способности переносить.
+    // The mode is chosen from Vin AND Vbat (cp_qc30: 2:1 only at
+    // Vin >= 2*Vbat + 250 mV). An elevated Vin without headroom gives None: the
+    // 1:1 bypass is forbidden there, and we do not spin a standby loop - the
+    // state is visible in `EngageState=4`.
+    // We do not downgrade a working transfer on sag: under load the bus drops by
+    // 100–250 mV, and the live measurement gives 8,176 V with a cell at 3,985 V,
+    // where `charge_mode` requires `2*Vbat + 250 mV` = 8,22 V - that is, bypass.
+    // Downgrading on an instantaneous sample tore the working 2:1 every ~5 s
+    // (live measurement 19.09 11:28 on MDY-11-EP: mode 1→3→1 at 0,42 A,
+    // `ChargeAttemptN` +1 per break). The sticky decision rests on the absolute
+    // 2:1 floor (8,0 V): sag is a consequence of load, not a loss of the ability
+    // to transfer.
     let desired = if pump_alive && vbus_uv >= u32::try_from(SWITCHING_MIN_VIN_UV).unwrap_or(0) {
         Some(OpMode::Switching)
     } else {
@@ -2985,44 +3064,45 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
             engage_state(sample.input_present, vbus, vbat_uv, status.op_mode),
         );
     }
-    // Полоса переноса 2:1 едет за банкой: пока банка набирает заряд, её верх
-    // уходит вверх, и шина, выставленная при согласовании, остаётся НИЖЕ полосы
-    // — либо, наоборот, уходит выше неё, если согласование целилось в
-    // фиксированные 9,5 В. И то и другое кончается одинаково: режим 3
-    // сохраняется (`SYS_STS=0x04`), а перенос падает до 39 мА аддитивного пола.
+    // The 2:1 transfer band follows the cell: while the cell takes on charge, its
+    // top edge moves up, and the bus set during negotiation stays BELOW the band
+    // - or, conversely, goes above it if negotiation aimed at a fixed 9,5 V. Both
+    // end the same way: mode 3 is retained (`SYS_STS=0x04`) while the transfer
+    // drops to the 39 mA additive floor.
     //
-    // Вход считается повышенным уже с `SWITCHING_MIN_VIN_UV`: обход 1:1 там
-    // запрещён, поэтому «повышен, но не в 2:1» — состояние, которое надо
-    // исправлять, а не оставлять. Прежняя форма требовала
-    // `desired == Switching`, а шина НИЖЕ пола полосы даёт `desired = None`
-    // (`charge_mode` требует `2*Vbat + 250 мВ`) — и поднимать её было некому:
-    // живой замер 18.09 22:38, Vin 8,88 В при полосе [9,00; 9,20] В, mode 1,
-    // 39 мА, счётчик попыток стоял, потому что `(None, standby)` считается
-    // согласованным состоянием.
+    // The input counts as elevated from `SWITCHING_MIN_VIN_UV` already: the 1:1
+    // bypass is forbidden there, so "elevated but not in 2:1" is a state to fix
+    // rather than to leave. The previous form required `desired == Switching`,
+    // while a bus BELOW the band floor gives `desired = None` (`charge_mode`
+    // requires `2*Vbat + 250 mV`) - and nobody raised it: live measurement
+    // 18.09 22:38, Vin 8,88 V with the band at [9,00; 9,20] V, mode 1, 39 mA, the
+    // attempt counter stood still because `(None, standby)` counts as a consistent
+    // state.
     let elevated = vbus_uv >= u32::try_from(SWITCHING_MIN_VIN_UV).unwrap_or(0);
-    // Шина выше 5 В — уже не «пятивольтовый» вход: обход 1:1 там греет разницу
-    // напряжений на чипе, а полоса переноса 2:1 всего на шаг QC3 выше. Прежнее
-    // условие (`elevated || dead_band`) требовало `desired = None`, но при 6–8 В
-    // `charge_mode` возвращает обход, и в полосу переноса шину не вёл никто:
-    // до ворот 2:1 не хватало одного шага.
+    // A bus above 5 V is no longer a "five-volt" input: the 1:1 bypass there heats
+    // the voltage difference across the chip, while the 2:1 transfer band is only
+    // one QC3 step higher. The previous condition (`elevated || dead_band`)
+    // required `desired = None`, but at 6–8 V `charge_mode` returns bypass, and
+    // nobody led the bus into the transfer band: one step was missing to the 2:1
+    // gate.
     //
-    // Живой замер 19.09 11:19 на MDY-11-EP: шина 7,888 В, `desired` = обход,
-    // 1:1 даёт 2,06 А при 6,75 В (банка 3,915 В — разница горит на чипе), и
-    // режим флапает 1↔2 каждые ~15 с: обход вне своего окна снимается, шина
-    // возвращается к 7,888 В, обход включается снова. 39 мА и `ChargeAttemptN`
-    // стояли — коррекция не запускалась ни разу.
+    // Live measurement 19.09 11:19 on MDY-11-EP: bus 7,888 V, `desired` = bypass,
+    // 1:1 gives 2,06 A at 6,75 V (cell 3,915 V - the difference burns on the
+    // chip), and the mode flaps 1↔2 every ~15 s: the bypass outside its window is
+    // removed, the bus returns to 7,888 V, the bypass turns on again. 39 mA and
+    // `ChargeAttemptN` stood still - the correction never ran.
     let above_five = vbus_uv >= u32::try_from(hvdcp::FIVE_V_STAY_MAX_UV).unwrap_or(0);
     let dead_band = desired.is_none() && above_five;
     let bypass_below_gate = matches!(desired, Some(OpMode::Bypass)) && above_five;
-    // Уход из обхода ради подъёма шины: в этом такте решение о режиме
-    // пересчитывать нельзя, оно посчитано по старому Vin (см. ниже).
+    // Leaving the bypass to raise the bus: on this tick the mode decision must not
+    // be recomputed, it was computed from the old Vin (see below).
     let mut left_bypass_for_walk = false;
     if vbat_uv > 0 && (elevated || dead_band || bypass_below_gate) {
-        // «Мёртвый» ток — это пол АЦП (39,1 мА), а не «мало»: у верха заряда
-        // банка берёт 0,1–0,5 А, и по мгновенному отсчёту такие такты
-        // выглядели мёртвыми. Поэтому требуется, чтобы и мгновенный отсчёт, и
-        // пик за окно `IIN_WINDOW_MS` лежали на полу — тогда за коррекцией
-        // действительно нет переноса.
+        // "Dead" current is the ADC floor (39,1 mA), not "little": at the top of
+        // the charge the cell draws 0,1–0,5 A, and by the instantaneous sample such
+        // ticks looked dead. So it is required that both the instantaneous sample
+        // and the peak over the `IIN_WINDOW_MS` window lie on the floor - then
+        // there really is no transfer behind the correction.
         let dead = status.op_mode == OpMode::Switching
             && sample.iin_ua <= hvdcp::IIN_DEAD_FLOOR_UA
             && st.max_iin_ua <= hvdcp::IIN_DEAD_FLOOR_UA;
@@ -3031,9 +3111,9 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
             let now = monotonic_ms();
             let target = hvdcp::target_vbus_uv(vbat_uv);
             let err = vbus_uv.abs_diff(target);
-            // Прогресс сбрасывает выдержку; застой (блок не держит QC3-шаг или
-            // это PD-адаптер, для которого импульсы — пустая трата SPMI)
-            // переводит петлю на редкий повтор.
+            // Progress resets the delay; a stall (the brick does not hold the QC3
+            // step, or this is a PD adapter for which the pulses are a waste of
+            // SPMI) switches the loop to a rare repeat.
             if err.saturating_add(WINDOW_PROGRESS_UV) < st.window_best_err_uv {
                 st.window_best_err_uv = err;
                 st.window_stall_n = 0;
@@ -3043,22 +3123,23 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
             } else {
                 WINDOW_STALL_MS
             };
-            // Первый такт в повышенном обходе не ждёт выдержки: 1:1 на 6–8 В
-            // греет разницу напряжений на чипе, и каждый лишний такт там — это
-            // 10 с работы впустую (см. `bypass_below_gate`). Дальше — обычный
-            // темп: `window_stall_n` растёт на каждом срабатывании, так что
-            // шторм импульсов невозможен, даже если вывести из обхода не удалось.
+            // The first tick in an elevated bypass does not wait for the cooldown:
+            // 1:1 at 6–8 V heats the voltage difference across the chip, and every
+            // extra tick there is 10 s of wasted work (see `bypass_below_gate`).
+            // After that it is the ordinary rate: `window_stall_n` grows on every
+            // trigger, so a pulse storm is impossible even if we failed to get out
+            // of the bypass.
             let urgent = matches!(desired, Some(OpMode::Bypass))
                 && status.op_mode == OpMode::Bypass
                 && st.window_stall_n == 0;
             if urgent || now.saturating_sub(st.last_window_nudge_ms) >= cooldown {
                 st.last_window_nudge_ms = now;
                 st.window_stall_n = st.window_stall_n.saturating_add(1);
-                // В 1:1 импульс INC поднимает вход прямо на банку: FET обхода
-                // замкнут, и шаг QC3 уходит не в шину, а в разницу напряжений
-                // на чипе. Поэтому сначала уводим чип в standby — тогда импульс
-                // меняет именно напряжение входа, а решение о режиме примет
-                // следующий такт по новому Vin.
+                // In 1:1 an INC pulse raises the input directly onto the cell: the
+                // bypass FET is closed, and the QC3 step goes not into the bus but
+                // into the voltage difference across the chip. So we first take the
+                // chip to standby - then the pulse changes the input voltage
+                // itself, and the next tick will decide the mode from the new Vin.
                 if status.op_mode == OpMode::Bypass {
                     let left = pump.standby().is_ok();
                     left_bypass_for_walk = left;
@@ -3066,8 +3147,8 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
                         mark_device_value(device, "WalkStandby", u32::from(left));
                     }
                 }
-                // SAFETY: PASSIVE_LEVEL; сессия открыта, доступ сериализован
-                // таймером (см. комментарий у `state()`).
+                // SAFETY: PASSIVE_LEVEL; the session is open, access is serialized
+                // by the timer (see the comment at `state()`).
                 let sent = unsafe {
                     hvdcp::nudge_vin_into_window(
                         device,
@@ -3083,15 +3164,15 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
                     mark_device_value(device, "WindowDead", u32::from(dead));
                 }
                 if sent > 0 {
-                    // Шина только что сдвинулась — режим перерешаем сразу, не
-                    // выжидая `CHARGE_RETRY_MS`: одиночный шаг QC3 меньше
-                    // `CHARGE_RETRY_DELTA_UV`, поэтому «изменение входа» его не
-                    // разбудит.
+                    // The bus has just shifted - we re-decide the mode at once,
+                    // without waiting for `CHARGE_RETRY_MS`: a single QC3 step is
+                    // below `CHARGE_RETRY_DELTA_UV`, so "input changed" would not
+                    // wake it.
                     st.last_charge_attempt_ms = 0;
                 }
             }
         } else if st.window_best_err_uv != u32::MAX || st.window_stall_n != 0 {
-            // Вернулись в полосу — история застоя сбрасывается.
+            // Back inside the band - the stall history is reset.
             st.window_best_err_uv = u32::MAX;
             st.window_stall_n = 0;
         }
@@ -3099,32 +3180,33 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
         st.window_best_err_uv = u32::MAX;
         st.window_stall_n = 0;
     }
-    // Пятивольтовый режим без переноса — состояние, в котором согласованием
-    // владеет повторный разгон HVDCP (ниже, `want_reelevate`), а не быстрый
-    // повтор решения о режиме. Оба предиката подняты сюда, к двум своим
-    // потребителям, одним местом: ниже по ним решается и то, молчит ли быстрый
-    // повтор (`changed`), и то, входит ли в разгон сам разгон.
+    // Five-volt mode without a transfer is the state in which negotiation is owned
+    // by the HVDCP re-elevation (below, `want_reelevate`), not by the fast repeat of
+    // the mode decision. Both predicates are lifted here, to their two consumers,
+    // in one place: further down they decide both whether the fast repeat stays
+    // silent (`changed`) and whether the elevation itself is included.
     let five_v_regime =
         vbus_uv >= u32::try_from(ln8000::encoding::CHARGE_MIN_VIN_UV).unwrap_or(0)
             && vbus_uv < u32::try_from(hvdcp::FIVE_V_STAY_MAX_UV).unwrap_or(0);
-    // Один отсчёт не доказывает, что переноса нет: пол АЦП — 39,1 мА, а у
-    // верха заряда банка берёт 0,1–0,5 А, и мгновенный замер ложится на пол
-    // между импульсами тока. Вторая опора, как и у `dead` выше, — пик за окно
-    // `IIN_WINDOW_MS`: перенос живой, если выше пола хотя бы одна величина.
+    // A single sample does not prove there is no transfer: the ADC floor is
+    // 39,1 mA, while at the top of the charge the cell draws 0,1–0,5 A, and the
+    // instantaneous measurement falls to the floor between current pulses. The
+    // second support, as for `dead` above, is the peak over the `IIN_WINDOW_MS`
+    // window: the transfer is live if at least one quantity is above the floor.
     let bypass_carrying = status.op_mode == OpMode::Bypass
         && (sample.iin_ua > hvdcp::IIN_DEAD_FLOOR_UA
             || st.max_iin_ua > hvdcp::IIN_DEAD_FLOOR_UA);
-    // Условия, при которых повторный разгон HVDCP владеет согласованием: вход
-    // есть, шина в пятивольтовом режиме, обход не несёт ток, насос не работает,
-    // банка ниже ворот разгона. Пока они держатся, быстрый повтор «по изменению
-    // входа» молчит (см. `changed` ниже): в этом состоянии изменение входа —
-    // это зуб пилы, которую создаёт наш же POR, и повтор шёл бы мимо выдержки
-    // разгона. Живой замер 19.09 (вход просел к 4,5–5 В): `ChargeAttemptN`
-    // 5→86 за 14,5 мин, то есть полное согласование (APSD ~2 с + `FORCE_9V`
-    // до 5 с — около 7 с под мьютексом состояния на попытку) каждые ~10 с.
-    // Выдержка разгона (60 с с удвоением до 300 с) и есть правильный темп для
-    // этого состояния: она ставится именно как «повторить то, что делает
-    // переподключение», а не «долбить POR каждые пять секунд».
+    // The conditions under which the HVDCP re-elevation owns negotiation: input
+    // present, bus in five-volt mode, bypass not carrying current, pump not
+    // working, cell below the elevation gate. While they hold, the fast repeat "on
+    // input change" stays silent (see `changed` below): in this state an input
+    // change is a sawtooth tooth created by our own POR, and the repeat would run
+    // past the elevation delay. Live measurement 19.09 (input sagged to 4,5–5 V):
+    // `ChargeAttemptN` 5→86 in 14,5 min, that is a full negotiation (APSD ~2 s +
+    // `FORCE_9V` up to 5 s - about 7 s under the state mutex per attempt) every
+    // ~10 s. The elevation delay (60 s doubling to 300 s) is the right rate for
+    // this state: it is set precisely as "repeat what re-plugging does" rather
+    // than "hammer a POR every five seconds".
     let reelevate_owns_negotiation = sample.input_present
         && vbat_read.is_ok()
         && iin_read.is_ok()
@@ -3132,33 +3214,35 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
         && !bypass_carrying
         && !pump_alive
         && vbat_uv < RE_ELEVATE_MAX_VBAT_UV;
-    // Обход снят ради подъёма шины: `desired` посчитан по старому Vin, поэтому
-    // в этом такте режим не перерешаем — следующий такт (250 мс) прочтёт шину
-    // заново и выберет 2:1, если импульс довёл её до полосы переноса.
+    // The bypass was removed to raise the bus: `desired` was computed from the old
+    // Vin, so we do not re-decide the mode on this tick - the next tick (250 ms)
+    // will read the bus again and pick 2:1 if the pulse brought it into the
+    // transfer band.
     if mode_ok && !left_bypass_for_walk {
         st.last_charge_attempt_ms = monotonic_ms();
         st.last_attempt_vbus_uv = vbus_uv;
     } else if desired.is_some() && !action.is_change() && !left_bypass_for_walk {
         let now = monotonic_ms();
         let cooled = now.saturating_sub(st.last_charge_attempt_ms) >= CHARGE_RETRY_MS;
-        // Изменение входа ускоряет повтор, но не отменяет пол: иначе пила входа,
-        // которую сам же POR и создаёт, гонит попытки каждые ~0,6 с
-        // (см. [`CHARGE_RETRY_FAST_MS`]).
+        // An input change speeds up the repeat but does not cancel the floor:
+        // otherwise the input sawtooth, which the POR itself creates, drives
+        // attempts every ~0,6 s (see [`CHARGE_RETRY_FAST_MS`]).
         //
-        // В пятивольтовом режиме без переноса быстрый повтор молчит
-        // (`reelevate_owns_negotiation` выше): там согласованием владеет
-        // повторный разгон со своей выдержкой, а смена входа — это зуб пилы от
-        // нашего же POR, а не новый уровень QC. За границей этого состояния
-        // (шина ушла выше 6 В, обход повёз ток, банка у верха) условие ложно, и
-        // повтор работает как раньше. Кулдаун `cooled` и мгновенный `upgrade`
-        // не тронуты: 30-секундный повтор остаётся страховкой отказа решения о
-        // режиме, а `upgrade` возможен только при повышенном Vin, где условие
-        // разгона ложно.
+        // In five-volt mode without a transfer the fast repeat stays silent
+        // (`reelevate_owns_negotiation` above): there negotiation is owned by the
+        // re-elevation with its own delay, and an input change is a sawtooth tooth
+        // from our own POR rather than a new QC level. Outside this state (the bus
+        // went above 6 V, the bypass carried current, the cell is at the top) the
+        // condition is false, and the repeat works as before. The `cooled` cooldown
+        // and the instant `upgrade` are untouched: the 30-second repeat remains the
+        // safety net for a failure of the mode decision, and `upgrade` is only
+        // possible at elevated Vin, where the elevation condition is false.
         let changed = st.last_attempt_vbus_uv.abs_diff(vbus_uv) >= CHARGE_RETRY_DELTA_UV
             && now.saturating_sub(st.last_charge_attempt_ms) >= CHARGE_RETRY_FAST_MS
             && !reelevate_owns_negotiation;
-        // Апгрейд bypass → 2:1 делаем сразу (QC поднял Vin). standby/unknown —
-        // это отказ, и повтор идёт не чаще кулдауна, а не каждый такт.
+        // The bypass → 2:1 upgrade is done at once (QC raised Vin). standby/unknown
+        // is a failure, and the repeat happens no more often than the cooldown
+        // rather than every tick.
         let upgrade = matches!(
             (desired, status.op_mode),
             (Some(OpMode::Switching), OpMode::Bypass)
@@ -3166,11 +3250,11 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
         if cooled || changed || upgrade {
             st.last_charge_attempt_ms = now;
             st.last_attempt_vbus_uv = vbus_uv;
-            // SAFETY: сессия открыта, доступ сериализован таймером.
-            // Soft-reset + configure уже сами пробуют заряд в том же такте.
+            // SAFETY: the session is open, access is serialized by the timer.
+            // Soft-reset + configure already try to charge on the same tick.
             let recovery = recover_ln_shutdown(pump);
-            // Второй POR в этом же такте не делаем: диагностика должна совпадать
-            // с фактическими действиями (см. ветку отказов ниже).
+            // We do not do a second POR on this same tick: the diagnostics must
+            // match the actual actions (see the failure branch below).
             let recovered_this_tick = matches!(recovery, ShutdownRecovery::Recovered(_));
             let result = match recovery {
                 ShutdownRecovery::Recovered(outcome) => {
@@ -3189,7 +3273,7 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
                     st.auto_starts = st.auto_starts.saturating_add(1);
                     st.failed_attempts = 0;
                     st.last_error = 0;
-                    println!("ln8000-kmdf: заряд включён автоматически, режим {}", mode.code());
+                    println!("ln8000-kmdf: charge enabled automatically, mode {}", mode.code());
                 }
                 Err(err) => {
                     st.last_error = pump_error_code(err);
@@ -3198,7 +3282,7 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
                         st.failed_attempts = 0;
                         if recovered_this_tick {
                             println!(
-                                "ln8000-kmdf: повтор после восстановления не удался — второй soft_reset в этом такте пропущен"
+                                "ln8000-kmdf: retry after recovery failed - second soft_reset skipped on this tick"
                             );
                         } else {
                             match recover_ln_shutdown(pump) {
@@ -3216,11 +3300,11 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
                                     }
                                     match outcome {
                                         Ok(mode) => println!(
-                                            "ln8000-kmdf: soft_reset после SHUTDOWN — заряд перезапущен, режим {}",
+                                            "ln8000-kmdf: soft_reset after SHUTDOWN - charge restarted, mode {}",
                                             mode.code()
                                         ),
                                         Err(err) => println!(
-                                            "ln8000-kmdf: soft_reset после SHUTDOWN — повтор не удался: {err}"
+                                            "ln8000-kmdf: soft_reset after SHUTDOWN - retry failed: {err}"
                                         ),
                                     }
                                 }
@@ -3229,8 +3313,8 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
                                     por_delay();
                                     let _ = pump.configure();
                                     println!("ln8000-kmdf: soft_reset + reconfigure (5 V path)");
-                                    // Правка 4: заряд включаем в том же такте, а не
-                                    // через CHARGE_RETRY_MS.
+                                    // Fix 4: we enable the charge on the same tick,
+                                    // not after CHARGE_RETRY_MS.
                                     let retry = pump.set_charging(true, &mut por_delay);
                                     st.charge_attempts = st.charge_attempts.saturating_add(1);
                                     st.last_enable_ms = monotonic_ms();
@@ -3244,18 +3328,18 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
                                     }
                                     match retry {
                                         Ok(mode) => println!(
-                                            "ln8000-kmdf: 5 V recovery — заряд перезапущен, режим {}",
+                                            "ln8000-kmdf: 5 V recovery - charge restarted, mode {}",
                                             mode.code()
                                         ),
                                         Err(err) => println!(
-                                            "ln8000-kmdf: 5 V recovery — повтор не удался: {err}"
+                                            "ln8000-kmdf: 5 V recovery - retry failed: {err}"
                                         ),
                                     }
                                 }
                                 ShutdownRecovery::NotInShutdown => {
                                     let _ = pump.clear_latched_faults();
                                     println!(
-                                        "ln8000-kmdf: сброс защёлки (elevated Vin, без soft_reset)"
+                                        "ln8000-kmdf: latch cleared (elevated Vin, no soft_reset)"
                                     );
                                 }
                             }
@@ -3271,10 +3355,11 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
         let _ = pump.set_charging(false, &mut por_delay);
     }
 
-    // Сторож чипа: если включён в профиле, его надо обслуживать чаще периода,
-    // иначе чип сам прекратит заряд. Когда сторож выключен, вызов ничего не делает.
+    // Chip watchdog: if it is enabled in the profile, it must be serviced more
+    // often than the period, otherwise the chip stops charging by itself. When the
+    // watchdog is off, the call does nothing.
     if let Err(err) = pump.service_watchdog() {
-        println!("ln8000-kmdf: не удалось обслужить сторожевой таймер: {err}");
+        println!("ln8000-kmdf: failed to service the watchdog: {err}");
     }
 
     // Cold-plug / re-plug: decide while pump is borrowed, act after drop.
@@ -3292,13 +3377,13 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
         now,
         st.hvdcp_retry_next_ms,
     );
-    // Пятивольтовый режим без переноса. Согласование видит вход только по
-    // фронту, поэтому потерянный QC-уровень (блок откатился на 5 В, защёлка
-    // VFAULT закрыла обход 1:1) не возвращается сам — шина стоит на 5 В до
-    // переподключения. Здесь решение принимается, а сам разгон идёт после
-    // освобождения `pump` (он переоткрывает шину). Условие входа — то же
-    // `reelevate_owns_negotiation`, которым выше заглушён быстрый повтор: у
-    // состояния один хозяин, и его выдержка — его темп.
+    // Five-volt mode without a transfer. Negotiation sees the input only on an
+    // edge, so a lost QC level (the brick fell back to 5 V, the VFAULT latch
+    // closed the 1:1 bypass) does not come back by itself - the bus sits at 5 V
+    // until the cable is re-plugged. The decision is made here, and the elevation
+    // itself happens after `pump` is released (it reopens the bus). The entry
+    // condition is the same `reelevate_owns_negotiation` that silenced the fast
+    // repeat above: the state has one owner, and its delay is its rate.
     let mut want_reelevate = false;
     if reelevate_owns_negotiation {
         if st.re_elevate_next_ms == 0 {
@@ -3316,7 +3401,7 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
             want_reelevate = true;
         }
     } else if st.re_elevate_next_ms != 0 || st.re_elevate_attempts != 0 {
-        // Шина поднялась или 5 В реально заряжает — эпизод закрыт.
+        // The bus has risen or 5 V really charges - the episode is closed.
         st.re_elevate_next_ms = 0;
         st.re_elevate_attempts = 0;
         st.re_elevate_backoff_ms = 0;
@@ -3328,19 +3413,19 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
     // SAFETY: DEVICE set in device_add; null after release_hardware.
     let device = unsafe { DEVICE };
     if device.is_null() {
-        // Released — timer already stopped; do not re-arm.
+        // Released - timer already stopped; do not re-arm.
         return;
     }
     if want_replug {
         mark_device_value(device, "HvdcpReplug", 1);
-        // Новый вход — старая защёлка `FORCE_9V` силы не имеет: блок мог быть
-        // заменён на QC3, для которого импульсы и есть способ подъёма, а
-        // `pulse_cmd_bit` под защёлкой их пропускает. Держать её через
-        // переподключение — значит запретить импульсный путь до перезапуска
-        // драйвера. Внутри одной сессии защёлку по-прежнему снимает только
-        // `safe_force_5v`: иначе первый же импульс уронил бы уровень QC2.
+        // A new input - the old `FORCE_9V` latch has no force: the brick may have
+        // been replaced with a QC3 one, for which pulses are the very way to
+        // elevate, and `pulse_cmd_bit` lets them through under the latch. Holding
+        // it across a re-plug means forbidding the pulse path until the driver is
+        // restarted. Within one session the latch is still cleared only by
+        // `safe_force_5v`: otherwise the first pulse would drop the QC2 level.
         unsafe { state() }.hvdcp.force9v_latched = false;
-        println!("ln8000-kmdf: HVDCP re-plug edge — renegotiate");
+        println!("ln8000-kmdf: HVDCP re-plug edge - renegotiate");
         let code = run_hvdcp_and_land(device);
         schedule_or_clear_superuser_retry(device, code);
         arm_hvdcp_input_edge(device);
@@ -3361,11 +3446,11 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
             arm_hvdcp_input_edge(device);
         }
     } else if want_reelevate {
-        // SAFETY: timer serialized with prepare/IOCTL; `pump` отпущен выше.
+        // SAFETY: the timer is serialized with prepare/IOCTL; `pump` was released above.
         let st = unsafe { state() };
         mark_device_value(device, "ReElevateN", st.re_elevate_attempts);
         println!(
-            "ln8000-kmdf: 5 V без переноса — повторный разгон HVDCP #{} (выдержка {} мс)",
+            "ln8000-kmdf: 5 V without transfer - HVDCP re-elevation #{} (delay {} ms)",
             st.re_elevate_attempts, st.re_elevate_backoff_ms
         );
         let code = run_hvdcp_and_land(device);
@@ -3376,12 +3461,13 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
     arm_telemetry_timer();
 }
 
-/// Применяет решение защиты к устройству.
+/// Applies a protection decision to the device.
 ///
-/// Уход в 1:1 разрешён только при `Vin` в окне обхода: `EN_1TO1` подаёт вход
-/// напрямую на батарею, поэтому на повышенном Vin (QC/PD 9–12 В) защита вместо
-/// обхода снижает ток, а при упорной температуре — останавливает заряд.
-/// `denied_strikes` — счётчик тактов, когда 1:1 был нужен и запрещён.
+/// The switch to 1:1 is only allowed with `Vin` inside the bypass window:
+/// `EN_1TO1` feeds the input directly to the battery, so at elevated Vin (QC/PD
+/// 9–12 V) protection reduces the current instead of bypassing, and at a stubborn
+/// temperature it stops the charge. `denied_strikes` is the counter of ticks when
+/// 1:1 was needed and forbidden.
 fn apply_guard(
     pump: &mut Pump<SpbBus>,
     action: GuardAction,
@@ -3397,16 +3483,16 @@ fn apply_guard(
         GuardAction::ReduceCurrent { to_ua, .. } => {
             *denied_strikes = 0;
             if let Err(err) = pump.set_iin_limit(to_ua) {
-                println!("ln8000-kmdf: не удалось снизить ток: {err}");
+                println!("ln8000-kmdf: failed to reduce the current: {err}");
             }
         }
         GuardAction::RestoreCurrent { to_ua, reason } => {
             *denied_strikes = 0;
             println!(
-                "ln8000-kmdf: {reason} — возвращаю профильный лимит тока до {to_ua} мкА"
+                "ln8000-kmdf: {reason} - returning the profile current limit to {to_ua} µA"
             );
             if let Err(err) = pump.set_iin_limit(to_ua) {
-                println!("ln8000-kmdf: не удалось вернуть лимит тока: {err}");
+                println!("ln8000-kmdf: failed to restore the current limit: {err}");
             }
         }
         GuardAction::FallbackToBypass { reason } => match resolve_bypass(
@@ -3418,48 +3504,48 @@ fn apply_guard(
             BypassResolution::Allowed => {
                 *denied_strikes = 0;
                 if let Err(err) = pump.enable_bypass() {
-                    println!("ln8000-kmdf: не удалось уйти в bypass: {err}");
+                    println!("ln8000-kmdf: failed to switch to bypass: {err}");
                 }
             }
             BypassResolution::ReduceCurrent { to_ua, reason } => {
                 *denied_strikes = denied_strikes.saturating_add(1);
                 println!(
-                    "ln8000-kmdf: {reason} при Vin {vin_uv} мкВ — 1:1 запрещён, снижаю ток до {to_ua} мкА"
+                    "ln8000-kmdf: {reason} at Vin {vin_uv} µV - 1:1 forbidden, reducing the current to {to_ua} µA"
                 );
                 if let Err(err) = pump.set_iin_limit(to_ua) {
-                    println!("ln8000-kmdf: не удалось снизить ток: {err}");
+                    println!("ln8000-kmdf: failed to reduce the current: {err}");
                 }
             }
             BypassResolution::Stop { reason } => {
                 println!(
-                    "ln8000-kmdf: {reason} при Vin {vin_uv} мкВ — 1:1 запрещён, останавливаю заряд"
+                    "ln8000-kmdf: {reason} at Vin {vin_uv} µV - 1:1 forbidden, stopping the charge"
                 );
                 if let Err(err) = pump.standby() {
-                    println!("ln8000-kmdf: не удалось остановить заряд: {err}");
+                    println!("ln8000-kmdf: failed to stop the charge: {err}");
                 }
             }
-            // Перечисление помечено `non_exhaustive`: новых разрешений не ждём,
-            // но на всякий случай не включаем 1:1 (безопасная сторона).
+            // The enum is marked `non_exhaustive`: we do not expect new
+            // permissions, but just in case we do not enable 1:1 (the safe side).
             _ => {
-                println!("ln8000-kmdf: неизвестный вердикт обхода ({reason}) — 1:1 не включаю");
+                println!("ln8000-kmdf: unknown bypass verdict ({reason}) - 1:1 not enabled");
             }
         },
         GuardAction::Stop { .. } => {
             *denied_strikes = 0;
             if let Err(err) = pump.standby() {
-                println!("ln8000-kmdf: не удалось остановить заряд: {err}");
+                println!("ln8000-kmdf: failed to stop the charge: {err}");
             }
         }
-        // Перечисление помечено `non_exhaustive`: новые действия игнорируем.
+        // The enum is marked `non_exhaustive`: we ignore new actions.
         _ => {}
     }
 }
 
-/// Обрабатывает управляющие запросы пользовательского режима.
+/// Handles user-mode control requests.
 ///
 /// # Safety
 ///
-/// Вызывается WDF; буферы запроса проверяются по размеру.
+/// Called by WDF; the request buffers are checked by size.
 unsafe extern "C" fn evt_io_device_control(
     _queue: WDFQUEUE,
     request: WDFREQUEST,
@@ -3467,8 +3553,8 @@ unsafe extern "C" fn evt_io_device_control(
     input_buffer_length: usize,
     io_control_code: ULONG,
 ) {
-    // Обработчики ниже читают `STATE` и ходят по шине: без мьютекса они
-    // столкнулись бы с таймером телеметрии.
+    // The handlers below read `STATE` and go out on the bus: without the mutex they
+    // would collide with the telemetry timer.
     let _state = lock_state();
     match io_control_code {
         ioctl::IOCTL_LN8000_GET_STATUS => unsafe { handle_get_status(request) },
@@ -3516,7 +3602,7 @@ fn schedule_or_clear_superuser_retry(device: WDFDEVICE, negotiate_rc: i32) {
             }
             mark_device_value(device, "HvdcpRetryPend", 1);
             mark_device_value(device, "HvdcpRetryN", st.hvdcp_retry_attempts);
-            println!("ln8000-kmdf: HVDCP SUPERUSER busy — will retry");
+            println!("ln8000-kmdf: HVDCP SUPERUSER busy - will retry");
         }
     } else {
         st.hvdcp_retry_pending = false;
@@ -3570,13 +3656,13 @@ fn run_hvdcp_and_land(device: WDFDEVICE) -> i32 {
         unsafe { hvdcp::run_negotiate_report(device, usbin_id, vbat_uv, hvdcp_st, &mut read_vin) }
     };
     // After Vin elevation (or 5 V stay), land in the correct pump path:
-    //  Vin >= 2*Vbat + 250 мВ → boost/trim + ICL pump + 2:1
-    //  ~5 V → max safe IIN retreat bypass (plain DCP / QC2 brick без elevate)
-    //  повышен, но без запаса (8,0–9,15 В) → сначала дотягиваем шину до окна
-    //  9,5–9,8 В (Android `cp_qc30.c:848`: UP, пока `vbus <= 9500`), затем
-    //  перечитываем ADC и решаем заново. Раньше этот случай ничего не
-    //  исправлял: boost стоял внутри `if engage == Switching`, то есть за
-    //  условием, которое сам должен создать, и такт кончался `ModeNotReached`.
+    //  Vin >= 2*Vbat + 250 mV → boost/trim + ICL pump + 2:1
+    //  ~5 V → max safe IIN retreat bypass (plain DCP / QC2 brick without elevate)
+    //  elevated, but without headroom (8,0–9,15 V) → first pull the bus into the
+    //  9,5–9,8 V window (Android `cp_qc30.c:848`: UP while `vbus <= 9500`), then
+    //  re-read the ADC and decide again. Previously this case fixed nothing: boost
+    //  sat inside `if engage == Switching`, that is behind the very condition it
+    //  was supposed to create, and the tick ended with `ModeNotReached`.
     if let Some(pump) = st.pump.as_mut() {
         let mut vin = pump.read_adc(AdcChannel::Vin).unwrap_or(0);
         let vbat_now = pump
@@ -3585,11 +3671,12 @@ fn run_hvdcp_and_land(device: WDFDEVICE) -> i32 {
             .map_or(vbat_uv, |v| u32::try_from(v.max(0)).unwrap_or(vbat_uv));
         let mut engage = charge_mode(vin, vbat_now);
         if engage != Some(OpMode::Switching) && vin >= hvdcp::FIVE_V_STAY_MAX_UV {
-            // Вход повышен (не 5-вольтовая ветка), но 2:1 ещё не допускается:
-            // доводим шину до полосы переноса и перечитываем ADC. Порог —
-            // «выше 5 В», а не `SWITCHING_MIN_VIN_UV`: живой QC3-блок в
-            // continuous-режиме встаёт чуть НИЖЕ ворот 2:1 (замер 19.09: 7,97 В
-            // против пола 8,0 В), и последний шаг делает INC-импульс, а не отказ.
+            // The input is elevated (not the five-volt branch), but 2:1 is not yet
+            // allowed: we pull the bus into the transfer band and re-read the ADC.
+            // The threshold is "above 5 V", not `SWITCHING_MIN_VIN_UV`: a live QC3
+            // brick in continuous mode settles slightly BELOW the 2:1 gate
+            // (measurement 19.09: 7,97 V against the 8,0 V floor), and the last step
+            // is made by an INC pulse rather than a failure.
             // SAFETY: PASSIVE_LEVEL; may reopen SUPERUSER for INC pulses.
             let _ = unsafe {
                 hvdcp::nudge_vin_into_window(device, usbin_id, &mut st.hvdcp, vin, vbat_now, false)
@@ -3599,21 +3686,22 @@ fn run_hvdcp_and_land(device: WDFDEVICE) -> i32 {
         }
         if engage == Some(OpMode::Switching) {
             mark_device_value(device, "SuAfc5vPath", 0);
-            // Полоса переноса едет за банкой (`[2*Vbat+200, 2*Vbat+400]` мВ), так
-            // что её держит живой Vbat, а не фиксированные 9,5–10,5 В: те лежат
-            // ВЫШЕ полосы на полной банке, и насос отдаёт ровно 39 мА (живой
-            // замер 18.09). `false` — ток здесь ещё не измерен, коррекция только
-            // по напряжению; мёртвый ток ловит такт телеметрии.
+            // The transfer band follows the cell (`[2*Vbat+200, 2*Vbat+400]` mV), so
+            // it is held by the live Vbat rather than fixed 9,5–10,5 V: those lie
+            // ABOVE the band on a full cell, and the pump delivers exactly 39 mA
+            // (live measurement 18.09). `false` - the current has not been measured
+            // here yet, the correction is voltage-only; the dead current is caught
+            // by the telemetry tick.
             // SAFETY: PASSIVE_LEVEL; may reopen SUPERUSER for pulses.
             let _ = unsafe {
                 hvdcp::nudge_vin_into_window(device, usbin_id, &mut st.hvdcp, vin, vbat_now, false)
             };
-            // Перечитывать ADC здесь не для чего: `set_charging` ниже читает
-            // Vin и Vbat сам, а режим уже выбран выше.
+            // There is no reason to re-read the ADC here: `set_charging` below reads
+            // Vin and Vbat itself, and the mode has already been chosen above.
             // SAFETY: PASSIVE_LEVEL; SUPERUSER / Usbin RH for ICL.
             let _ = unsafe { hvdcp::raise_icl_for_pump(device, usbin_id, &mut st.hvdcp) };
         } else if engage == Some(OpMode::Bypass) && hvdcp::vin_stayed_near_5v(vin) {
-            // Plain DCP / QC2 FORCE no-op / brick без elevate: обход 1:1 @ 2.7 А.
+            // Plain DCP / QC2 FORCE no-op / brick without elevate: 1:1 bypass @ 2.7 A.
             // SAFETY: PASSIVE_LEVEL; raises USBIN ICL for 5 V high-current.
             let _ = unsafe { hvdcp::raise_icl_for_5v_bypass(device, usbin_id, &mut st.hvdcp) };
             // Align pump IIN limit with NABU class-B bus budget.
@@ -3709,13 +3797,13 @@ unsafe fn handle_run_hvdcp(request: WDFREQUEST, input_length: usize) {
     unsafe { write_output(request, &answer) };
 }
 
-/// Отдаёт состояние драйвера.
+/// Exposes the driver state.
 ///
 /// # Safety
 ///
-/// `request` валиден; выходной буфер достаточного размера.
+/// `request` is valid; the output buffer is large enough.
 unsafe fn handle_get_status(request: WDFREQUEST) {
-    // SAFETY: доступ сериализован WDF.
+    // SAFETY: access is serialized by WDF.
     let st = unsafe { state() };
     let mut status = Ln8000Status {
         magic: LN8000_STATUS_MAGIC,
@@ -3757,9 +3845,9 @@ unsafe fn handle_get_status(request: WDFREQUEST) {
             status.op_mode = sample.op_mode.code();
         }
     } else if let Some(pump) = st.pump.as_mut() {
-        // Сохранённого снимка ещё нет (периодический сбор не наполнил его),
-        // поэтому читаем показатели на месте: обмен по шине занимает единицы
-        // миллисекунд, и обработчик не блокируется.
+        // There is no stored snapshot yet (the periodic collection has not filled
+        // it), so we read the values in place: a bus transfer takes single-digit
+        // milliseconds, and the handler does not block.
         status.vbat_uv =
             u32::try_from(pump.read_adc(AdcChannel::Vbat).unwrap_or_default().max(0)).unwrap_or(0);
         status.vbus_uv =
@@ -3777,8 +3865,8 @@ unsafe fn handle_get_status(request: WDFREQUEST) {
                 status.iin_ua,
                 st.max_iin_ua,
                 status.fault1_sts & ln8000::regs::FAULT1_VAC_UNPLUG != 0,
-                // Годность отсчётов входа: тот же признак, что и в такте
-                // телеметрии, — ноль канала означает «нет отсчёта».
+                // Suitability of the input samples: the same flag as in the
+                // telemetry tick - a zero channel means "no sample".
                 status.vbat_uv > 0 && status.vbus_uv > 0,
                 monotonic_ms(),
             );
@@ -3793,22 +3881,23 @@ unsafe fn handle_get_status(request: WDFREQUEST) {
     unsafe { write_output(request, &status) };
 }
 
-/// Читает регистр LN8000 (диагностика).
+/// Reads an LN8000 register (diagnostics).
 ///
 /// # Safety
 ///
-/// `request` валиден; входной буфер содержит [`Ln8000RegRequest`].
+/// `request` is valid; the input buffer contains [`Ln8000RegRequest`].
 unsafe fn handle_read_reg(request: WDFREQUEST, input_length: usize) {
     if input_length < core::mem::size_of::<Ln8000RegRequest>() {
         unsafe { complete(request, wdk_sys::STATUS_BUFFER_TOO_SMALL, 0) };
         return;
     }
-    // SAFETY: буфер проверен по размеру; адрес берётся из запроса клиента.
+    // SAFETY: the buffer has been checked by size; the address comes from the
+    // client request.
     let Some(mut answer) = (unsafe { read_input::<Ln8000RegRequest>(request) }) else {
         unsafe { complete(request, wdk_sys::STATUS_INVALID_PARAMETER, 0) };
         return;
     };
-    // SAFETY: доступ сериализован WDF.
+    // SAFETY: access is serialized by WDF.
     let st = unsafe { state() };
     if let Some(pump) = st.pump.as_mut() {
         match pump.read_register(answer.addr) {
@@ -3824,22 +3913,23 @@ unsafe fn handle_read_reg(request: WDFREQUEST, input_length: usize) {
     unsafe { write_output(request, &answer) };
 }
 
-/// Записывает регистр LN8000 (диагностика).
+/// Writes an LN8000 register (diagnostics).
 ///
 /// # Safety
 ///
-/// `request` валиден; входной буфер содержит [`Ln8000RegRequest`].
+/// `request` is valid; the input buffer contains [`Ln8000RegRequest`].
 unsafe fn handle_write_reg(request: WDFREQUEST, input_length: usize) {
     if input_length < core::mem::size_of::<Ln8000RegRequest>() {
         unsafe { complete(request, wdk_sys::STATUS_BUFFER_TOO_SMALL, 0) };
         return;
     }
-    // SAFETY: буфер проверен по размеру; адрес и значение — из запроса клиента.
+    // SAFETY: the buffer has been checked by size; the address and the value come from
+    // the client request.
     let Some(mut answer) = (unsafe { read_input::<Ln8000RegRequest>(request) }) else {
         unsafe { complete(request, wdk_sys::STATUS_INVALID_PARAMETER, 0) };
         return;
     };
-    // SAFETY: доступ сериализован WDF.
+    // SAFETY: access is serialized by WDF.
     let st = unsafe { state() };
     if let Some(pump) = st.pump.as_mut() {
         if let Err(err) = pump.write_register(answer.addr, answer.value) {
@@ -3854,29 +3944,29 @@ unsafe fn handle_write_reg(request: WDFREQUEST, input_length: usize) {
     unsafe { write_output(request, &answer) };
 }
 
-/// Задаёт лимиты тока и напряжения.
+/// Sets the current and voltage limits.
 ///
 /// # Safety
 ///
-/// `request` валиден; входной буфер содержит [`Ln8000LimitsRequest`].
+/// `request` is valid; the input buffer contains [`Ln8000LimitsRequest`].
 unsafe fn handle_set_limits(request: WDFREQUEST, input_length: usize) {
     if input_length < core::mem::size_of::<Ln8000LimitsRequest>() {
         unsafe { complete(request, wdk_sys::STATUS_BUFFER_TOO_SMALL, 0) };
         return;
     }
-    // SAFETY: буфер проверен по размеру.
+    // SAFETY: the buffer has been checked by size.
     let Some(mut answer) = (unsafe { read_input::<Ln8000LimitsRequest>(request) }) else {
         unsafe { complete(request, wdk_sys::STATUS_INVALID_PARAMETER, 0) };
         return;
     };
-    // SAFETY: доступ сериализован WDF.
+    // SAFETY: access is serialized by WDF.
     let st = unsafe { state() };
     if let Some(pump) = st.pump.as_mut() {
         if answer.iin_ua > 0 {
             match pump.set_iin_limit(answer.iin_ua) {
                 Ok(code) => {
-                    // Сообщаем не запрошенный ток, а фактически применённый:
-                    // кодирование округляет значение до шага 50 мА.
+                    // We report the actually applied current, not the requested
+                    // one: the encoding rounds the value to a 50 mA step.
                     let applied = decode_iin_limit(code);
                     answer.applied_iin_ua = applied;
                     st.limits.iin_max_ua = applied;
@@ -3896,17 +3986,17 @@ unsafe fn handle_set_limits(request: WDFREQUEST, input_length: usize) {
     unsafe { write_output(request, &answer) };
 }
 
-/// Переключает режим работы.
+/// Switches the operating mode.
 ///
 /// # Safety
 ///
-/// `request` валиден; входной буфер содержит [`Ln8000ModeRequest`].
+/// `request` is valid; the input buffer contains [`Ln8000ModeRequest`].
 unsafe fn handle_set_mode(request: WDFREQUEST, input_length: usize) {
     if input_length < core::mem::size_of::<Ln8000ModeRequest>() {
         unsafe { complete(request, wdk_sys::STATUS_BUFFER_TOO_SMALL, 0) };
         return;
     }
-    // SAFETY: буфер проверен по размеру.
+    // SAFETY: the buffer has been checked by size.
     let Some(mut answer) = (unsafe { read_input::<Ln8000ModeRequest>(request) }) else {
         unsafe { complete(request, wdk_sys::STATUS_INVALID_PARAMETER, 0) };
         return;
@@ -3915,19 +4005,19 @@ unsafe fn handle_set_mode(request: WDFREQUEST, input_length: usize) {
         unsafe { complete(request, wdk_sys::STATUS_INVALID_PARAMETER, 0) };
         return;
     }
-    // SAFETY: доступ сериализован WDF.
+    // SAFETY: access is serialized by WDF.
     let st = unsafe { state() };
     if let Some(pump) = st.pump.as_mut() {
-        // mode 2 (1:1) — только в окне обхода: `EN_1TO1` подаёт вход напрямую на
-        // батарею, поэтому на повышенном Vin отказываем отдельным кодом, а не
-        // пропускаем вызов в чип.
+        // mode 2 (1:1) is allowed only inside the bypass window: `EN_1TO1` feeds the
+        // input straight to the battery, so with elevated Vin we reject with a
+        // dedicated code rather than forwarding the call to the chip.
         if answer.mode == 2 {
             let vin = pump.read_adc(AdcChannel::Vin).unwrap_or(0);
             let vbat =
                 u32::try_from(pump.read_adc(AdcChannel::Vbat).unwrap_or(0).max(0)).unwrap_or(0);
             if !bypass_allowed_by_vin(vin, vbat) {
                 println!(
-                    "ln8000-kmdf: SET_MODE bypass отклонён: Vin {vin} мкВ вне окна обхода"
+                    "ln8000-kmdf: SET_MODE bypass rejected: Vin {vin} µV outside the bypass window"
                 );
                 answer.error_code = ioctl::ERR_BYPASS_VIN_OUT_OF_WINDOW;
                 unsafe { write_output(request, &answer) };
@@ -3949,28 +4039,28 @@ unsafe fn handle_set_mode(request: WDFREQUEST, input_length: usize) {
     unsafe { write_output(request, &answer) };
 }
 
-/// Явный старт/стоп заряда через [`IOCTL_LN8000_SET_CHARGE`].
+/// Explicit charge start/stop via [`IOCTL_LN8000_SET_CHARGE`].
 ///
 /// # Safety
 ///
-/// `request` валиден; входной/выходной буфер достаточного размера.
+/// `request` is valid; the input/output buffer is large enough.
 unsafe fn handle_set_charge(request: WDFREQUEST, input_length: usize) {
     if input_length < core::mem::size_of::<Ln8000ChargeRequest>() {
         unsafe { complete(request, wdk_sys::STATUS_BUFFER_TOO_SMALL, 0) };
         return;
     }
-    // SAFETY: буфер проверен по размеру.
+    // SAFETY: the buffer has been checked by size.
     let Some(mut answer) = (unsafe { read_input::<Ln8000ChargeRequest>(request) }) else {
         unsafe { complete(request, wdk_sys::STATUS_INVALID_PARAMETER, 0) };
         return;
     };
-    // SAFETY: доступ к глобальному состоянию WDF.
+    // SAFETY: access to the global WDF state.
     let st = unsafe { state() };
     let queue = unsafe { call_unsafe_wdf_function_binding!(WdfRequestGetIoQueue, request) };
     let device = unsafe { call_unsafe_wdf_function_binding!(WdfIoQueueGetDevice, queue) };
     if let Some(pump) = st.pump.as_mut() {
         let result = if answer.on != 0 {
-            // Soft-reset + configure уже сами пробуют включить заряд в этом такте.
+            // Soft-reset + configure already try to enable charging in this tick.
             let outcome = match recover_ln_shutdown(pump) {
                 ShutdownRecovery::Recovered(outcome) => outcome,
                 ShutdownRecovery::NotInShutdown => pump.set_charging(true, &mut por_delay),
@@ -4001,13 +4091,13 @@ unsafe fn handle_set_charge(request: WDFREQUEST, input_length: usize) {
     unsafe { write_output(request, &answer) };
 }
 
-/// Отдаёт сведения о сеансах заряда.
+/// Returns information about the charge sessions.
 ///
 /// # Safety
 ///
-/// `request` валиден; вывод проверяется вызывающим.
+/// `request` is valid; the output is checked by the caller.
 unsafe fn handle_get_sessions(request: WDFREQUEST) {
-    // SAFETY: доступ сериализован WDF.
+    // SAFETY: access is serialized by WDF.
     let st = unsafe { state() };
     let mut answer = Ln8000Sessions {
         total: st.telemetry.session_total(),
@@ -4028,19 +4118,19 @@ unsafe fn handle_get_sessions(request: WDFREQUEST) {
     unsafe { write_output(request, &answer) };
 }
 
-/// Выгружает отсчёты телеметрии.
+/// Returns the telemetry samples.
 ///
 /// # Safety
 ///
-/// `request` валиден; выходной буфер заполняется поэлементно.
+/// `request` is valid; the output buffer is filled element by element.
 unsafe fn handle_get_samples(request: WDFREQUEST, input_length: usize) {
     if input_length < core::mem::size_of::<Ln8000SamplesRequest>() {
         unsafe { complete(request, wdk_sys::STATUS_BUFFER_TOO_SMALL, 0) };
         return;
     }
-    // SAFETY: буфер проверен по размеру.
+    // SAFETY: the buffer has been checked by size.
     let requested_count = unsafe { read_input::<Ln8000SamplesRequest>(request) };
-    // SAFETY: доступ сериализован WDF.
+    // SAFETY: access is serialized by WDF.
     let st = unsafe { state() };
     let (buffer, length) = match unsafe {
         output_buffer(request, core::mem::size_of::<Ln8000SamplesRequest>())
@@ -4065,8 +4155,8 @@ unsafe fn handle_get_samples(request: WDFREQUEST, input_length: usize) {
     let mut written = 0_usize;
     st.telemetry.for_each_sample(|sample| {
         if written < limit {
-            // SAFETY: запись идёт внутри выходного буфера запроса, а
-            // `written < limit <= capacity` не даёт выйти за его границы.
+            // SAFETY: the write stays inside the request output buffer, and
+            // `written < limit <= capacity` keeps it within the bounds.
             unsafe {
                 let destination = base
                     .add(header_size + written * sample_size)
@@ -4082,7 +4172,7 @@ unsafe fn handle_get_samples(request: WDFREQUEST, input_length: usize) {
         ..Ln8000SamplesRequest::default()
     };
     if written > 0 {
-        // SAFETY: первый записанный отсчёт лежит сразу за заголовком.
+        // SAFETY: the first written sample lies right after the header.
         unsafe {
             core::ptr::copy_nonoverlapping(
                 base.add(header_size),
@@ -4091,7 +4181,7 @@ unsafe fn handle_get_samples(request: WDFREQUEST, input_length: usize) {
             );
         }
     }
-    // SAFETY: заголовок пишется в начало выходного буфера запроса.
+    // SAFETY: the header is written at the start of the request output buffer.
     unsafe {
         core::ptr::copy_nonoverlapping(core::ptr::from_ref(&header).cast::<u8>(), base, header_size);
     }
@@ -4099,7 +4189,7 @@ unsafe fn handle_get_samples(request: WDFREQUEST, input_length: usize) {
     unsafe { complete(request, wdk_sys::STATUS_SUCCESS, information) };
 }
 
-/// Преобразует отсчёт ядра в структуру ответа.
+/// Converts a core sample into the response structure.
 fn to_sample(sample: &TelemetrySample) -> Ln8000Sample {
     Ln8000Sample {
         ts_ms: sample.ts_ms,
@@ -4113,17 +4203,17 @@ fn to_sample(sample: &TelemetrySample) -> Ln8000Sample {
     }
 }
 
-/// Копирует входной буфер запроса в структуру.
+/// Copies the request input buffer into a structure.
 ///
-/// Возвращает `None`, если буфер меньше `size_of::<T>()`.
+/// Returns `None` if the buffer is smaller than `size_of::<T>()`.
 ///
 /// # Safety
 ///
-/// `request` валиден; вызов на уровне, допускающем доступ к буферу запроса.
+/// `request` is valid; called at a level that permits access to the request buffer.
 unsafe fn read_input<T: Copy + Default>(request: WDFREQUEST) -> Option<T> {
     let mut buffer: *mut core::ffi::c_void = core::ptr::null_mut();
     let mut length: usize = 0;
-    // SAFETY: входной буфер запроса создаётся фреймворком (METHOD_BUFFERED).
+    // SAFETY: the request input buffer is created by the framework (METHOD_BUFFERED).
     let status = unsafe {
         call_unsafe_wdf_function_binding!(
             WdfRequestRetrieveInputBuffer,
@@ -4137,7 +4227,7 @@ unsafe fn read_input<T: Copy + Default>(request: WDFREQUEST) -> Option<T> {
         return None;
     }
     let mut value = T::default();
-    // SAFETY: буфер проверен по размеру; копируем ровно size_of::<T>().
+    // SAFETY: the buffer has been checked by size; we copy exactly size_of::<T>().
     unsafe {
         core::ptr::copy_nonoverlapping(
             buffer.cast::<u8>(),
@@ -4148,18 +4238,18 @@ unsafe fn read_input<T: Copy + Default>(request: WDFREQUEST) -> Option<T> {
     Some(value)
 }
 
-/// Отдаёт выходной буфер запроса и его размер.
+/// Returns the request output buffer and its size.
 ///
 /// # Safety
 ///
-/// `request` валиден.
+/// `request` is valid.
 unsafe fn output_buffer(
     request: WDFREQUEST,
     min_length: usize,
 ) -> Result<(*mut core::ffi::c_void, usize), NTSTATUS> {
     let mut buffer: *mut core::ffi::c_void = core::ptr::null_mut();
     let mut length: usize = 0;
-    // SAFETY: выходной буфер запроса создаётся фреймворком (METHOD_BUFFERED).
+    // SAFETY: the request output buffer is created by the framework (METHOD_BUFFERED).
     let status = unsafe {
         call_unsafe_wdf_function_binding!(
             WdfRequestRetrieveOutputBuffer,
@@ -4175,11 +4265,11 @@ unsafe fn output_buffer(
     Ok((buffer, length))
 }
 
-/// Копирует структуру в выходной буфер запроса и завершает его.
+/// Copies the structure into the request output buffer and completes it.
 ///
 /// # Safety
 ///
-/// `request` валиден; `value` указывает на живую структуру.
+/// `request` is valid; `value` points to a live structure.
 unsafe fn write_output<T: Copy>(request: WDFREQUEST, value: &T) {
     let (buffer, _length) = match unsafe { output_buffer(request, core::mem::size_of::<T>()) } {
         Ok(value) => value,
@@ -4188,7 +4278,7 @@ unsafe fn write_output<T: Copy>(request: WDFREQUEST, value: &T) {
             return;
         }
     };
-    // SAFETY: буфер проверен по размеру; копируем ровно size_of::<T>().
+    // SAFETY: the buffer has been checked by size; we copy exactly size_of::<T>().
     unsafe {
         core::ptr::copy_nonoverlapping(
             core::ptr::from_ref(value).cast::<u8>(),
@@ -4199,13 +4289,13 @@ unsafe fn write_output<T: Copy>(request: WDFREQUEST, value: &T) {
     unsafe { complete(request, wdk_sys::STATUS_SUCCESS, core::mem::size_of::<T>()) };
 }
 
-/// Завершает запрос с кодом и объёмом данных.
+/// Completes the request with a status and an information volume.
 ///
 /// # Safety
 ///
-/// `request` — валидный незавершённый запрос.
+/// `request` is a valid, not yet completed request.
 unsafe fn complete(request: WDFREQUEST, status: NTSTATUS, information: usize) {
-    // SAFETY: запрос принадлежит этому вызову и ещё не завершён.
+    // SAFETY: the request belongs to this call and is not completed yet.
     unsafe {
         call_unsafe_wdf_function_binding!(
             WdfRequestCompleteWithInformation,
@@ -4216,11 +4306,11 @@ unsafe fn complete(request: WDFREQUEST, status: NTSTATUS, information: usize) {
     }
 }
 
-/// Монотонные миллисекунды ядра.
+/// Monotonic kernel milliseconds.
 fn monotonic_ms() -> u64 {
     let mut stamp: u64 = 0;
-    // SAFETY: `KeQueryInterruptTimePrecise` — документированная ядерная функция;
-    // единица измерения — 100 нс, поэтому делим на 10 000.
+    // SAFETY: `KeQueryInterruptTimePrecise` is a documented kernel routine;
+    // the unit is 100 ns, so we divide by 10 000.
     let ticks = unsafe { wdk_sys::ntddk::KeQueryInterruptTimePrecise(&raw mut stamp) };
     ticks / 10_000
 }
@@ -4234,9 +4324,9 @@ fn pump_error_code(err: PumpError) -> i32 {
         PumpError::Fault { .. } => -5,
         PumpError::OutOfRange { .. } => -6,
         PumpError::WatchdogExpired => -7,
-        // Запрет политики, а не отказ чипа: 1:1 вне окна обхода.
+        // A policy refusal, not a chip failure: 1:1 outside the bypass window.
         PumpError::BypassNeedsFiveVoltVin { .. } => ioctl::ERR_BYPASS_VIN_OUT_OF_WINDOW,
-        // Перечисление помечено `non_exhaustive`: новые варианты дадут -100.
+        // The enum is marked `non_exhaustive`: new variants will give -100.
         _ => -100,
     }
 }

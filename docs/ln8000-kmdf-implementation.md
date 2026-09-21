@@ -1,100 +1,100 @@
-# LN8000: реализация KMDF (Rust)
+# LN8000: KMDF implementation (Rust)
 
-Прикладные шаги для `crates/kmdf` и будущего SPB-транспорта к LN8000.
+Applied steps for `crates/kmdf` and the future SPB transport to the LN8000.
 
-Общий контекст: `01-analysis/ln8000-windows-driver-roadmap.md`.
+General context: `01-analysis/ln8000-windows-driver-roadmap.md`.
 
 ---
 
-## Архитектура
+## Architecture
 
 ```
 [Battery miniclass / CLI]  ←→  [KMDF LN8000]  ←→  SpbCx / I²C (QUP)
                                       ↑
-                               ln8000_charger.c (логика)
-                               core crate (политика, если нужна)
+                               ln8000_charger.c (logic)
+                               core crate (policy, if needed)
 ```
 
-Текущий `kmdf` крейт — каркас WDK; SPMI/SPB-транспорт — в разработке (`crates/kmdf/src/spmi.rs`).
+The current `kmdf` crate is a WDK skeleton; the SPMI/SPB transport is under development (`crates/kmdf/src/spmi.rs`).
 
 ---
 
-## Шаг 1 — SPB / I²C
+## Step 1 - SPB / I²C
 
-1. INF: `HardwareIds` = `ACPI\QCOM057E` (существующий PEIC) или свой `LNX8000`.
-2. `EVT_WDF_DEVICE_PREPARE_HARDWARE`: разбор `_CRS`, `SpbTargetDeviceConnect`.
-3. Probe: `SpbRead` регистра `0x00` → `DEVICE_ID == 0x42`.
+1. INF: `HardwareIds` = `ACPI\QCOM057E` (the existing PEIC) or a custom `LNX8000`.
+2. `EVT_WDF_DEVICE_PREPARE_HARDWARE`: parse `_CRS`, `SpbTargetDeviceConnect`.
+3. Probe: `SpbRead` of register `0x00` -> `DEVICE_ID == 0x42`.
 
-Образцы: `08-driver-samples/Windows-driver-samples/spb/`.
+Samples: `08-driver-samples/Windows-driver-samples/spb/`.
 
 ---
 
-## Шаг 2 — Init (из DTS)
+## Step 2 - Init (from DTS)
 
-Пороги и disable-флаги — таблица в `04-android-reference-sources/LN8000.md`.
+The thresholds and disable flags are in the table in `04-android-reference-sources/LN8000.md`.
 
-Минимальный набор записей после probe:
+The minimal set of writes after probe:
 
 - `THRESHOLD_CTRL`, `NTC_CTRL`
-- `FAULT_CTRL` (учесть отключённые в DT защиты)
+- `FAULT_CTRL` (account for the protections disabled in the DT)
 - `REGULATION_CTRL`, `IIN_CTRL`, `V_FLOAT_CTRL`
 
 ---
 
-## Шаг 3 — IRQ
+## Step 3 - IRQ
 
-- Зарегистрировать `WdfInterruptCreate` по GPIO из `_CRS` (GPIO **36** на nabu).
-- В DPC: читать `INT1`, `SYS_STS`, `FAULT1/2_STS`, `SAFETY_STS`.
-- Маски: `INT1_MSK`.
-
----
-
-## Шаг 4 — op_mode
-
-Целевое состояние: **`LN8000_OPMODE_SWITCHING` (3)**.
-
-Управление через `SYS_CTRL` (`STANDBY_EN`, `EN_1TO1`), `CHARGE_CTRL`, `REGULATION_CTRL`.
-
-**Acceptance test:** после включения ЗУ `op_mode == 3` стабильно; откат к `1` (STANDBY) = баг init/PD/защит.
+- Register `WdfInterruptCreate` on the GPIO from `_CRS` (GPIO **36** on nabu).
+- In the DPC: read `INT1`, `SYS_STS`, `FAULT1/2_STS`, `SAFETY_STS`.
+- Masks: `INT1_MSK`.
 
 ---
 
-## Шаг 5 — IOCTL / интеграция
+## Step 4 - op_mode
 
-Варианты:
+The target state: **`LN8000_OPMODE_SWITCHING` (3)**.
 
-- отдельный control device + IOCTL (как в `crates/kmdf/src/ioctl.rs`);
-- связка с battery miniclass через shared interface / WMI.
+Control through `SYS_CTRL` (`STANDBY_EN`, `EN_1TO1`), `CHARGE_CTRL`, `REGULATION_CTRL`.
 
-Не дублировать `qcbattmngr8150` без координации.
+**Acceptance test:** after the charger is enabled `op_mode == 3` is stable; a fall back to `1` (STANDBY) = an init/PD/protection bug.
 
 ---
 
-## Шаг 6 — сборка и отладка
+## Step 5 - IOCTL / integration
+
+Options:
+
+- a separate control device + IOCTL (as in `crates/kmdf/src/ioctl.rs`);
+- a link to the battery miniclass through a shared interface / WMI.
+
+Do not duplicate `qcbattmngr8150` without coordination.
+
+---
+
+## Step 6 - build and debug
 
 ```text
-# из 11-driver-rust/crates/kmdf (отдельный workspace, ARM64)
+# from 11-driver-rust/crates/kmdf (a separate workspace, ARM64)
 cargo wdk build --target aarch64-pc-windows-msvc
 ```
 
 - Test signing, Secure Boot off.
 - WinDbg: `!wdfkd.wdfdevice`, SPB trace.
-- Последовательность: **DEVICE_ID → пороги → op_mode 3 → IRQ**.
+- The sequence: **DEVICE_ID -> thresholds -> op_mode 3 -> IRQ**.
 
 ---
 
-## Зависимости вне LN8000
+## Dependencies outside the LN8000
 
-| Блок | Статус под Windows |
+| Block | Status under Windows |
 |---|---|
 | Fuel gauge PM8150 | ✅ |
-| SMB5 / APSD | ❌ (отдельный трек, `core` crate) |
-| PM8150B PD / Type-C | ❌ (нужен для 9 V+) |
+| SMB5 / APSD | ❌ (a separate track, `core` crate) |
+| PM8150B PD / Type-C | ❌ (needed for 9 V+) |
 
 ---
 
-## Ссылки
+## Links
 
-- Регистры: `04-android-reference-sources/drivers_power_supply_ti_ln8000_charger.h`
-- Логика: `04-android-reference-sources/drivers_power_supply_ti_ln8000_charger.c`
+- Registers: `04-android-reference-sources/drivers_power_supply_ti_ln8000_charger.h`
+- Logic: `04-android-reference-sources/drivers_power_supply_ti_ln8000_charger.c`
 - ACPI: `09-acpi-nabu/ln8000-acpi-uefi.md`

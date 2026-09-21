@@ -1,29 +1,29 @@
-//! Типизированные ошибки ядра драйвера.
+//! Typed core driver errors.
 //!
-//! В библиотечном коде нет `unwrap`, `expect` и `panic`: любая нештатная
-//! ситуация возвращается как значение. Строки в ошибках статические, поэтому
-//! крейт остаётся пригодным для `no_std`.
+//! Library code contains no `unwrap`, `expect` or `panic`: every abnormal situation
+//! is returned as a value. The strings in errors are static, so the crate stays
+//! usable in `no_std`.
 
 use core::fmt;
 
-/// Категория сбоя транспорта.
+/// Transport failure category.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TransportErrorKind {
-    /// Ошибка ввода-вывода на стороне ОС.
+    /// OS-side input/output error.
     Io,
-    /// Устройство не ответило за отведённое время.
+    /// The device did not respond in the allotted time.
     Timeout,
-    /// Связь с устройством потеряна (устройство исчезло из системы).
+    /// Communication with the device was lost (the device left the system).
     Disconnected,
-    /// Устройство вернуло неверный или неразборчивый ответ.
+    /// The device returned an invalid or unreadable response.
     Protocol,
-    /// Операция не поддерживается данным транспортом.
+    /// The operation is not supported by this transport.
     Unsupported,
 }
 
 impl TransportErrorKind {
-    /// Короткое имя категории для журнала.
+    /// Short category name for the journal.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -42,49 +42,49 @@ impl fmt::Display for TransportErrorKind {
     }
 }
 
-/// Сбой на уровне транспорта: не удалось прочитать или записать регистр.
+/// Transport-level failure: a register could not be read or written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransportError {
-    /// Категория сбоя.
+    /// Failure category.
     pub kind: TransportErrorKind,
-    /// Платформенный код (код NTSTATUS, `errno` или код из протокола), `0` если нет.
+    /// Platform code (NTSTATUS code, `errno` or protocol code), `0` if none.
     pub code: i32,
-    /// Человекочитаемое пояснение.
+    /// Human-readable explanation.
     pub detail: &'static str,
 }
 
 impl TransportError {
-    /// Создаёт ошибку транспорта.
+    /// Creates a transport error.
     #[must_use]
     pub const fn new(kind: TransportErrorKind, code: i32, detail: &'static str) -> Self {
         Self { kind, code, detail }
     }
 
-    /// Сбой ввода-вывода.
+    /// Input/output failure.
     #[must_use]
     pub const fn io(detail: &'static str) -> Self {
         Self::new(TransportErrorKind::Io, 0, detail)
     }
 
-    /// Таймаут операции.
+    /// Operation timeout.
     #[must_use]
     pub const fn timeout(detail: &'static str) -> Self {
         Self::new(TransportErrorKind::Timeout, 0, detail)
     }
 
-    /// Потеря связи с устройством.
+    /// Loss of communication with the device.
     #[must_use]
     pub const fn disconnected(detail: &'static str) -> Self {
         Self::new(TransportErrorKind::Disconnected, 0, detail)
     }
 
-    /// Нарушение протокола обмена.
+    /// Protocol violation.
     #[must_use]
     pub const fn protocol(detail: &'static str) -> Self {
         Self::new(TransportErrorKind::Protocol, 0, detail)
     }
 
-    /// Операция не поддерживается.
+    /// Operation not supported.
     #[must_use]
     pub const fn unsupported(detail: &'static str) -> Self {
         Self::new(TransportErrorKind::Unsupported, 0, detail)
@@ -95,7 +95,7 @@ impl fmt::Display for TransportError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "транспорт: {} (код {}): {}",
+            "transport: {} (code {}): {}",
             self.kind, self.code, self.detail
         )
     }
@@ -103,58 +103,58 @@ impl fmt::Display for TransportError {
 
 impl core::error::Error for TransportError {}
 
-/// Полная ошибка драйвера.
+/// Complete driver error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ChargerError {
-    /// Не удалось выполнить операцию с регистрами.
+    /// Register operation failed.
     Transport(TransportError),
-    /// Операция требует открытой сессии.
+    /// The operation requires an open session.
     NotOpen,
-    /// Сессия уже открыта.
+    /// The session is already open.
     AlreadyOpen,
-    /// APSD ещё не завершился: результат пока недостоверен.
+    /// APSD has not completed yet: the result is not yet reliable.
     DetectionNotComplete,
-    /// APSD не завершился за отведённое время.
+    /// APSD did not complete in the allotted time.
     DetectionTimeout {
-        /// Сколько миллисекунд ждали.
+        /// How many milliseconds were waited.
         waited_ms: u64,
     },
-    /// `APSD_RESULT_STATUS` содержит неизвестный образец.
+    /// `APSD_RESULT_STATUS` holds an unknown pattern.
     UnknownAdapterPattern {
-        /// Прочитанное значение без служебного бита.
+        /// Value read without the service bit.
         raw: u8,
     },
-    /// Аппаратура сообщила таймаут проверки HVDCP: адаптер нестабилен.
+    /// The hardware reported an HVDCP check timeout: the adapter is unstable.
     AdapterCheckTimeout {
-        /// Сырое значение `APSD_STATUS`.
+        /// Raw value of `APSD_STATUS`.
         raw_status: u8,
     },
-    /// Запрошенный ток вне допустимого диапазона.
+    /// Requested current is outside the allowed range.
     CurrentOutOfRange {
-        /// Запрошенный ток в микроамперax.
+        /// Requested current in microamperes.
         requested_ua: u32,
-        /// Верхняя граница в микроамперax.
+        /// Upper bound in microamperes.
         max_ua: u32,
     },
-    /// Прочитанное значение не совпало с записанным.
+    /// The value read did not match the value written.
     VerifyFailed {
-        /// Адрес регистра.
+        /// Register address.
         addr: u16,
-        /// Что записали.
+        /// What was written.
         wrote: u8,
-        /// Что прочитали.
+        /// What was read.
         read: u8,
     },
-    /// Устройство сообщило о неисправности.
+    /// The device reported a fault.
     DeviceFault {
-        /// Сырое значение регистра состояния.
+        /// Raw value of the status register.
         status: u8,
     },
 }
 
 impl ChargerError {
-    /// Короткое стабильное имя ошибки для журнала и метрик.
+    /// Short stable error name for the journal and metrics.
     #[must_use]
     pub const fn code(&self) -> &'static str {
         match self {
@@ -171,7 +171,7 @@ impl ChargerError {
         }
     }
 
-    /// Позволяет ли ошибка продолжить работу после сброса транспорта.
+    /// Whether the error still allows work to continue after a transport reset.
     #[must_use]
     pub const fn is_recoverable(&self) -> bool {
         matches!(
@@ -190,32 +190,32 @@ impl fmt::Display for ChargerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Transport(e) => write!(f, "{e}"),
-            Self::NotOpen => f.write_str("сессия не открыта"),
-            Self::AlreadyOpen => f.write_str("сессия уже открыта"),
-            Self::DetectionNotComplete => f.write_str("детекция APSD ещё не завершена"),
+            Self::NotOpen => f.write_str("session is not open"),
+            Self::AlreadyOpen => f.write_str("session is already open"),
+            Self::DetectionNotComplete => f.write_str("APSD detection has not completed yet"),
             Self::DetectionTimeout { waited_ms } => {
-                write!(f, "детекция APSD не завершилась за {waited_ms} мс")
+                write!(f, "APSD detection did not complete within {waited_ms} ms")
             }
             Self::UnknownAdapterPattern { raw } => {
-                write!(f, "неизвестный образец APSD: 0x{raw:02X}")
+                write!(f, "unknown APSD pattern: 0x{raw:02X}")
             }
             Self::AdapterCheckTimeout { raw_status } => write!(
                 f,
-                "аппаратура сообщила таймаут проверки HVDCP (APSD_STATUS=0x{raw_status:02X})"
+                "hardware reported an HVDCP check timeout (APSD_STATUS=0x{raw_status:02X})"
             ),
             Self::CurrentOutOfRange {
                 requested_ua,
                 max_ua,
             } => write!(
                 f,
-                "ток {requested_ua} мкА выше допустимого максимума {max_ua} мкА"
+                "current {requested_ua} µA is above the allowed maximum {max_ua} µA"
             ),
             Self::VerifyFailed { addr, wrote, read } => write!(
                 f,
-                "проверка записи не прошла: 0x{addr:04X} записали 0x{wrote:02X}, прочитали 0x{read:02X}"
+                "write verification failed: 0x{addr:04X} wrote 0x{wrote:02X}, read 0x{read:02X}"
             ),
             Self::DeviceFault { status } => {
-                write!(f, "устройство сообщило о неисправности: 0x{status:02X}")
+                write!(f, "device reported a fault: 0x{status:02X}")
             }
         }
     }
@@ -271,7 +271,7 @@ mod tests {
         let text = error.to_string();
         assert!(text.contains("0x1370"));
         assert!(text.contains("0x1D"));
-        let transport = TransportError::disconnected("канал потерян");
+        let transport = TransportError::disconnected("link lost");
         assert!(transport.to_string().contains("disconnected"));
     }
 

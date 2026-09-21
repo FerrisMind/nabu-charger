@@ -1,27 +1,27 @@
-//! Типизированные ошибки ядра драйвера LN8000.
+//! Typed errors of the LN8000 driver core.
 //!
-//! Библиотечный код не паникует: нештатные ситуации возвращаются значениями.
+//! Library code does not panic: abnormal situations are returned by value.
 
 use core::fmt;
 
-/// Категория сбоя шины I²C.
+/// Category of an I²C bus failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum BusErrorKind {
-    /// Ошибка ввода-вывода.
+    /// Input/output error.
     Io,
-    /// Устройство не ответило.
+    /// The device did not answer.
     Timeout,
-    /// Устройство отсутствует на шине.
+    /// The device is absent from the bus.
     Disconnected,
-    /// Устройство вернуло неожиданный ответ.
+    /// The device returned an unexpected response.
     Protocol,
-    /// Операция не поддерживается транспортом.
+    /// The operation is not supported by the transport.
     Unsupported,
 }
 
 impl BusErrorKind {
-    /// Короткое имя категории для журнала.
+    /// Short category name for the journal.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -40,49 +40,49 @@ impl fmt::Display for BusErrorKind {
     }
 }
 
-/// Сбой обмена по шине I²C.
+/// Failure of an I²C bus transfer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BusError {
-    /// Категория.
+    /// Category.
     pub kind: BusErrorKind,
-    /// Платформенный код (NTSTATUS или код протокола), `0` если нет.
+    /// Platform code (NTSTATUS or protocol code), `0` if none.
     pub code: i32,
-    /// Пояснение.
+    /// Explanation.
     pub detail: &'static str,
 }
 
 impl BusError {
-    /// Создаёт ошибку шины.
+    /// Creates a bus error.
     #[must_use]
     pub const fn new(kind: BusErrorKind, code: i32, detail: &'static str) -> Self {
         Self { kind, code, detail }
     }
 
-    /// Ошибка ввода-вывода.
+    /// Input/output error.
     #[must_use]
     pub const fn io(detail: &'static str) -> Self {
         Self::new(BusErrorKind::Io, 0, detail)
     }
 
-    /// Таймаут.
+    /// Timeout.
     #[must_use]
     pub const fn timeout(detail: &'static str) -> Self {
         Self::new(BusErrorKind::Timeout, 0, detail)
     }
 
-    /// Устройство отсутствует.
+    /// The device is absent.
     #[must_use]
     pub const fn disconnected(detail: &'static str) -> Self {
         Self::new(BusErrorKind::Disconnected, 0, detail)
     }
 
-    /// Нарушение протокола.
+    /// Protocol violation.
     #[must_use]
     pub const fn protocol(detail: &'static str) -> Self {
         Self::new(BusErrorKind::Protocol, 0, detail)
     }
 
-    /// Операция не поддерживается.
+    /// The operation is not supported.
     #[must_use]
     pub const fn unsupported(detail: &'static str) -> Self {
         Self::new(BusErrorKind::Unsupported, 0, detail)
@@ -93,7 +93,7 @@ impl fmt::Display for BusError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "шина: {} (код {}): {}",
+            "bus: {} (code {}): {}",
             self.kind, self.code, self.detail
         )
     }
@@ -101,54 +101,54 @@ impl fmt::Display for BusError {
 
 impl core::error::Error for BusError {}
 
-/// Полная ошибка драйвера LN8000.
+/// Full LN8000 driver error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum PumpError {
-    /// Сбой шины.
+    /// Bus failure.
     Bus(BusError),
-    /// Сессия не открыта.
+    /// Session is not open.
     NotOpen,
-    /// Устройство ответило не тем идентификатором.
+    /// The device answered with the wrong identifier.
     WrongDeviceId {
-        /// Что прочитали из `DEVICE_ID`.
+        /// What was read from `DEVICE_ID`.
         got: u8,
     },
-    /// Устройство не подтвердило нужный режим.
+    /// The device did not confirm the requested mode.
     ModeNotReached {
-        /// Ожидаемый режим.
+        /// Expected mode.
         wanted: u8,
-        /// Что показывает `SYS_STS`.
+        /// What `SYS_STS` shows.
         raw_status: u8,
     },
-    /// 1:1 запрещён: вход не в окне обхода (нужно 4,2…8 В).
+    /// 1:1 bypass forbidden: the input is outside the bypass window (4.2-8 V needed).
     ///
-    /// `EN_1TO1` подаёт вход напрямую на батарею, поэтому при повышенном Vin
-    /// (QC/PD, 9–12 В) режим не включается ни одним путём.
+    /// `EN_1TO1` feeds the input straight to the battery, so with a raised Vin
+    /// (QC/PD, 9-12 V) the mode is not entered by any path.
     BypassNeedsFiveVoltVin {
-        /// Измеренный Vin, мкВ (может быть отрицательным при сбое АЦП).
+        /// Measured Vin, µV (may be negative on ADC failure).
         vin_uv: i32,
     },
-    /// Сработал отказ (сторожевой таймер, перенапряжение, перегрев…).
+    /// A fault fired (watchdog timer, overvoltage, overtemperature...).
     Fault {
-        /// Маска отказа.
+        /// Fault mask.
         mask: u8,
-        /// Описание отказа.
+        /// Fault description.
         detail: &'static str,
     },
-    /// Значение вне допустимого диапазона.
+    /// Value outside the allowed range.
     OutOfRange {
-        /// Параметр.
+        /// Parameter.
         field: &'static str,
-        /// Запрошенное значение.
+        /// Requested value.
         requested: u32,
     },
-    /// Сторожевой таймер не поддерживали: устройство ушло в shutdown.
+    /// The watchdog timer was not serviced: the device went to shutdown.
     WatchdogExpired,
 }
 
 impl PumpError {
-    /// Стабильный код ошибки для журнала и метрик.
+    /// Stable error code for the journal and metrics.
     #[must_use]
     pub const fn code(&self) -> &'static str {
         match self {
@@ -163,7 +163,7 @@ impl PumpError {
         }
     }
 
-    /// Можно ли продолжить работу после сброса шины.
+    /// Whether work can continue after a bus reset.
     #[must_use]
     pub const fn is_recoverable(&self) -> bool {
         matches!(
@@ -180,29 +180,29 @@ impl fmt::Display for PumpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Bus(e) => write!(f, "{e}"),
-            Self::NotOpen => f.write_str("сессия не открыта"),
+            Self::NotOpen => f.write_str("session is not open"),
             Self::WrongDeviceId { got } => {
                 write!(
                     f,
-                    "неожиданный идентификатор устройства: 0x{got:02X} (ожидался 0x42)"
+                    "unexpected device identifier: 0x{got:02X} (expected 0x42)"
                 )
             }
             Self::ModeNotReached { wanted, raw_status } => {
-                write!(f, "режим {wanted} не достигнут, SYS_STS=0x{raw_status:02X}")
+                write!(f, "mode {wanted} not reached, SYS_STS=0x{raw_status:02X}")
             }
             Self::BypassNeedsFiveVoltVin { vin_uv } => {
                 write!(
                     f,
-                    "1:1 bypass запрещён при Vin {vin_uv} мкВ (нужно 4,2…8 В)"
+                    "1:1 bypass forbidden at Vin {vin_uv} µV (4.2-8 V needed)"
                 )
             }
             Self::Fault { mask, detail } => {
-                write!(f, "отказ (маска 0x{mask:02X}): {detail}")
+                write!(f, "fault (mask 0x{mask:02X}): {detail}")
             }
             Self::OutOfRange { field, requested } => {
-                write!(f, "значение вне диапазона: {field}={requested}")
+                write!(f, "value out of range: {field}={requested}")
             }
-            Self::WatchdogExpired => f.write_str("истёк сторожевой таймер"),
+            Self::WatchdogExpired => f.write_str("watchdog timer expired"),
         }
     }
 }
@@ -251,7 +251,7 @@ mod tests {
     fn display_mentions_details() {
         let error = PumpError::WrongDeviceId { got: 0x00 };
         assert!(error.to_string().contains("0x00"));
-        let bus = BusError::disconnected("нет ответа");
+        let bus = BusError::disconnected("no response");
         assert!(bus.to_string().contains("disconnected"));
     }
 

@@ -75,12 +75,12 @@ HKR, Parameters, IinLimitUa,      %REG_DWORD%, 2000000
 HKR, Parameters, VbatFloatUv,     %REG_DWORD%, 4470000
 HKR, Parameters, VacOvpUv,        %REG_DWORD%, 13000000
 ; protection thresholds (tenths of degC) and currents (uA):
-; Пороги обязаны лежать выше температуры покоя кристалла этой платы: живой
-; замер 19.09 на .657 — 43,5-46,1 °C в простое (насос в standby) и 50,8 °C под
-; нагрузкой 2:1. Прежние 430/480/550 были ниже покоя, срез срабатывал
-; постоянно, а возврат (порог минус гистерезис 3,0 °C) был недостижим: предел
-; входного тока уходил на IinFloorUa и оставался там навсегда (живой
-; IIN_CTRL = 10, то есть 500 мА, при профиле 2,7 А).
+; Thresholds must sit above the crystal idle temperature of this board: live
+; measurement on 19.09 at .657 - 43.5-46.1 degC idle (pump in standby) and
+; 50.8 degC under 2:1 load. The previous 430/480/550 were below idle, fold-back
+; tripped continuously, and the return (threshold minus 3.0 degC hysteresis)
+; was unreachable: the input current limit fell to IinFloorUa and stayed there
+; forever (live IIN_CTRL = 10, that is 500 mA, with a 2.7 A profile).
 HKR, Parameters, TempReduceDc,    %REG_DWORD%, 550
 HKR, Parameters, TempBypassDc,    %REG_DWORD%, 600
 HKR, Parameters, TempStopDc,      %REG_DWORD%, 650
@@ -93,9 +93,9 @@ HKR, Parameters, BusRetryCount,   %REG_DWORD%, 2
 HKR, Parameters, NtcAlarmCfg,     %REG_DWORD%, 226
 HKR, Parameters, WatchdogEnabled, %REG_DWORD%, 0
 ; 0 = pump protections as in the tablet Device Tree, 1 = loops enabled.
-; Под Windows батарею ведёт не SMB5, а сам насос: при 0 (как в DTS) напряжение
-; ограничивает только аппаратный VBAT_OV ~ V_FLOAT*1.02, и чистая установка
-; молча теряла петли V_FLOAT/IIN. Поэтому умолчание — 1.
+; Under Windows the pump itself, not SMB5, drives the battery: with 0 (as in the
+; DTS) only the hardware VBAT_OV ~ V_FLOAT*1.02 limits the voltage, and a clean
+; installation silently lost the V_FLOAT/IIN loops. That is why the default is 1.
 HKR, Parameters, ProtectionProfile, %REG_DWORD%, 1
 
 ; ================= strings =================

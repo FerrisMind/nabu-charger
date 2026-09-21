@@ -1,52 +1,52 @@
-# Базовая производительность
+# Baseline performance
 
-Измерено `criterion` на этой машине (AMD Ryzen 7 3700X, Windows 11,
-Rust 1.97.0, профиль `bench`). Служит базовой линией для сравнения будущих версий.
+Measured with `criterion` on this machine (AMD Ryzen 7 3700X, Windows 11,
+Rust 1.97.0, `bench` profile). Serves as the baseline for comparing future versions.
 
-Команды:
+Commands:
 
 ```powershell
 cargo bench -p host --bench core_state_machine  -- --warm-up-time 0.5 --measurement-time 1.5 --sample-size 20 --noplot
 cargo bench -p host --bench transport_throughput -- --warm-up-time 0.5 --measurement-time 1.5 --sample-size 15 --noplot
 ```
 
-Сырые выводы: `artifacts/bench-core.txt`, `artifacts/bench-transport.txt`.
+Raw outputs: `artifacts/bench-core.txt`, `artifacts/bench-transport.txt`.
 
-## Логика ядра
+## Core logic
 
-| Сценарий | Время | Что означает |
+| Scenario | Time | What it means |
 |---|---|---|
-| `session/open` | 232 нс | проверка связи с периферией (сброс + чтение) |
-| `session/detect_hvdcp3` | 625 нс | один шаг детекции с готовым APSD |
-| `session/full/sdp` | 836 нс | полный цикл: открытие → детекция → политика |
-| `session/full/dcp` | 791 нс | то же для порта зарядки |
-| `session/full/hvdcp2` | 931 нс | то же для QC2 |
-| `session/full/hvdcp3` | 902 нс | то же для QC3 |
-| `session/full/hvdcp3p5` | 864 нс | то же для QC3.5 |
-| `decode/apsd_result` | 305 пс | разбор одного результата детекции |
+| `session/open` | 232 ns | check of communication with the peripheral (reset + read) |
+| `session/detect_hvdcp3` | 625 ns | one detection step with a ready APSD |
+| `session/full/sdp` | 836 ns | full cycle: open -> detection -> policy |
+| `session/full/dcp` | 791 ns | the same for a charging port |
+| `session/full/hvdcp2` | 931 ns | the same for QC2 |
+| `session/full/hvdcp3` | 902 ns | the same for QC3 |
+| `session/full/hvdcp3p5` | 864 ns | the same for QC3.5 |
+| `decode/apsd_result` | 305 ps | parsing of one detection result |
 
-Полный цикл сессии укладывается в **~0.9 мкс** без обращений к железу: это чистая
-работа логики (разбор, политика, журнал, проверки). В драйвере ядра к этому
-добавляется время транзакции SPMI, которое определяется шиной, а не нашим кодом.
+A full session cycle fits into **~0.9 us** with no hardware accesses: this is pure
+logic work (parsing, policy, journal, checks). In the kernel driver the SPMI
+transaction time is added to this, which is determined by the bus, not by our code.
 
-## Транспорт
+## Transport
 
-| Транспорт, операция | Время на 512 операций | Пропускная способность |
+| Transport, operation | Time per 512 operations | Throughput |
 |---|---|---|
-| мок, чтение | 3.15 мкс | 163 млн операций/с |
-| мок, запись | 3.20 мкс | 160 млн операций/с |
-| TCP (localhost, симулятор), чтение 64 операций | 8.38 мс | 7 640 операций/с |
+| mock, read | 3.15 us | 163 million operations/s |
+| mock, write | 3.20 us | 160 million operations/s |
+| TCP (localhost, simulator), read of 64 operations | 8.38 ms | 7 640 operations/s |
 
-Мок показывает верхнюю границу полезной работы; TCP к симулятору — нижнюю
-границу для сети (≈131 мкс на round-trip). Реальная шина SPMI ожидается в
-диапазоне между ними: одна транзакция SPMI — это единицы микросекунд.
+The mock shows the upper bound of useful work; TCP to the simulator is the lower
+bound for the network (~131 us per round-trip). The real SPMI bus is expected in the
+range between them: one SPMI transaction is a few microseconds.
 
-## Как сравнивать с будущими версиями
+## How to compare with future versions
 
-1. Прогнать те же команды.
-2. Сравнить с таблицами выше: регрессией считается рост более чем на 20 % на
-   любом сценарии при неизменном железе и toolchain.
-3. Если регрессия подтверждена — смотреть `target/criterion/*/report/index.html`.
+1. Run the same commands.
+2. Compare with the tables above: a regression is an increase of more than 20% on
+   any scenario with unchanged hardware and toolchain.
+3. If the regression is confirmed, look at `target/criterion/*/report/index.html`.
 
-Замеры не являются частью CI: они зависят от машины. В CI проверяется только то,
-что бенчмарки собираются и запускаются.
+Measurements are not part of CI: they depend on the machine. CI only checks that the
+benchmarks build and run.

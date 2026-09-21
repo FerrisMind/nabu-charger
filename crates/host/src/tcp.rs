@@ -1,22 +1,22 @@
-//! Реальный транспорт по TCP: стенд с железом, эмулятор или удалённая лаборатория.
+//! Real TCP transport: a hardware bench, an emulator or a remote lab.
 //!
-//! Протокол намеренно простой и текстовый — его легко повторить на любой стороне:
+//! The protocol is deliberately simple and textual, easy to reproduce on either side:
 //!
-//! | Запрос | Ответ | Смысл |
+//! | Request | Response | Meaning |
 //! |---|---|---|
-//! | `R <addr:04X>` | `V <value:02X>` | чтение регистра |
-//! | `W <addr:04X> <value:02X>` | `OK` | запись регистра |
-//! | `RESET` | `OK` | сброс канала |
-//! | любой | `ERR <code>` | отказ устройства |
+//! | `R <addr:04X>` | `V <value:02X>` | register read |
+//! | `W <addr:04X> <value:02X>` | `OK` | register write |
+//! | `RESET` | `OK` | channel reset |
+//! | any | `ERR <code>` | device failure |
 //!
-//! Строки завершаются `\n`. Адреса и значения — в шестнадцатеричном виде без префикса.
+//! Lines are terminated with `\n`. Addresses and values are hexadecimal without a prefix.
 
 use charger_core::{ChargerTransport, TransportError, TransportErrorKind};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
-/// Транспорт к устройству по TCP.
+/// Transport to the device over TCP.
 #[derive(Debug)]
 pub struct TcpTransport {
     reader: BufReader<TcpStream>,
@@ -25,25 +25,25 @@ pub struct TcpTransport {
 }
 
 impl TcpTransport {
-    /// Подключается к устройству.
+    /// Connects to the device.
     ///
     /// # Errors
     ///
-    /// [`TransportError`] с категорией [`TransportErrorKind::Io`], если адрес
-    /// недоступен или соединение не устанавливается за `timeout`.
+    /// [`TransportError`] with kind [`TransportErrorKind::Io`] if the address is
+    /// unreachable or the connection is not established within `timeout`.
     pub fn connect(addr: impl ToSocketAddrs, timeout: Duration) -> Result<Self, TransportError> {
         let writer = TcpStream::connect(addr)
-            .map_err(|_| TransportError::io("не удалось подключиться к устройству"))?;
+            .map_err(|_| TransportError::io("failed to connect to the device"))?;
         writer
             .set_read_timeout(Some(timeout))
-            .map_err(|_| TransportError::io("не удалось задать таймаут чтения"))?;
+            .map_err(|_| TransportError::io("failed to set the read timeout"))?;
         writer
             .set_write_timeout(Some(timeout))
-            .map_err(|_| TransportError::io("не удалось задать таймаут записи"))?;
+            .map_err(|_| TransportError::io("failed to set the write timeout"))?;
         let reader = BufReader::new(
             writer
                 .try_clone()
-                .map_err(|_| TransportError::io("не удалось разделить поток"))?,
+                .map_err(|_| TransportError::io("failed to clone the stream"))?,
         );
         Ok(Self {
             reader,
@@ -66,7 +66,7 @@ impl TcpTransport {
             .map_err(|_| classify_read_error())?;
         if read == 0 {
             return Err(TransportError::disconnected(
-                "устройство закрыло соединение",
+                "the device closed the connection",
             ));
         }
         Ok(self.command.trim().to_owned())
@@ -77,7 +77,7 @@ fn classify_read_error() -> TransportError {
     TransportError::new(
         TransportErrorKind::Timeout,
         std::io::ErrorKind::TimedOut as i32,
-        "нет ответа от устройства",
+        "no response from the device",
     )
 }
 
@@ -85,12 +85,12 @@ fn classify_write_error() -> TransportError {
     TransportError::new(
         TransportErrorKind::Io,
         std::io::ErrorKind::BrokenPipe as i32,
-        "не удалось отправить запрос",
+        "failed to send the request",
     )
 }
 
 fn parse_hex(text: &str) -> Result<u16, TransportError> {
-    u16::from_str_radix(text, 16).map_err(|_| TransportError::protocol("неверный ответ устройства"))
+    u16::from_str_radix(text, 16).map_err(|_| TransportError::protocol("invalid device response"))
 }
 
 impl ChargerTransport for TcpTransport {
@@ -102,10 +102,10 @@ impl ChargerTransport for TcpTransport {
             (Some("V"), Some(value)) => {
                 let parsed = parse_hex(value)?;
                 u8::try_from(parsed)
-                    .map_err(|_| TransportError::protocol("значение вне диапазона байта"))
+                    .map_err(|_| TransportError::protocol("value out of byte range"))
             }
-            (Some("ERR"), _) => Err(TransportError::io("устройство вернуло ошибку чтения")),
-            _ => Err(TransportError::protocol("неожиданный ответ на чтение")),
+            (Some("ERR"), _) => Err(TransportError::io("the device returned a read error")),
+            _ => Err(TransportError::protocol("unexpected response to a read")),
         }
     }
 
@@ -115,9 +115,9 @@ impl ChargerTransport for TcpTransport {
         match response.as_str() {
             "OK" => Ok(()),
             other if other.starts_with("ERR") => {
-                Err(TransportError::io("устройство вернуло ошибку записи"))
+                Err(TransportError::io("the device returned a write error"))
             }
-            _ => Err(TransportError::protocol("неожиданный ответ на запись")),
+            _ => Err(TransportError::protocol("unexpected response to a write")),
         }
     }
 
@@ -125,7 +125,9 @@ impl ChargerTransport for TcpTransport {
         let response = self.transact("RESET")?;
         match response.as_str() {
             "OK" => Ok(()),
-            _ => Err(TransportError::protocol("устройство не подтвердило сброс")),
+            _ => Err(TransportError::protocol(
+                "the device did not acknowledge the reset",
+            )),
         }
     }
 

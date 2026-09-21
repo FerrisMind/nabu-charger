@@ -37,13 +37,12 @@ pub const REG_APSD_RESULT: u16 = 0x1308;
 pub const REG_QC_CHANGE_STATUS: u16 = 0x1309;
 /// `QC_PULSE_COUNT_STATUS` (USBIN_BASE + 0x0A) — HW pulse counter.
 ///
-/// **В заголовке smb5 регистра нет** (`smb5-reg.h` его не объявляет; адрес и
-/// маска `QC_PULSE_COUNT_MASK` есть только в `smb-reg.h:472-475`, и читает его
-/// единственный драйвер — `drivers_power_supply_qcom_smb-lib.c:805-830` — под
-/// `PMI8998_SUBTYPE`/`PM660_SUBTYPE`). Читается **только как диагностика**
-/// (`SuQcPulseHw`): ни одно решение по нему не принимается, счёт импульсов ведёт
-/// наш собственный `state.pulse_cnt`. Значение в отчёте не считать числом
-/// импульсов PM8150B.
+/// **The register does not exist in the smb5 header** (`smb5-reg.h` does not declare
+/// it; the address and the `QC_PULSE_COUNT_MASK` mask are only in `smb-reg.h:472-475`,
+/// and the only driver that reads it is `drivers_power_supply_qcom_smb-lib.c:805-830`,
+/// under `PMI8998_SUBTYPE`/`PM660_SUBTYPE`). It is read **for diagnostics only**
+/// (`SuQcPulseHw`): no decision is made from it, the pulse count is kept by our own
+/// `state.pulse_cnt`. Do not treat the value in the report as the PM8150B pulse count.
 pub const REG_QC_PULSE_COUNT: u16 = 0x130A;
 /// Qualcomm peri `INT_LATCHED_CLR` (USBIN_BASE + 0x14).
 pub const REG_INT_LATCHED_CLR: u16 = 0x1314;
@@ -117,18 +116,18 @@ pub const USBIN_ADAPTER_ALLOW_5V_TO_12V: u8 = 0x0C;
 pub const BIT_QC_9V: u8 = 1 << 1;
 /// `QC_CONTINUOUS_BIT` in `QC_CHANGE_STATUS`.
 ///
-/// **Имя из прошлого поколения.** Бит объявлен только в `smb-reg.h:467`
-/// (`QC_CONTINUOUS_BIT`) и в `smb-reg.h:466` (`QC_5V_TO_9V_REASON_BIT`); в
-/// `smb5-reg.h` блок `QC_CHANGE_STATUS` (`:229-233`) описывает лишь
-/// `QC_12V BIT(2)`, `QC_9V BIT(1)`, `QC_5V BIT(0)` и `QC_2P0_STATUS_MASK`, а
-/// регистра `0x130A` там нет вовсе. Штамп PM8150B идёт по `smb5-reg.h`, поэтому
-/// бит 3 для нас недокументирован. Он остаётся входом маршрутизации осознанно:
-/// импульсный путь для сомнительного результата безопаснее DCP-ветки (импульсы
-/// поднимают реальный QC-блок, а DCP их игнорирует и остаётся на 5 В — решает
-/// живой замер `SuQcPre`/`SuQcChgSt`, а не догадка). Разбирать это как «QC3
-/// подтверждён» нельзя: только как «возможно QC».
+/// **A name from the previous generation.** The bit is declared only in
+/// `smb-reg.h:467` (`QC_CONTINUOUS_BIT`) and `smb-reg.h:466`
+/// (`QC_5V_TO_9V_REASON_BIT`); in `smb5-reg.h` the `QC_CHANGE_STATUS` block
+/// (`:229-233`) describes only `QC_12V BIT(2)`, `QC_9V BIT(1)`, `QC_5V BIT(0)` and
+/// `QC_2P0_STATUS_MASK`, and the `0x130A` register is not there at all. The PM8150B
+/// stamp follows `smb5-reg.h`, so bit 3 is undocumented for us. It stays a routing
+/// input deliberately: the pulse path is safer for a doubtful result than the DCP
+/// branch (pulses raise a real QC brick, while a DCP ignores them and stays at 5 V -
+/// the live `SuQcPre`/`SuQcChgSt` measurement decides, not a guess). It must not be
+/// read as "QC3 confirmed": only as "possibly QC".
 pub const BIT_QC_CONTINUOUS: u8 = 1 << 3;
-/// `QC_5V_TO_9V_REASON_BIT`. См. [`BIT_QC_CONTINUOUS`] — тот же источник имён.
+/// `QC_5V_TO_9V_REASON_BIT`. See [`BIT_QC_CONTINUOUS`] - same source of the names.
 pub const BIT_QC_5V_TO_9V_REASON: u8 = 1 << 4;
 
 /// Raw `USBIN_CURRENT_LIMIT_CFG` for 500 mA (step 50 mA → code 10).
@@ -187,7 +186,7 @@ pub const QC_STATUS_SETTLE_MS: u32 = 200;
 /// is host-tested in `ln8000::hvdcp_policy`; only the poll cadence lives here.
 pub const FORCE9V_POLL_MS: u32 = 50;
 
-/// Сколько подряд отсчётов выше ворот 2:1 засчитываются как установившийся 9 В.
+/// How many consecutive samples above the 2:1 gate count as a settled 9 V.
 pub const FORCE9V_CONFIRM_N: u32 = 2;
 
 /// QC3.0 step size (µV), `HVDCP3_STEP_UV`.
@@ -247,9 +246,9 @@ pub const WINDOW_NUDGE_MS: u64 = 10_000;
 /// must also require the *window peak* to be at the floor, not just one sample.
 pub const IIN_DEAD_FLOOR_UA: u32 = 60_000;
 
-// Инварианты окна QC3: цель обязана проходить собственные ворота 2:1
-// (`2*Vbat + 250 мВ`) на всей достижимой ёмкости банки и достигаться за
-// разрешённое число INC-импульсов.
+// QC3 window invariants: the target must pass the 2:1 admission gate
+// (`2*Vbat + 250 mV`) across the whole reachable capacity of the pack and must be
+// reachable within the allowed number of INC pulses.
 const _: () = assert!(MAX_BOOST_INC <= MAX_PULSE_CNT);
 const _: () = assert!(
     PUMP_VIN_TARGET_MIN_UV as u32 >= ln8000::encoding::min_vin_for_switching_uv(4_500_000)
@@ -350,9 +349,9 @@ pub struct HvdcpState {
     /// Vendor writes `FORCE_9V` **once** (`smb5-lib.c:8376`) and never touches
     /// the register again for that adapter: the level is held by the bit, not by
     /// pulses. QC2 has no continuous mode, so an INC/DEC here is both useless
-    /// and — with a raw write — fatal to the latch. Live 19.09 on MDY-11-EP:
-    /// peak 8,224 В, then the post-path pulse wrote `0x01`, the brick folded
-    /// back to ~4,9 В and the landing classified it as a 5 V source.
+    /// and - with a raw write - fatal to the latch. Live 19.09 on MDY-11-EP:
+    /// peak 8.224 V, then the post-path pulse wrote `0x01`, the brick folded back
+    /// to ~4.9 V and the landing classified it as a 5 V source.
     pub force9v_latched: bool,
 }
 
@@ -823,12 +822,12 @@ fn pulse_dec_gap(
 /// other bit of the register survives the pulse. A raw write here cleared
 /// `FORCE_9V`: one INC after the QC2 rise dropped the brick back to 5 V.
 /// On a latched bus the pulse is skipped entirely — QC2 has no continuous mode.
-/// Возвращает `true`, если импульс действительно ушёл в чип.
+/// Returns `true` if the pulse actually went out to the chip.
 ///
-/// Признак нужен вызывающему: под защёлкой счётчик импульсов обязан стоять
-/// вместе с импульсом. Иначе `estimated_vbus_uv` публикует уровень, которого на
-/// шине нет (живой замер 19.09 12:02: `SuVbusEst` 5,4 В при измеренных 8,8 В —
-/// счётчик считал импульсы, которые `pulse_cmd_bit` пропустил).
+/// The caller needs this flag: under the latch the pulse counter must stand still
+/// together with the pulse. Otherwise `estimated_vbus_uv` publishes a level that is
+/// not on the bus (live measurement on 19.09 12:02: `SuVbusEst` 5.4 V against
+/// measured 8.8 V - the counter counted pulses that `pulse_cmd_bit` had skipped).
 fn pulse_cmd_bit(bus: &mut Bus<'_>, state: &HvdcpState, bit: u8) -> Result<bool, HvdcpError> {
     if state.force9v_latched {
         return Ok(false);
@@ -875,9 +874,9 @@ fn publish_marks(device: WDFDEVICE, state: &HvdcpState, err: Option<HvdcpError>)
     mark(device, "SuPulseCnt", state.pulse_cnt);
     mark(device, "SuApsdResult", u32::from(state.apsd_result));
     mark(device, "SuVbusEst", estimated_vbus_uv(state.pulse_cnt));
-    // Защёлка `FORCE_9V` — состояние, которое переживает такт и подавляет
-    // импульсный путь. Без марки «шина стоит» неотличимо от «импульсы уходят
-    // впустую».
+    // The `FORCE_9V` latch is state that outlives the tick and suppresses the pulse
+    // path. Without the mark, "the bus stands still" is indistinguishable from
+    // "pulses go out for nothing".
     mark(device, "QcLatch", u32::from(state.force9v_latched));
     match err {
         Some(e) => mark(device, "HvdcpErr", e.code() as u32),
@@ -895,7 +894,7 @@ fn publish_marks(device: WDFDEVICE, state: &HvdcpState, err: Option<HvdcpError>)
 /// The gate must be met on [`FORCE9V_CONFIRM_N`] consecutive samples: a QC3 brick
 /// answers the legacy QC2 request with a spike and drops back, and a single
 /// sample above the gate used to end the wait on a level that never existed
-/// (live 19.09 11:07: `SuDcp9vVin` = 8,224 В, landing read ~4,8 В).
+/// (live 19.09 11:07: `SuDcp9vVin` = 8.224 V, landing read ~4.8 V).
 fn wait_force9v_rise(read_vin: &mut impl FnMut() -> i32) -> (i32, i32) {
     let mut waited = 0_u32;
     let mut deadline = FORCE9V_SETTLE_MS;
@@ -1254,25 +1253,25 @@ fn negotiate_on_bus(
             let _ = attempt_qc35_authenticate(device, bus, state, read_vin);
 
             state.phase = HvdcpPhase::Qc3Pulse;
-            // Счётчик импульсов общий на весь подъём и **не обнуляется** после
-            // подготовки QC3.5: подготовка уже подняла адаптер в окно 5,5–6,4 В
-            // своими INC, и если начать отсчёт заново, реальных импульсов
-            // окажется больше потолка `MAX_PULSE_CNT` (23 × 200 мВ от 5 В — это
-            // 9,6 В), а оценка `estimated_vbus_uv` будет врать вниз.
+            // The pulse counter is shared across the whole raise and is **not reset**
+            // after the QC3.5 prep: the prep already lifted the adapter into the
+            // 5.5-6.4 V window with its own INC, and starting the count over would
+            // make the real pulse count exceed the `MAX_PULSE_CNT` ceiling (23 x 200 mV
+            // from 5 V is 9.6 V), while `estimated_vbus_uv` would read too low.
             publish_marks(device, state, None);
             let want = pulses_toward_target(vbat_uv);
             mark(device, "HvdcpTarget", target_vbus_uv(vbat_uv));
             mark(device, "HvdcpWantPulses", want);
-            // Подъём замкнут по АЦП насоса, как вендорский raise-loop читает
-            // результат на каждом шаге: импульс → чтение Vin → стоп на цели.
-            // Слепая пачка опасна ровно тем, что после подготовки база уже не
-            // 5 В, и 23 импульса от неё дают ~11 В — выше `PUMP_VIN_TRIM_UV`,
-            // где живой кремний защёлкивает `VIN_OV` и 2:1 после этого не
-            // включается (проверено в комментарии `trim_vin_for_pump`).
-            // Недобор до пола окна добирает `boost_vin_for_pump` после
-            // согласования, поэтому останавливаться рано безопасно.
-            // Стоп — по `2*Vbat`-цели, а не по фиксированным 9,5 В: на полной
-            // банке 9,5 В лежат ВЫШЕ полосы переноса (живой замер 18.09).
+            // The raise is closed-loop on the pump ADC, the way the vendor raise-loop
+            // reads the result at every step: pulse -> read Vin -> stop at the target.
+            // A blind burst is dangerous precisely because after the prep the baseline
+            // is no longer 5 V, and 23 pulses from it give ~11 V - above
+            // `PUMP_VIN_TRIM_UV`, where live silicon latches `VIN_OV` and 2:1 cannot
+            // be engaged afterwards (verified in the `trim_vin_for_pump` comment).
+            // Any shortfall against the window floor is made up by
+            // `boost_vin_for_pump` after the negotiate, so stopping early is safe.
+            // The stop is on the `2*Vbat` target, not on a fixed 9.5 V: with a full
+            // pack 9.5 V sits ABOVE the transfer band (live measurement on 18.09).
             let target_now = target_vbus_uv(vbat_uv) as i32;
             let ceiling_now = trim_target_uv(vbat_uv);
             let mut vin_now = read_vin();
@@ -1293,8 +1292,8 @@ fn negotiate_on_bus(
                 mark(device, "SuPulseCnt", state.pulse_cnt);
                 vin_now = read_vin();
                 if vin_now > ceiling_now {
-                    // Защитный потолок: выше полосы переноса импульсы только
-                    // защёлкивают VIN_OV и ничего не заряжают.
+                    // Safety ceiling: above the transfer band pulses only latch
+                    // VIN_OV and charge nothing.
                     break;
                 }
             }
@@ -1355,12 +1354,11 @@ fn negotiate_on_bus(
                     "SuDcpPeakVin",
                     u32::try_from(vin_peak.max(0)).unwrap_or(0),
                 );
-                // Решение — по УДЕРЖАНИЮ, а не по пику: `wait_force9v_rise`
-                // останавливается на первом же отсчёте выше ворот, а шина при
-                // этом может ходить 4,6 ↔ 8,2 В (живой замер 19.09 11:07:
-                // `SuDcp9vVin` = 8,224 В, а посадка через такт прочла ~4,8 В).
-                // Уровень считается установленным, только если 8,0 В держатся
-                // два чтения подряд.
+                // The decision is on the HOLD, not on the peak: `wait_force9v_rise`
+                // stops at the first sample above the gate, while the bus can swing
+                // 4.6 <-> 8.2 V (live 19.09 11:07: `SuDcp9vVin` = 8.224 V, yet the
+                // landing read ~4.8 V a tick later). The level counts as settled only
+                // if 8.0 V hold for two consecutive reads.
                 let mut vin_after = read_vin();
                 let mut hold = 0_u32;
                 for _ in 0..4 {
@@ -1376,13 +1374,13 @@ fn negotiate_on_bus(
                     vin_after = read_vin();
                 }
                 mark(device, "SuDcpHoldN", hold);
-                // FORCE_9V — это **legacy-команда QC2**. QC3-блок отвечает на
-                // неё всплеском и возвращается к своему шагу continuous-режима;
-                // тот же MDY-11-EP держал 7,952 В тридцать секунд подряд на
-                // импульсах QC3 (замер 10:46). Поэтому неустоявшийся уровень
-                // ведём родным протоколом: база 5 В (`smblib_force_vbus_voltage
-                // (FORCE_5V_BIT)` в начале вендорского `raise_qc3_vbus_work`),
-                // затем шаги INC с чтением результата на каждом шаге.
+                // FORCE_9V is a **legacy QC2 command**. A QC3 brick answers it with a
+                // spike and returns to its own continuous-mode step; the same MDY-11-EP
+                // held 7.952 V for thirty seconds straight on QC3 pulses (measurement
+                // 10:46). So an unsettled level is driven with the native protocol:
+                // 5 V baseline (`smblib_force_vbus_voltage(FORCE_5V_BIT)` at the head
+                // of the vendor `raise_qc3_vbus_work`), then INC steps with the result
+                // read at every step.
                 if hold < 2 {
                     mark(device, "SuDcpNoElevate", 1);
                     safe_force_5v(bus, state);
@@ -1407,8 +1405,8 @@ fn negotiate_on_bus(
                         u32::try_from(vin_now.max(0)).unwrap_or(0),
                     );
                     if vin_now < FORCE9V_RISE_UV {
-                        // Блок не ответил и на импульсы: это не QC-адаптер,
-                        // откат в 5 В обход с вендорскими 2 А.
+                        // The brick did not answer the pulses either: this is not a QC
+                        // adapter, retreat to the 5 V bypass with the vendor's 2 A.
                         safe_force_5v(bus, state);
                         match ensure_icl_at_least(bus, state, ICL_RAW_DCP_2A) {
                             Ok(icl) => mark(device, "SuDcpIcl", u32::from(icl)),
@@ -1692,9 +1690,9 @@ pub unsafe fn nudge_vin_into_window(
     if vin_uv <= 0 || vbat_uv == 0 {
         return 0;
     }
-    // Заложенный `FORCE_9V` идёт мимо полосы: QC2 отдаёт фиксированный уровень
-    // и continuous-режима не имеет, а импульс снял бы защёлку (см.
-    // `pulse_cmd_bit`). Решение о режиме принимает вызывающий по живому ADC.
+    // A latched `FORCE_9V` runs outside the band: QC2 gives a fixed level and has
+    // no continuous mode, and a pulse would drop the latch (see `pulse_cmd_bit`).
+    // The caller decides the mode from the live ADC.
     if state.force9v_latched {
         return 0;
     }
@@ -1827,22 +1825,22 @@ mod tests {
 
     #[test]
     fn target_tracks_the_live_transfer_band() {
-        // Цель — середина полосы переноса `[2*Vbat+200, 2*Vbat+400]` мВ, и она
-        // едет за банкой вместо фиксированных 9,5 В, которые на полной банке
-        // лежат выше полосы (живой замер 18.09: 39 мА на 9,744 и 9,888 В).
+        // The target is the centre of the transfer band `[2*Vbat+200, 2*Vbat+400]` mV,
+        // and it rides with the pack instead of the fixed 9.5 V, which with a full
+        // pack sits above the band (live measurement on 18.09: 39 mA at 9.744 and 9.888 V).
         assert_eq!(target_vbus_uv(4_000_000), 8_300_000);
         assert_eq!(target_vbus_uv(4_420_000), 9_140_000);
         assert_eq!(target_vbus_uv(4_500_000), 9_300_000);
-        // Низкая банка: цель поднимается до абсолютного пола допуска 2:1.
+        // Low pack: the target is raised to the absolute 2:1 admission floor.
         assert_eq!(target_vbus_uv(3_000_000), PUMP_VIN_TARGET_ABS_MIN_UV);
-        // Банка не прочитана — вендорский пол 9,5 В.
+        // Pack not read - the vendor's 9.5 V floor.
         assert_eq!(target_vbus_uv(0), PUMP_VIN_TARGET_MIN_UV as u32);
     }
 
     #[test]
     fn target_always_admits_switching() {
-        // Инвариант, который нарушала прежняя форма `2*Vbat + 200 мВ`:
-        // цель обязана проходить собственные ворота 2:1 (`2*Vbat + 250 мВ`).
+        // The invariant the old `2*Vbat + 200 mV` form violated: the target must pass
+        // the 2:1 admission gate (`2*Vbat + 250 mV`).
         for vbat in (3_000_000..=4_500_000).step_by(50_000) {
             let vin = i32::try_from(target_vbus_uv(vbat)).unwrap_or(i32::MIN);
             assert_eq!(
@@ -1860,7 +1858,7 @@ mod tests {
         assert!(MAX_BOOST_INC <= MAX_PULSE_CNT);
         assert_eq!(MAX_PULSE_CNT, 23); // cp_qc30.h:81 MAX_PLUSE_COUNT_ALLOWED
         assert!(estimated_vbus_uv(MAX_PULSE_CNT) >= PUMP_VIN_TARGET_MIN_UV as u32);
-        // Пулевой бюджет теперь зависит от банки: полная банка дешевле.
+        // The pulse budget now depends on the pack: a full pack is cheaper.
         assert_eq!(pulses_toward_target(4_000_000), 17);
         assert!(pulses_toward_target(4_500_000) <= MAX_PULSE_CNT);
     }
@@ -1922,7 +1920,7 @@ mod tests {
         assert!(PUMP_VIN_TARGET_CEIL_UV < PUMP_VIN_TRIM_UV as u32);
         assert!(window_floor_uv(4_420_000) < trim_target_uv(4_420_000));
         assert!(trim_target_uv(4_420_000) as u32 <= PUMP_VIN_TRIM_UV as u32);
-        // Без прочитанной банки границы не срываются в ноль.
+        // Without a pack reading the bounds do not collapse to zero.
         assert_eq!(window_floor_uv(0), PUMP_VIN_TARGET_MIN_UV);
         assert_eq!(trim_target_uv(0), PUMP_VIN_TARGET_MIN_UV);
     }

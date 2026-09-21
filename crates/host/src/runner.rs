@@ -1,4 +1,4 @@
-//! Блокирующий цикл сессии: превращает неблокирующие шаги ядра в сценарий.
+//! Blocking session loop: turns the non-blocking core steps into a scenario.
 
 use charger_core::{
     AdapterType, ChargePlan, Charger, ChargerError, ChargerTransport, Clock, Detection, Journal,
@@ -6,12 +6,12 @@ use charger_core::{
 };
 use std::time::Duration;
 
-/// Параметры прогона сессии.
+/// Session run options.
 #[derive(Debug, Clone, Copy)]
 pub struct RunOptions {
-    /// Пауза между шагами ожидания детекции.
+    /// Pause between detection polling steps.
     pub poll_interval: Duration,
-    /// Предохранитель: сколько шагов допускается до отказа.
+    /// Fuse: how many steps are allowed before giving up.
     pub max_steps: u32,
 }
 
@@ -24,27 +24,27 @@ impl Default for RunOptions {
     }
 }
 
-/// Итог сессии.
+/// Session outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionOutcome {
-    /// Распознанный адаптер.
+    /// Recognized adapter.
     pub adapter: AdapterType,
-    /// Применённый план.
+    /// Applied plan.
     pub plan: ChargePlan,
-    /// Состояние драйвера в конце.
+    /// Driver state at the end.
     pub state: State,
-    /// Счётчики.
+    /// Counters.
     pub stats: Stats,
 }
 
-/// Ждёт завершения детекции и применяет политику.
+/// Waits for detection to complete and applies the policy.
 ///
-/// `on_adapter` вызывается в момент распознавания адаптера — удобно, чтобы
-/// напечатать строку отчёта или отправить уведомление.
+/// `on_adapter` is called the moment the adapter is recognized, which is handy
+/// for printing a report line or sending a notification.
 ///
 /// # Errors
 ///
-/// Любая ошибка ядра пробрасывается наружу; таймаут предохранителя даёт
+/// Any core error is propagated out; a fuse timeout yields
 /// [`ChargerError::DetectionTimeout`].
 pub fn run_until_ready<T, C, J, F>(
     charger: &mut Charger<'_, T, C, J>,
@@ -82,11 +82,11 @@ where
     }
 }
 
-/// Опрашивает состояние устройства и переприменяет политику при смене адаптера.
+/// Polls the device state and reapplies the policy when the adapter changes.
 ///
 /// # Errors
 ///
-/// Пробрасывает ошибки ядра; при смене адаптера возвращает новый план.
+/// Propagates core errors; on an adapter change returns the new plan.
 pub fn monitor_cycle<T, C, J>(
     charger: &mut Charger<'_, T, C, J>,
 ) -> Result<Option<ChargePlan>, ChargerError>

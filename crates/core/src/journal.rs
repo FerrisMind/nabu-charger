@@ -1,29 +1,29 @@
-//! Структурированный журнал операций.
+//! Structured operation journal.
 //!
-//! Каждое обращение к устройству и каждое решение драйвера попадают в журнал:
-//! с порядковым номером, меткой времени, идентификатором запроса и результатом.
-//! Хост-уровень превращает эти записи в JSON Lines и в события `tracing`.
+//! Every access to the device and every driver decision goes into the journal:
+//! with a sequence number, a timestamp, a request id and the outcome.
+//! The host layer turns these records into JSON Lines and into `tracing` events.
 //!
-//! Все текстовые поля — статические строки, поэтому записи копируемы, не требуют
-//! аллокаций и работают в `no_std`.
+//! All text fields are static strings, so records are copyable, need no allocations
+//! and work in `no_std`.
 
-/// Уровень важности записи.
+/// Record severity level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Level {
-    /// Подробности, нужные только при отладке.
+    /// Details needed only when debugging.
     Trace,
-    /// Диагностические сведения.
+    /// Diagnostic information.
     Debug,
-    /// Нормальный ход работы.
+    /// Normal operation.
     Info,
-    /// Нештатная ситуация, работа продолжается.
+    /// Abnormal situation, operation continues.
     Warn,
-    /// Операция не выполнена.
+    /// Operation not completed.
     Error,
 }
 
 impl Level {
-    /// Имя уровня для сериализации.
+    /// Level name for serialization.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -42,96 +42,96 @@ impl core::fmt::Display for Level {
     }
 }
 
-/// Что именно произошло.
+/// What exactly happened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum EventKind {
-    /// Открытие сессии: проверка связи с периферией.
+    /// Session open: link check with the peripheral.
     Open {
-        /// Имя транспорта.
+        /// Transport name.
         transport: &'static str,
-        /// Удалось ли открыть.
+        /// Whether the open succeeded.
         ok: bool,
     },
-    /// Закрытие сессии.
+    /// Session close.
     Close {
-        /// Удалось ли вернуть безопасный лимит тока.
+        /// Whether the safe current limit was restored.
         ok: bool,
     },
-    /// Чтение регистра.
+    /// Register read.
     Read {
-        /// Адрес регистра.
+        /// Register address.
         addr: u16,
-        /// Прочитанное значение.
+        /// Value read.
         value: u8,
-        /// Длительность операции в микросекундах.
+        /// Operation duration in microseconds.
         elapsed_us: u64,
     },
-    /// Запись регистра.
+    /// Register write.
     Write {
-        /// Адрес регистра.
+        /// Register address.
         addr: u16,
-        /// Записанное значение.
+        /// Value written.
         value: u8,
-        /// Длительность операции в микросекундах.
+        /// Operation duration in microseconds.
         elapsed_us: u64,
     },
-    /// Результат детекции адаптера.
+    /// Adapter detection result.
     Detect {
-        /// Распознанный тип.
+        /// Identified type.
         adapter: &'static str,
-        /// Сырое значение `APSD_STATUS`.
+        /// Raw value of `APSD_STATUS`.
         raw_status: u8,
-        /// Сырое значение `APSD_RESULT_STATUS`.
+        /// Raw value of `APSD_RESULT_STATUS`.
         raw_result: u8,
-        /// Сколько миллисекунд шла детекция.
+        /// How many milliseconds detection took.
         waited_ms: u64,
     },
-    /// Применённая политика тока.
+    /// Applied current policy.
     Policy {
-        /// Тип адаптера.
+        /// Adapter type.
         adapter: &'static str,
-        /// Целевой лимит тока в микроамперax.
+        /// Target current limit in microamperes.
         icl_ua: u32,
-        /// Код, записанный в регистр.
+        /// Code written to the register.
         icl_raw: u8,
-        /// Напряжение QC2, если запрашивалось.
+        /// QC2 voltage, if requested.
         qc2_voltage: Option<&'static str>,
-        /// Допустим ли charge pump.
+        /// Whether the charge pump is eligible.
         pump_eligible: bool,
     },
-    /// Повторная попытка.
+    /// Retry.
     Retry {
-        /// Что повторяем.
+        /// What is being retried.
         op: &'static str,
-        /// Номер попытки.
+        /// Attempt number.
         attempt: u8,
-        /// Причина.
+        /// Reason.
         reason: &'static str,
     },
-    /// Сброс канала связи.
+    /// Link reset.
     Reset {
-        /// Удалось ли восстановить канал.
+        /// Whether the link was recovered.
         ok: bool,
     },
-    /// Смена состояния драйвера.
+    /// Driver state change.
     StateChange {
-        /// Прежнее состояние.
+        /// Previous state.
         from: &'static str,
-        /// Новое состояние.
+        /// New state.
         to: &'static str,
     },
-    /// Ошибка.
+    /// Error.
     Error {
-        /// Операция.
+        /// Operation.
         op: &'static str,
-        /// Код ошибки.
+        /// Error code.
         error: &'static str,
     },
 }
 
 impl EventKind {
-    /// Стабильное имя типа события для фильтрации и метрик.
+    /// Stable event type name for filtering and metrics.
     #[must_use]
     pub const fn name(&self) -> &'static str {
         match self {
@@ -149,30 +149,30 @@ impl EventKind {
     }
 }
 
-/// Одна запись журнала.
+/// One journal record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Event {
-    /// Порядковый номер записи, начиная с 1.
+    /// Record sequence number, starting at 1.
     pub seq: u64,
-    /// Метка времени в миллисекундах монотонных часов.
+    /// Timestamp in milliseconds of the monotonic clock.
     pub ts_ms: u64,
-    /// Идентификатор запроса, к которому относится запись.
+    /// Request id the record belongs to.
     pub request_id: u64,
-    /// Уровень важности.
+    /// Severity level.
     pub level: Level,
-    /// Содержание.
+    /// Content.
     pub kind: EventKind,
 }
 
-/// Приёмник записей журнала.
+/// Sink for journal records.
 ///
-/// Реализация не должна паниковать и обязана быть готовой к вызову из `Drop`.
+/// The implementation must not panic and must be ready to be called from `Drop`.
 pub trait Journal {
-    /// Принимает одну запись.
+    /// Accepts one record.
     fn event(&self, event: &Event);
 }
 
-/// Журнал-заглушка: ничего не делает.
+/// Null journal: does nothing.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NullJournal;
 

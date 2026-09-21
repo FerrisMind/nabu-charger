@@ -1,7 +1,7 @@
-//! Интеграционные тесты хост-слоя: реальные сценарии поверх трейта транспорта.
+//! Host layer integration tests: real scenarios on top of the transport trait.
 //!
-//! Здесь нет реального железа: логика драйвера проверяется на моке, а транспорт —
-//! по TCP к симулятору устройства в этом же процессе.
+//! There is no real hardware here: the driver logic is checked on the mock and the
+//! transport over TCP against the device simulator in the same process.
 
 #![allow(
     clippy::unwrap_used,
@@ -34,92 +34,92 @@ fn wait_for<F: FnMut() -> bool>(mut condition: F, timeout: Duration) -> bool {
 
 #[test]
 fn session_on_mock_applies_policy_and_writes_journal() {
-    let dir = tempfile::tempdir().expect("временный каталог");
+    let dir = tempfile::tempdir().expect("temporary directory");
     let path = dir.path().join("journal.jsonl");
-    let journal = JsonlJournal::create(&path).expect("журнал создаётся");
+    let journal = JsonlJournal::create(&path).expect("the journal is created");
     let clock = SystemClock::start();
 
     let transport = MockTransport::hvdcp3();
     let mut charger = Charger::open(transport, &clock, &journal, ChargerConfig::for_nabu())
-        .expect("сессия открывается");
+        .expect("the session opens");
     let outcome = run_until_ready(&mut charger, &clock, RunOptions::default(), |_| Ok(()))
-        .expect("сессия проходит");
+        .expect("the session completes");
 
     assert_eq!(outcome.adapter, AdapterType::Hvdcp3);
     assert_eq!(outcome.plan.applied_icl_ua, 3_000_000);
     assert!(outcome.plan.policy.pump_eligible);
     charger.close();
-    journal.flush().expect("журнал сброшен на диск");
+    journal.flush().expect("the journal is flushed to disk");
 
-    let text = std::fs::read_to_string(&path).expect("журнал читается");
+    let text = std::fs::read_to_string(&path).expect("the journal is readable");
     let lines: Vec<&str> = text.lines().collect();
-    assert!(lines.len() > 5, "в журнале должно быть несколько записей");
+    assert!(lines.len() > 5, "the journal must contain several records");
 
     for line in &lines {
-        let value: serde_json::Value = serde_json::from_str(line).expect("строка — валидный JSON");
-        assert!(value.get("seq").is_some(), "есть порядковый номер");
-        assert!(value.get("ts_ms").is_some(), "есть метка времени");
+        let value: serde_json::Value = serde_json::from_str(line).expect("the line is valid JSON");
+        assert!(value.get("seq").is_some(), "it has a sequence number");
+        assert!(value.get("ts_ms").is_some(), "it has a timestamp");
         assert!(
             value.get("request_id").is_some(),
-            "есть идентификатор запроса"
+            "it has a request identifier"
         );
-        assert!(value.get("level").is_some(), "есть уровень");
-        assert!(value.get("kind").is_some(), "есть тип события");
+        assert!(value.get("level").is_some(), "it has a level");
+        assert!(value.get("kind").is_some(), "it has an event kind");
     }
 
     let detect = lines
         .iter()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .find(|value| value.get("kind").and_then(|k| k.as_str()) == Some("detect"))
-        .expect("есть запись о детекции");
+        .expect("there is a detection record");
     assert_eq!(detect["adapter"], "HVDCP3");
     assert_eq!(detect["raw_result"], serde_json::json!(0x48));
 }
 
 #[test]
 fn session_over_tcp_against_simulator() {
-    eprintln!("шаг 1: запуск симулятора");
-    let sim = Simulator::start(AdapterType::Hvdcp3P5).expect("симулятор поднимается");
-    eprintln!("шаг 2: адрес {}", sim.addr());
+    eprintln!("step 1: starting the simulator");
+    let sim = Simulator::start(AdapterType::Hvdcp3P5).expect("the simulator starts");
+    eprintln!("step 2: address {}", sim.addr());
     let clock = SystemClock::start();
     let transport = TcpTransport::connect(sim.addr(), Duration::from_millis(500))
-        .expect("подключение к симулятору");
-    eprintln!("шаг 3: подключились");
+        .expect("connection to the simulator");
+    eprintln!("step 3: connected");
 
-    // QC3.5 поднимается до HVDCP3P5 только после аутентификации: без неё
-    // аппаратура сообщает образец HVDCP3, и драйвер честно говорит HVDCP3.
+    // QC3.5 comes up as HVDCP3P5 only after authentication: without it the
+    // hardware reports the HVDCP3 pattern, and the driver honestly says HVDCP3.
     let config = ChargerConfig {
         qc35: charger_core::Qc35Support::Supported {
             authenticated: true,
         },
         ..ChargerConfig::for_nabu()
     };
-    let mut charger =
-        Charger::open(transport, &clock, &NullJournal, config).expect("сессия открывается по сети");
-    eprintln!("шаг 4: сессия открыта");
+    let mut charger = Charger::open(transport, &clock, &NullJournal, config)
+        .expect("the session opens over the network");
+    eprintln!("step 4: session open");
     let outcome = run_until_ready(&mut charger, &clock, RunOptions::default(), |_| Ok(()))
-        .expect("сессия проходит по сети");
-    eprintln!("шаг 5: сессия прошла");
+        .expect("the session completes over the network");
+    eprintln!("step 5: session completed");
 
     assert_eq!(outcome.adapter, AdapterType::Hvdcp3P5);
     assert_eq!(charger.transport_name(), "tcp");
     assert_eq!(charger.state(), State::Ready);
-    eprintln!("шаг 6: остановка симулятора");
+    eprintln!("step 6: stopping the simulator");
     sim.stop();
-    eprintln!("шаг 7: готово");
+    eprintln!("step 7: done");
 }
 
 #[test]
 fn adapter_change_is_detected_and_reapplied() {
-    let sim = Simulator::start(AdapterType::Dcp).expect("симулятор поднимается");
+    let sim = Simulator::start(AdapterType::Dcp).expect("the simulator starts");
     let handle = sim.handle();
     let clock = SystemClock::start();
     let transport = TcpTransport::connect(sim.addr(), Duration::from_millis(500))
-        .expect("подключение к симулятору");
+        .expect("connection to the simulator");
     let mut charger = Charger::open(transport, &clock, &NullJournal, ChargerConfig::for_nabu())
-        .expect("сессия открывается");
+        .expect("the session opens");
     let outcome = run_until_ready(&mut charger, &clock, RunOptions::default(), |_| Ok(()))
-        .expect("первичная детекция");
+        .expect("initial detection");
     assert_eq!(outcome.adapter, AdapterType::Dcp);
 
     handle.set_adapter(AdapterType::Hvdcp3);
@@ -130,33 +130,33 @@ fn adapter_change_is_detected_and_reapplied() {
         },
         Duration::from_secs(2),
     );
-    assert!(switched, "смена адаптера должна обнаруживаться");
+    assert!(switched, "an adapter change must be detected");
     let plan = charger
         .apply(AdapterType::Hvdcp3)
-        .expect("политика переприменяется");
+        .expect("the policy is reapplied");
     assert_eq!(plan.applied_icl_ua, 3_000_000);
     sim.stop();
 }
 
 #[test]
 fn power_removal_is_reported_as_detached() {
-    let sim = Simulator::start(AdapterType::Hvdcp3).expect("симулятор поднимается");
+    let sim = Simulator::start(AdapterType::Hvdcp3).expect("the simulator starts");
     let handle = sim.handle();
     let clock = SystemClock::start();
     let transport = TcpTransport::connect(sim.addr(), Duration::from_millis(500))
-        .expect("подключение к симулятору");
+        .expect("connection to the simulator");
     let mut charger = Charger::open(transport, &clock, &NullJournal, ChargerConfig::for_nabu())
-        .expect("сессия открывается");
-    run_until_ready(&mut charger, &clock, RunOptions::default(), |_| Ok(())).expect("детекция");
+        .expect("the session opens");
+    run_until_ready(&mut charger, &clock, RunOptions::default(), |_| Ok(())).expect("detection");
 
-    // Пропажа питания выражается снятым битом готовности в APSD_STATUS.
+    // Power removal is expressed by the cleared ready bit in APSD_STATUS.
     handle.set_reg(charger_core::regs::APSD_STATUS, 0);
     handle.set_reg(charger_core::regs::APSD_RESULT_STATUS, 0);
     let detached = wait_for(
         || matches!(charger.monitor(), Ok(Monitor::Detached)),
         Duration::from_secs(2),
     );
-    assert!(detached, "пропажа питания должна обнаруживаться");
+    assert!(detached, "power removal must be detected");
     sim.stop();
 }
 
@@ -170,11 +170,11 @@ fn transport_faults_are_retried_and_surface_as_typed_errors() {
         times: 1,
     });
     let charger = Charger::open(mock, &clock, &NullJournal, ChargerConfig::for_testing())
-        .expect("один сбой переживается повтором");
+        .expect("a single fault is survived by a retry");
     assert_eq!(charger.stats().retries, 1);
     assert_eq!(charger.stats().resets, 1);
 
-    // Второй сбой исчерпывает бюджет повторов и превращается в типизированную ошибку.
+    // The second fault exhausts the retry budget and turns into a typed error.
     let mut strict = MockTransport::hvdcp3();
     strict.push_fault(Fault::ReadError {
         addr: charger_core::regs::APSD_STATUS,
@@ -187,7 +187,7 @@ fn transport_faults_are_retried_and_surface_as_typed_errors() {
     };
     let result = Charger::open(strict, &clock, &NullJournal, config);
     match result {
-        Ok(_) => panic!("сессия не должна открыться на мёртвом канале"),
+        Ok(_) => panic!("the session must not open on a dead channel"),
         Err(err) => {
             assert!(matches!(err, ChargerError::Transport(_)));
             assert_eq!(err.code(), "transport");
@@ -211,7 +211,10 @@ fn failed_reset_blocks_opening() {
         ..ChargerConfig::for_testing()
     };
     let result = Charger::open(mock, &clock, &NullJournal, config);
-    assert!(result.is_err(), "без сброса канала сессия не открывается");
+    assert!(
+        result.is_err(),
+        "without a channel reset the session does not open"
+    );
 }
 
 #[test]
@@ -224,9 +227,9 @@ fn reopening_works_without_restarting_the_process() {
             &NullJournal,
             ChargerConfig::for_testing(),
         )
-        .expect("повторное открытие");
+        .expect("reopening");
         let outcome = run_until_ready(&mut charger, &clock, RunOptions::default(), |_| Ok(()))
-            .expect("повторная сессия");
+            .expect("a repeat session");
         assert_eq!(outcome.adapter, AdapterType::Hvdcp2);
         charger.close();
     }
@@ -234,20 +237,20 @@ fn reopening_works_without_restarting_the_process() {
 
 #[test]
 fn monitor_cycle_reapplies_policy_only_on_change() {
-    let sim = Simulator::start(AdapterType::Sdp).expect("симулятор поднимается");
+    let sim = Simulator::start(AdapterType::Sdp).expect("the simulator starts");
     let handle = sim.handle();
     let clock = SystemClock::start();
     let transport = TcpTransport::connect(sim.addr(), Duration::from_millis(500))
-        .expect("подключение к симулятору");
+        .expect("connection to the simulator");
     let mut charger = Charger::open(transport, &clock, &NullJournal, ChargerConfig::for_nabu())
-        .expect("сессия открывается");
-    run_until_ready(&mut charger, &clock, RunOptions::default(), |_| Ok(())).expect("детекция");
+        .expect("the session opens");
+    run_until_ready(&mut charger, &clock, RunOptions::default(), |_| Ok(())).expect("detection");
 
     assert!(
         host::runner::monitor_cycle(&mut charger)
-            .expect("опрос")
+            .expect("poll")
             .is_none(),
-        "без смены адаптера политика не переприменяется"
+        "without an adapter change the policy is not reapplied"
     );
 
     handle.set_adapter(AdapterType::Hvdcp2);
@@ -255,16 +258,19 @@ fn monitor_cycle_reapplies_policy_only_on_change() {
         || matches!(host::runner::monitor_cycle(&mut charger), Ok(Some(_))),
         Duration::from_secs(2),
     );
-    assert!(changed, "новая политика применяется после смены адаптера");
+    assert!(
+        changed,
+        "the new policy is applied after the adapter change"
+    );
     assert_eq!(charger.adapter(), Some(AdapterType::Hvdcp2));
     sim.stop();
 }
 
 #[test]
 fn journal_records_request_ids_and_monotonic_time() {
-    let dir = tempfile::tempdir().expect("временный каталог");
+    let dir = tempfile::tempdir().expect("temporary directory");
     let path = dir.path().join("monotonic.jsonl");
-    let journal = JsonlJournal::create(&path).expect("журнал создаётся");
+    let journal = JsonlJournal::create(&path).expect("the journal is created");
     let clock = SystemClock::start();
     let mut charger = Charger::open(
         MockTransport::dcp(),
@@ -272,12 +278,12 @@ fn journal_records_request_ids_and_monotonic_time() {
         &journal,
         ChargerConfig::for_testing(),
     )
-    .expect("сессия открывается");
+    .expect("the session opens");
     let _ = run_until_ready(&mut charger, &clock, RunOptions::default(), |_| Ok(()));
     charger.close();
-    journal.flush().expect("сброс журнала");
+    journal.flush().expect("journal flush");
 
-    let text = std::fs::read_to_string(&path).expect("журнал читается");
+    let text = std::fs::read_to_string(&path).expect("the journal is readable");
     let mut previous_ts = 0_u64;
     let mut previous_seq = 0_u64;
     let mut requests = 0_u64;
@@ -285,14 +291,14 @@ fn journal_records_request_ids_and_monotonic_time() {
         let value: serde_json::Value = serde_json::from_str(line).expect("JSON");
         let ts = value["ts_ms"].as_u64().unwrap_or_default();
         let seq = value["seq"].as_u64().unwrap_or_default();
-        assert!(ts >= previous_ts, "время не должно идти назад");
-        assert!(seq > previous_seq, "номера записей возрастают");
+        assert!(ts >= previous_ts, "time must not go backwards");
+        assert!(seq > previous_seq, "record numbers increase");
         previous_ts = ts;
         previous_seq = seq;
         if value["request_id"].as_u64().unwrap_or_default() > 0 {
             requests += 1;
         }
     }
-    assert!(requests > 3, "записи несут идентификатор запроса");
-    assert!(clock.now_ms() < 60_000, "тест не должен занимать минуту");
+    assert!(requests > 3, "records carry a request identifier");
+    assert!(clock.now_ms() < 60_000, "the test must not take a minute");
 }

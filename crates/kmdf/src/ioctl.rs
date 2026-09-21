@@ -1,69 +1,69 @@
-//! Контракт драйвера с пользовательским режимом: коды IOCTL и структуры обмена.
+//! Driver contract with user mode: IOCTL codes and exchange structures.
 //!
-//! Все запросы — `METHOD_BUFFERED`, `FILE_ANY_ACCESS`, тип устройства
-//! `FILE_DEVICE_UNKNOWN` (0x22). Коды построены через стандартный макрос
+//! All requests are `METHOD_BUFFERED`, `FILE_ANY_ACCESS`, device type
+//! `FILE_DEVICE_UNKNOWN` (0x22). The codes are built with the standard macro
 //! `CTL_CODE(Type, Function, Method, Access) = (Type << 16) | (Access << 14) | (Function << 2) | Method`.
 
-/// Тип устройства, который объявляет драйвер.
+/// Device type declared by the driver.
 pub const FILE_DEVICE_NABU_CHARGER: u32 = 0x22;
 
-/// Собирает код управления по правилам `CTL_CODE`.
+/// Builds a control code per the `CTL_CODE` rules.
 ///
-/// * `function` — номер функции (0x800..0xFFF для вендорских);
-/// * `method` — 0 = `METHOD_BUFFERED`;
-/// * `access` — 0 = `FILE_ANY_ACCESS`.
+/// * `function` - function number (0x800..0xFFF for vendor codes);
+/// * `method` - 0 = `METHOD_BUFFERED`;
+/// * `access` - 0 = `FILE_ANY_ACCESS`.
 #[must_use]
 pub const fn ctl_code(function: u32, method: u32, access: u32) -> u32 {
     (FILE_DEVICE_NABU_CHARGER << 16) | (access << 14) | (function << 2) | method
 }
 
-/// Получить состояние драйвера и последний применённый план.
+/// Get the driver state and the last applied plan.
 pub const IOCTL_NABU_GET_STATUS: u32 = ctl_code(0x800, 0, 0);
-/// Запустить детекцию адаптера (неблокирующе: результат появится в статусе).
+/// Start adapter detection (non-blocking: the result appears in the status).
 pub const IOCTL_NABU_DETECT_START: u32 = ctl_code(0x801, 0, 0);
-/// Применить политику тока для распознанного адаптера.
+/// Apply the current policy for the recognized adapter.
 pub const IOCTL_NABU_APPLY_POLICY: u32 = ctl_code(0x802, 0, 0);
-/// Принудительно задать лимит входного тока в микроамперax.
+/// Force the input current limit in microamperes.
 pub const IOCTL_NABU_SET_ICL: u32 = ctl_code(0x803, 0, 0);
-/// Прочитать регистр периферии зарядника (диагностика).
+/// Read a charger peripheral register (diagnostics).
 pub const IOCTL_NABU_READ_REG: u32 = ctl_code(0x804, 0, 0);
-/// Записать регистр периферии зарядника (диагностика).
+/// Write a charger peripheral register (diagnostics).
 pub const IOCTL_NABU_WRITE_REG: u32 = ctl_code(0x805, 0, 0);
-/// Получить снимок журнала операций.
+/// Get a snapshot of the operation journal.
 pub const IOCTL_NABU_GET_JOURNAL: u32 = ctl_code(0x806, 0, 0);
 
-/// Идентификатор структуры, чтобы клиент не перепутал версии.
+/// Structure identifier so the client cannot mix up versions.
 pub const NABU_STATUS_MAGIC: u32 = 0x4E41_4255; // "NABU"
 
-/// Версия контракта обмена.
+/// Version of the exchange contract.
 pub const NABU_STATUS_VERSION: u16 = 1;
 
-/// Возможности драйвера: один поток расширений, как принято в Windows.
+/// Driver capabilities: a single extension stream, as is customary in Windows.
 pub const NABU_CAPABILITIES: u32 = 1;
 
-/// Состояние сессии драйвера (совпадает с `charger_core::State`).
+/// Driver session state (matches `charger_core::State`).
 ///
-/// В bring-up используются все варианты: `Idle`/`Detecting`/`Ready` — после
-/// подключения таймера детекции (см. `docs/HANDOVER.md`).
+/// During bring-up all variants are used: `Idle`/`Detecting`/`Ready` after the
+/// detection timer is wired up (see `docs/HANDOVER.md`).
 #[allow(dead_code)]
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NabuState {
-    /// Сессия не открыта.
+    /// The session is not open.
     Closed = 0,
-    /// Связь есть, детекция не запускалась.
+    /// Communication is up, detection has not been started.
     Idle = 1,
-    /// Идёт ожидание APSD.
+    /// Waiting for APSD.
     Detecting = 2,
-    /// Тип определён, политика применена.
+    /// The type is determined, the policy has been applied.
     Ready = 3,
-    /// Сессия в неисправности.
+    /// The session is faulted.
     Faulted = 4,
 }
 
 impl NabuState {
-    /// Переводит состояние ядра в контрактное представление.
-    #[allow(dead_code)] // Подключается вместе с таймером детекции.
+    /// Converts the core state into the contract representation.
+    #[allow(dead_code)] // Wired up together with the detection timer.
     #[must_use]
     pub const fn from_core(state: charger_core::State) -> Self {
         match state {
@@ -76,99 +76,99 @@ impl NabuState {
     }
 }
 
-/// Ответ на [`IOCTL_NABU_GET_STATUS`].
+/// Response to [`IOCTL_NABU_GET_STATUS`].
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NabuStatus {
-    /// Магия [`NABU_STATUS_MAGIC`].
+    /// Magic value of [`NABU_STATUS_MAGIC`].
     pub magic: u32,
-    /// Версия контракта [`NABU_STATUS_VERSION`].
+    /// Contract version of [`NABU_STATUS_VERSION`].
     pub version: u16,
-    /// Битовая маска возможностей.
+    /// Capability bit mask.
     pub capabilities: u32,
-    /// Состояние сессии.
+    /// Session state.
     pub state: u8,
-    /// Код типа адаптера (`AdapterType` как число; 255 — неизвестно).
+    /// Adapter type code (`AdapterType` as a number; 255 means unknown).
     pub adapter_code: u8,
-    /// Допустим ли charge pump.
+    /// Whether the charge pump is eligible.
     pub pump_eligible: u8,
-    /// Зарезервировано для выравнивания.
+    /// Reserved for alignment.
     pub reserved: u8,
-    /// Фактический лимит входного тока в микроамперax.
+    /// Actual input current limit in microamperes.
     pub icl_ua: u32,
-    /// Код лимита, записанный в регистр.
+    /// Limit code written to the register.
     pub icl_raw: u8,
-    /// Заосервировано.
+    /// Reserved.
     pub reserved2: [u8; 3],
-    /// Сколько чтений регистров выполнено.
+    /// How many register reads have been performed.
     pub reads: u64,
-    /// Сколько записей выполнено.
+    /// How many writes have been performed.
     pub writes: u64,
-    /// Сколько повторов после сбоев.
+    /// How many retries after failures.
     pub retries: u64,
-    /// Сколько сбросов канала.
+    /// How many channel resets.
     pub resets: u64,
-    /// Сколько ошибок зафиксировано.
+    /// How many errors have been recorded.
     pub errors: u64,
 }
 
-/// Запрос [`IOCTL_NABU_READ_REG`] и [`IOCTL_NABU_WRITE_REG`].
+/// Request for [`IOCTL_NABU_READ_REG`] and [`IOCTL_NABU_WRITE_REG`].
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NabuRegRequest {
-    /// Адрес регистра.
+    /// Register address.
     pub addr: u16,
-    /// Значение: вход для записи, выход для чтения.
+    /// Value: input for a write, output for a read.
     pub value: u8,
-    /// Зарезервировано.
+    /// Reserved.
     pub reserved: u8,
-    /// Код ошибки транспорта, если операция не удалась.
+    /// Transport error code if the operation failed.
     pub error_code: i32,
 }
 
-/// Запрос [`IOCTL_NABU_SET_ICL`].
+/// Request for [`IOCTL_NABU_SET_ICL`].
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NabuIclRequest {
-    /// Требуемый лимит входного тока в микроамперax.
+    /// Requested input current limit in microamperes.
     pub icl_ua: u32,
-    /// Фактически выставленный лимит (после квантования по сетке).
+    /// Actually applied limit (after quantization to the grid).
     pub applied_ua: u32,
-    /// Код регистра, который записали.
+    /// Register code that was written.
     pub icl_raw: u8,
-    /// Код ошибки: 0 — успех.
+    /// Error code: 0 means success.
     pub error_code: i32,
 }
 
-/// Одна запись журнала в буфере [`IOCTL_NABU_GET_JOURNAL`].
-#[allow(dead_code)] // Заполняется при подключении выдачи журнала клиенту.
+/// One journal record in the buffer of [`IOCTL_NABU_GET_JOURNAL`].
+#[allow(dead_code)] // Filled in when journal delivery to the client is wired up.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NabuJournalEntry {
-    /// Порядковый номер.
+    /// Sequence number.
     pub seq: u64,
-    /// Метка времени в миллисекундах монотонных часов ядра.
+    /// Timestamp in milliseconds of the kernel monotonic clock.
     pub ts_ms: u64,
-    /// Идентификатор запроса.
+    /// Request identifier.
     pub request_id: u64,
-    /// Уровень (`trace`..`error`).
+    /// Level (`trace`..`error`).
     pub level: u8,
-    /// Тип события.
+    /// Event kind.
     pub kind: u8,
-    /// Адрес регистра, если применимо.
+    /// Register address, if applicable.
     pub addr: u16,
-    /// Значение, если применимо.
+    /// Value, if applicable.
     pub value: u8,
-    /// Зарезервировано.
+    /// Reserved.
     pub reserved: [u8; 3],
 }
 
-/// Запрос [`IOCTL_NABU_GET_JOURNAL`].
+/// Request for [`IOCTL_NABU_GET_JOURNAL`].
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NabuJournalRequest {
-    /// Сколько записей вернуть (не больше размера буфера клиента).
+    /// How many records to return (not more than the client buffer size).
     pub count: u32,
-    /// Сколько записей реально доступно.
+    /// How many records are actually available.
     pub available: u32,
 }

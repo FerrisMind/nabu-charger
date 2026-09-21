@@ -1,6 +1,6 @@
 [package]
 name = "ln8000"
-description = "Ядро драйвера charge pump LN8000 (Xiaomi Pad 5, I2C 0x51): регистры, режимы, защиты, статус"
+description = "LN8000 charge pump driver core (Xiaomi Pad 5, I2C 0x51): registers, modes, protections, status"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,8 +15,8 @@ name = "ln8000"
 path = "src/lib.rs"
 
 [features]
-# `testkit` входит в стандартную сборку: примеры в документации должны
-# собираться и исполняться в `cargo test`.
+# `testkit` is part of the default build: the documentation examples must
+# compile and run under `cargo test`.
 default = ["std", "testkit"]
 std = []
 testkit = []

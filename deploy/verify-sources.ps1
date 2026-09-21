@@ -1,26 +1,26 @@
-﻿#Requires -Version 7.0
+#Requires -Version 7.0
 <#
-    verify-sources.ps1 — сверка драйвера с эталонными источниками и живым дампом.
+    verify-sources.ps1 - cross-check the driver against the reference sources and the live dump.
 
-    Запуск:
+    Run:
         .\verify-sources.ps1
 
-    Три независимые проверки:
+    Three independent checks:
 
-      1. Дескриптор I²C из живого дампа ACPI. В `_CRS` узла PEIC лежит настоящий
-         ресурс подключения шины: адрес устройства, скорость, имя контроллера.
-         Скрипт его декодирует и сверяет с тем, на что рассчитывает драйвер.
+      1. The I2C descriptor from the live ACPI dump. The PEIC node's `_CRS` holds the real
+         bus connection resource: device address, speed, controller name.
+         The script decodes it and cross-checks it against what the driver expects.
 
-      2. Регистры SMB (ветка battery-стека). Каждый адрес и каждый бит из
-         `crates/core/src/regs.rs` сверяется с определениями из
-         `smb5-reg.h`, включая вычисляемые `BASE + offset`, `BIT(n)` и `GENMASK`.
+      2. SMB registers (battery-stack branch). Every address and every bit from
+         `crates/core/src/regs.rs` is cross-checked against the definitions in
+         `smb5-reg.h`, including the computed `BASE + offset`, `BIT(n)` and `GENMASK`.
 
-      3. Числовые константы LN8000. Формулы кодирования ядра сверяются со
-         значениями из `ln8000_charger.h`. Отдельно сообщается, что именно по
-         этим источникам проверить нельзя — без приукрашивания.
+      3. LN8000 numeric constants. The core encoding formulas are cross-checked against
+         the values in `ln8000_charger.h`. It separately states what cannot be
+         verified from these sources - without embellishment.
 
-    Отчёт пишется в artifacts\verify-sources.txt. Код возврата 0, если
-    расхождений нет.
+    The report is written to artifacts\verify-sources.txt. Exit code 0 if there are
+    no mismatches.
 #>
 [CmdletBinding()]
 param(
@@ -34,7 +34,7 @@ $ErrorActionPreference = 'Stop'
 $report = New-Object System.Collections.Generic.List[string]
 $mismatch = 0
 $checked = 0
-# Имена, которые в разных заголовках определены по-разному (разные поколения чипов).
+# Names defined differently in different headers (different chip generations).
 $script:conflicts = @{}
 
 function Emit {
@@ -43,10 +43,10 @@ function Emit {
     Write-Host $Text
 }
 
-# --- разбор числовых выражений из C-заголовков ---------------------------
+# --- parsing numeric expressions from C headers --------------------------
 
 function ConvertTo-PsExpression {
-    # PowerShell не понимает C-операторы: переводим побитовые формы.
+    # PowerShell does not understand C operators: convert the bitwise forms.
     param([string]$Expr)
     $e = $Expr
     $e = $e -replace '<<', ' -shl '
@@ -81,8 +81,8 @@ function Get-DefineTable {
                 if ($name -match '^(__|LN8000_REG_PRINT)') { continue }
                 $raw = ($raw -replace '/\*.*?\*/', '') -replace '//.*$', ''
             } elseif ($line -match '^\s*([A-Z][A-Z0-9_]{3,})\s*=\s*(.+?)\s*,?\s*$') {
-                # Значением может быть не только число, но и BIT(n)/GENMASK(h,l):
-                # их разбирает Resolve-Define, а мусорные строки отсеются там же.
+                # The value may be not only a number but also BIT(n)/GENMASK(h,l):
+                # Resolve-Define parses those, and junk lines are filtered out there too.
                 $candidate = $Matches[2].Trim()
                 if ($candidate -notmatch ';|\(''|"') {
                     $name = $Matches[1]
@@ -92,7 +92,7 @@ function Get-DefineTable {
             if (-not $name) { continue }
             $value = $raw.Trim()
             if ($table.ContainsKey($name)) {
-                # Первый файл в списке — приоритетное поколение (smb5 для nabu).
+                # The first file in the list is the priority generation (smb5 for nabu).
                 if ($table[$name] -ne $value) {
                     $script:conflicts[$name] = @{ primary = $table[$name]; other = $value; file = $short }
                 }
@@ -116,7 +116,7 @@ function Resolve-Define {
             for ($i = $low; $i -le $high; $i++) { $value += [math]::Pow(2, $i) }
             [string][int64]$value
         })
-    # подстановка имён
+    # name substitution
     $names = @($Table.Keys | Where-Object { $expr -match "\b$_\b" })
     foreach ($nested in $names) {
         $resolved = Resolve-Define -Name $nested -Table $Table -Depth ($Depth + 1)
@@ -134,7 +134,7 @@ function Get-RustConst {
     $text = Get-Content -LiteralPath $Path -Raw
     if ($text -notmatch ("pub const\s+" + $Name + "\s*:\s*[A-Za-z0-9]+\s*=\s*([^;]+);")) { return $null }
     $expr = $Matches[1].Trim()
-    # сначала подставляем имена (подчёркивания в них значимы!), потом чистим числа
+    # first substitute names (underscores in them are significant!), then clean up numbers
     foreach ($dep in ([regex]::Matches($expr, '[A-Z][A-Z0-9_]+') | ForEach-Object { $_.Value } | Select-Object -Unique)) {
         $value = Get-RustConst -Path $Path -Name $dep
         if ($null -ne $value) { $expr = [regex]::Replace($expr, "\b$dep\b", [string]$value) }
@@ -148,32 +148,32 @@ function Compare-Value {
     param([string]$Title, [object]$Mine, [object]$Reference)
     $script:checked++
     if ($null -eq $Reference) {
-        Emit ("  [?]    " + $Title.PadRight(42) + " в эталоне не найдено")
+        Emit ("  [?]    " + $Title.PadRight(42) + " not found in the reference")
         return
     }
     if ($null -eq $Mine) {
-        Emit ("  [!]    " + $Title.PadRight(42) + " в коде не найдено (эталон " + $Reference + ")")
+        Emit ("  [!]    " + $Title.PadRight(42) + " not found in the code (reference " + $Reference + ")")
         $script:mismatch++
         return
     }
     if ($Mine -eq $Reference) {
-        Emit ("  [ок]   " + $Title.PadRight(42) + " " + $Mine)
+        Emit ("  [ok]   " + $Title.PadRight(42) + " " + $Mine)
     } else {
-        Emit ("  [РАСХ] " + $Title.PadRight(42) + " код " + $Mine + " / эталон " + $Reference)
+        Emit ("  [MISMATCH] " + $Title.PadRight(42) + " code " + $Mine + " / reference " + $Reference)
         $script:mismatch++
     }
 }
 
 Emit ''
 Emit '========================================================================='
-Emit ' Сверка драйвера nabu с эталонными источниками и живым дампом'
-Emit (' Время: ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
+Emit ' Cross-check of the nabu driver against reference sources and the live dump'
+Emit (' Time: ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
 Emit '========================================================================='
 
-# --- 1. дескриптор I²C из дампа ACPI -------------------------------------
+# --- 1. I2C descriptor from the ACPI dump --------------------------------
 
 Emit ''
-Emit '1. Ресурс подключения шины из живого дампа ACPI (узел PEIC)'
+Emit '1. Bus connection resource from the live ACPI dump (PEIC node)'
 Emit '-------------------------------------------------------------------------'
 
 $bytes = $null
@@ -186,7 +186,7 @@ if (Test-Path -LiteralPath $Dsdt) {
                 $collected = New-Object System.Collections.Generic.List[byte]
                 for ($j = $i + 1; $j -lt [Math]::Min($i + 12, $lines.Count); $j++) {
                     if ($lines[$j] -match '^\s*/\*\s*[0-9A-F]{4}\s*\*/\s*(.*?)(?://.*)?$') {
-                        # берём все байты строки: последний может быть без запятой
+                        # take all bytes on the line: the last one may be without a comma
                         foreach ($pair in ([regex]::Matches($Matches[1], '0x([0-9A-Fa-f]{2})'))) {
                             $collected.Add([Convert]::ToByte($pair.Groups[1].Value, 16))
                         }
@@ -200,15 +200,15 @@ if (Test-Path -LiteralPath $Dsdt) {
 }
 
 if (-not $bytes -or $bytes.Count -lt 20) {
-    Emit '  дамп не прочитан — пропускаем'
+    Emit '  dump not read - skipping'
     $mismatch++
 } else {
-    Emit ('  длина буфера: ' + $bytes.Count + ' байт')
+    Emit ('  buffer length: ' + $bytes.Count + ' bytes')
     $tag = $bytes[0]
     $busType = $bytes[5]
     $speed = [BitConverter]::ToUInt32($bytes, 12)
     $address = [BitConverter]::ToUInt16($bytes, 16)
-    # строка ресурса заканчивается нулём; дальше должен идти EndTag
+    # the resource string ends with a NUL; an EndTag must follow
     $tail = $bytes[18..($bytes.Count - 1)]
     $nul = [Array]::IndexOf($tail, [byte]0)
     $resourceSource = ''
@@ -218,28 +218,28 @@ if (-not $bytes -or $bytes.Count -lt 20) {
     $afterNul = if ($nul -ge 0) { $tail[($nul + 1)..($tail.Count - 1)] } else { @() }
 
     $script:checked++
-    if ($tag -eq 0x8E) { Emit '  [ок]   тип ресурса: дескриптор I²C (0x8E)' } else { Emit ('  [РАСХ] тип ресурса ' + $tag + ', ожидался 0x8E'); $mismatch++ }
-    Compare-Value 'шина I²C (SerialBusType)' $busType 1
-    Compare-Value 'адрес устройства на шине' $address 0x0051
-    Compare-Value 'скорость шины, Гц' $speed 100000
-    Compare-Value 'управляющий узел шины' $resourceSource '\_SB.I2C5'
+    if ($tag -eq 0x8E) { Emit '  [ok]   resource type: I2C descriptor (0x8E)' } else { Emit ('  [MISMATCH] resource type ' + $tag + ', expected 0x8E'); $mismatch++ }
+    Compare-Value 'I2C bus (SerialBusType)' $busType 1
+    Compare-Value 'device address on the bus' $address 0x0051
+    Compare-Value 'bus speed, Hz' $speed 100000
+    Compare-Value 'bus controller node' $resourceSource '\_SB.I2C5'
     $script:checked++
     if ($afterNul.Count -ge 2 -and $afterNul[0] -eq 0x79 -and $afterNul[1] -eq 0x00) {
-        Emit '  [ок]   буфер корректно закрыт EndTag (0x79)'
+        Emit '  [ok]   buffer correctly closed by EndTag (0x79)'
     } else {
-        Emit ('  [РАСХ] хвост буфера: ' + (($afterNul | ForEach-Object { '0x' + $_.ToString('X2') }) -join ' '))
+        Emit ('  [MISMATCH] buffer tail: ' + (($afterNul | ForEach-Object { '0x' + $_.ToString('X2') }) -join ' '))
         $mismatch++
     }
     Emit ''
-    Emit '  Что это подтверждает для драйвера: шина, адрес 0x51 и контроллер совпадают'
-    Emit '  с тем, на что рассчитывает драйвер LN8000. Прерывания в этом ресурсе нет —'
-    Emit '  поэтому драйвер опрашивает состояние по таймеру, а не ждёт прерывания.'
+    Emit '  What this confirms for the driver: the bus, address 0x51 and controller match'
+    Emit '  what the LN8000 driver expects. There is no interrupt in this resource,'
+    Emit '  so the driver polls the state on a timer instead of waiting for an interrupt.'
 }
 
-# --- 2. регистры и биты SMB ----------------------------------------------
+# --- 2. SMB registers and bits -------------------------------------------
 
 Emit ''
-Emit '2. Регистры и биты SMB против smb5-reg.h'
+Emit '2. SMB registers and bits against smb5-reg.h'
 Emit '-------------------------------------------------------------------------'
 
 $smbHeaders = @(
@@ -247,7 +247,7 @@ $smbHeaders = @(
     (Join-Path $Sources 'drivers_power_supply_qcom_smb-reg.h')
 )
 $smb = Get-DefineTable -Path $smbHeaders
-Emit ('  определений в эталоне: ' + $smb.Count)
+Emit ('  definitions in the reference: ' + $smb.Count)
 Emit ''
 
 $coreRegs = Join-Path $Repo 'crates\core\src\regs.rs'
@@ -267,7 +267,7 @@ $regPairs = @(
     @{ mine = 'USBIN_CURRENT_LIMIT_CFG'; ref = 'USBIN_CURRENT_LIMIT_CFG_REG' }
 )
 foreach ($pair in $regPairs) {
-    Compare-Value ('адрес ' + $pair.mine) (Get-RustConst -Path $coreRegs -Name $pair.mine) (Resolve-Define -Name $pair.ref -Table $smb)
+    Compare-Value ('address ' + $pair.mine) (Get-RustConst -Path $coreRegs -Name $pair.mine) (Resolve-Define -Name $pair.ref -Table $smb)
 }
 
 Emit ''
@@ -285,20 +285,20 @@ $bitPairs = @(
     @{ mine = 'QC2_VOLTAGE_MASK'; ref = 'HVDCP_PULSE_COUNT_MAX_QC2_MASK' }
 )
 foreach ($pair in $bitPairs) {
-    Compare-Value ('бит ' + $pair.mine) (Get-RustConst -Path $coreRegs -Name $pair.mine) (Resolve-Define -Name $pair.ref -Table $smb)
+    Compare-Value ('bit ' + $pair.mine) (Get-RustConst -Path $coreRegs -Name $pair.mine) (Resolve-Define -Name $pair.ref -Table $smb)
 }
 
 Emit ''
-Emit '  коды напряжения QC2 в эталоне:'
+Emit '  QC2 voltage codes in the reference:'
 foreach ($name in @('HVDCP_PULSE_COUNT_MAX_QC2_5V', 'HVDCP_PULSE_COUNT_MAX_QC2_9V', 'HVDCP_PULSE_COUNT_MAX_QC2_12V')) {
     $value = Resolve-Define -Name $name -Table $smb
     if ($null -ne $value) { Emit ('    ' + $name.PadRight(34) + ' = 0x' + $value.ToString('X2')) }
 }
 
-# --- 3. числовые константы LN8000 ----------------------------------------
+# --- 3. LN8000 numeric constants -----------------------------------------
 
 Emit ''
-Emit '3. Числовые константы LN8000 против ln8000_charger.h'
+Emit '3. LN8000 numeric constants against ln8000_charger.h'
 Emit '-------------------------------------------------------------------------'
 
 $lnHeader = Join-Path $Sources 'drivers_power_supply_ti_ln8000_charger.h'
@@ -310,56 +310,56 @@ $lnText = (@(
     (Join-Path $Repo 'crates\ln8000\src\regs.rs'),
     (Join-Path $Repo 'crates\ln8000\src\status.rs')
 ) | Where-Object { Test-Path -LiteralPath $_ } | ForEach-Object { Get-Content -LiteralPath $_ -Raw } | Out-String)
-# убираем подчёркивания в числах, чтобы «4_890» находился как «4890»
+# strip underscores in numbers so that "4_890" is found as "4890"
 $lnText = [regex]::Replace($lnText, '(?<=[0-9])_(?=[0-9])', '')
 
 $lnChecks = @(
-    @{ ref = 'LN8000_DEVICE_ID'; literal = '0x42'; what = 'идентификатор чипа' },
-    @{ ref = 'LN8000_VBAT_FLOAT_MIN'; literal = '3_725_000'; what = 'нижняя граница напряжения заряда' },
-    @{ ref = 'LN8000_VBAT_FLOAT_LSB'; literal = '5_000'; what = 'шаг напряжения заряда' },
-    @{ ref = 'LN8000_IIN_CFG_MIN'; literal = '500_000'; what = 'нижняя граница входного тока' },
-    @{ ref = 'LN8000_IIN_CFG_LSB'; literal = '50_000'; what = 'шаг входного тока' },
-    @{ ref = 'LN8000_ADC_IIN_STEP'; literal = '4890'; what = 'шаг АЦП входного тока' },
-    @{ ref = 'LN8000_ADC_VAC_STEP'; literal = '16_000'; what = 'шаг АЦП входного напряжения' },
-    @{ ref = 'LN8000_ADC_VBAT_STEP'; literal = '5_000'; what = 'шаг АЦП напряжения батареи' },
-    @{ ref = 'LN8000_ADC_NTCV_STEP'; literal = '2933'; what = 'шаг АЦП термодатчика' },
-    @{ ref = 'LN8000_ADC_DIETEMP_MIN'; literal = '-25'; what = 'смещение температуры кристалла' },
-    @{ ref = 'LN8000_BAT_OVP_DEFAULT'; literal = '4_440_000'; what = 'порог перенапряжения батареи' },
-    @{ ref = 'LN8000_BUS_OVP_DEFAULT'; literal = '9_500_000'; what = 'порог перенапряжения входа' },
-    @{ ref = 'LN8000_IIN_CFG_DEFAULT'; literal = '2_000_000'; what = 'входной ток по умолчанию' }
+    @{ ref = 'LN8000_DEVICE_ID'; literal = '0x42'; what = 'chip ID' },
+    @{ ref = 'LN8000_VBAT_FLOAT_MIN'; literal = '3_725_000'; what = 'lower bound of the charge voltage' },
+    @{ ref = 'LN8000_VBAT_FLOAT_LSB'; literal = '5_000'; what = 'charge voltage step' },
+    @{ ref = 'LN8000_IIN_CFG_MIN'; literal = '500_000'; what = 'lower bound of the input current' },
+    @{ ref = 'LN8000_IIN_CFG_LSB'; literal = '50_000'; what = 'input current step' },
+    @{ ref = 'LN8000_ADC_IIN_STEP'; literal = '4890'; what = 'input current ADC step' },
+    @{ ref = 'LN8000_ADC_VAC_STEP'; literal = '16_000'; what = 'input voltage ADC step' },
+    @{ ref = 'LN8000_ADC_VBAT_STEP'; literal = '5_000'; what = 'battery voltage ADC step' },
+    @{ ref = 'LN8000_ADC_NTCV_STEP'; literal = '2933'; what = 'thermistor ADC step' },
+    @{ ref = 'LN8000_ADC_DIETEMP_MIN'; literal = '-25'; what = 'die temperature offset' },
+    @{ ref = 'LN8000_BAT_OVP_DEFAULT'; literal = '4_440_000'; what = 'battery overvoltage threshold' },
+    @{ ref = 'LN8000_BUS_OVP_DEFAULT'; literal = '9_500_000'; what = 'input overvoltage threshold' },
+    @{ ref = 'LN8000_IIN_CFG_DEFAULT'; literal = '2_000_000'; what = 'default input current' }
 )
 foreach ($check in $lnChecks) {
     $script:checked++
     $reference = Resolve-Define -Name $check.ref -Table $ln
     $present = $lnText -match [regex]::Escape(($check.literal -replace '_', ''))
     if ($null -eq $reference) {
-        Emit ('  [?]    ' + $check.what.PadRight(42) + ' в эталоне не найдено')
+        Emit ('  [?]    ' + $check.what.PadRight(42) + ' not found in the reference')
     } elseif ($present) {
-        Emit ('  [ок]   ' + $check.what.PadRight(42) + $reference)
+        Emit ('  [ok]   ' + $check.what.PadRight(42) + $reference)
     } else {
-        Emit ('  [РАСХ] ' + $check.what.PadRight(42) + ' в коде нет значения ' + $check.literal)
+        Emit ('  [MISMATCH] ' + $check.what.PadRight(42) + ' the code has no value ' + $check.literal)
         $mismatch++
     }
 }
 
 Emit ''
-Emit '  Отдельно: пауза обновления АЦП. Эталон перед чтением пары байт ставит бит 1'
-Emit '  в TIMER_CTRL (PAUSE_ADC_UPDATE) и снимает его после. У нас это добавлено в'
-Emit '  read_adc и покрыто тестом adc_read_pauses_and_resumes_conversion_update.'
+Emit '  Separately: the ADC update pause. Before reading a byte pair the reference sets bit 1'
+Emit '  in TIMER_CTRL (PAUSE_ADC_UPDATE) and clears it afterwards. We added this to'
+Emit '  read_adc and covered it with the adc_read_pauses_and_resumes_conversion_update test.'
 
 Emit ''
-Emit '  Все числовые константы выше взяты из эталонного заголовка; адреса регистров и'
-Emit '  битовые маски сверяются ниже по закреплённому источнику (reference/).'
+Emit '  All numeric constants above come from the reference header; register addresses and'
+Emit '  bit masks are cross-checked below against the pinned source (reference/).'
 
-# --- 4. адреса и биты LN8000 по закреплённому источнику -------------------
+# --- 4. LN8000 addresses and bits against the pinned source ---------------
 
 Emit ''
-Emit '4. Адреса регистров LN8000 против закреплённого эталона'
+Emit '4. LN8000 register addresses against the pinned reference'
 Emit '-------------------------------------------------------------------------'
 
 $lnRef = Join-Path $Repo 'reference\ln8000_charger_extract.h'
 $ln2 = Get-DefineTable -Path @($lnRef)
-Emit ('  определений в закреплённом источнике: ' + $ln2.Count)
+Emit ('  definitions in the pinned source: ' + $ln2.Count)
 Emit ''
 
 $lnRegs = Join-Path $Repo 'crates\ln8000\src\regs.rs'
@@ -397,12 +397,12 @@ $lnPairs = @(
     @{ mine = 'BC_STS_E'; ref = 'LN8000_REG_BC_STS_E' }
 )
 foreach ($pair in $lnPairs) {
-    Compare-Value ('адрес ' + $pair.mine) (Get-RustConst -Path $lnRegs -Name $pair.mine) (Resolve-Define -Name $pair.ref -Table $ln2)
+    Compare-Value ('address ' + $pair.mine) (Get-RustConst -Path $lnRegs -Name $pair.mine) (Resolve-Define -Name $pair.ref -Table $ln2)
 }
 
 Emit ''
-Emit '  Переключение режимов: маска должна равняться единице, сдвинутой на номер бита из эталона.'
-Emit '  Значения из нашего кода:'
+Emit '  Mode switching: the mask must equal one shifted by the bit number from the reference.'
+Emit '  Values from our code:'
 foreach ($name in @('SYS_STS_SHUTDOWN', 'SYS_STS_STANDBY', 'SYS_STS_SWITCHING_ENABLED', 'SYS_STS_BYPASS_ENABLED',
                     'SYS_CTRL_STANDBY_EN', 'SYS_CTRL_EN_1TO1')) {
     $value = Get-RustConst -Path $lnRegs -Name $name
@@ -416,7 +416,7 @@ $modePairs = @(
     @{ mine = 'SYS_STS_SHUTDOWN'; refMask = 'LN8000_MASK_SHUTDOWN_STS' }
 )
 foreach ($pair in $modePairs) {
-    Compare-Value ('состояние ' + $pair.mine) (Get-RustConst -Path $lnRegs -Name $pair.mine) (Resolve-Define -Name $pair.refMask -Table $ln2)
+    Compare-Value ('state ' + $pair.mine) (Get-RustConst -Path $lnRegs -Name $pair.mine) (Resolve-Define -Name $pair.refMask -Table $ln2)
 }
 
 foreach ($bitPair in @(
@@ -425,11 +425,11 @@ foreach ($bitPair in @(
     $bitNumber = Resolve-Define -Name $bitPair.refBit -Table $ln2
     $mine = Get-RustConst -Path $lnRegs -Name $bitPair.mine
     $expected = if ($null -ne $bitNumber) { 1 -shl [int]$bitNumber } else { $null }
-    Compare-Value ('бит ' + $bitPair.mine + ' (1 << ' + $bitNumber + ')') $mine $expected
+    Compare-Value ('bit ' + $bitPair.mine + ' (1 << ' + $bitNumber + ')') $mine $expected
 }
 
 Emit ''
-Emit '  Смысловые значения эталона (проверяются тестами ядра):'
+Emit '  Meaningful reference values (checked by the core tests):'
 foreach ($name in @('LN8000_OPMODE_STANDBY', 'LN8000_OPMODE_BYPASS', 'LN8000_OPMODE_SWITCHING',
                     'LN8000_VAC_OVP_6P5V', 'LN8000_VAC_OVP_11V', 'LN8000_VAC_OVP_12V', 'LN8000_VAC_OVP_13V',
                     'LN8000_WATCHDOG_5SEC', 'LN8000_WATCHDOG_10SEC', 'LN8000_WATCHDOG_20SEC', 'LN8000_WATCHDOG_40SEC')) {
@@ -438,7 +438,7 @@ foreach ($name in @('LN8000_OPMODE_STANDBY', 'LN8000_OPMODE_BYPASS', 'LN8000_OPM
 }
 
 Emit ''
-Emit '  Регистры каналов АЦП по эталону (совпадают с нашим кодом):'
+Emit '  ADC channel registers per the reference (they match our code):'
 foreach ($name in @('LN8000_REG_ADC01_STS', 'LN8000_REG_ADC02_STS', 'LN8000_REG_ADC03_STS', 'LN8000_REG_ADC04_STS',
                     'LN8000_REG_ADC06_STS', 'LN8000_REG_ADC07_STS', 'LN8000_REG_ADC08_STS', 'LN8000_REG_ADC09_STS')) {
     $value = Resolve-Define -Name $name -Table $ln2
@@ -446,29 +446,29 @@ foreach ($name in @('LN8000_REG_ADC01_STS', 'LN8000_REG_ADC02_STS', 'LN8000_REG_
 }
 
 Emit ''
-Emit '  Расхождения между поколениями чипов в эталонах (учтено smb5):'
+Emit '  Differences between chip generations in the references (smb5 taken into account):'
 if ($script:conflicts.Count -eq 0) {
-    Emit '    нет'
+    Emit '    none'
 } else {
     foreach ($name in ($script:conflicts.Keys | Sort-Object)) {
         $item = $script:conflicts[$name]
-        Emit ('    ' + $name.PadRight(34) + ' smb5: ' + ([string]$item.primary).PadRight(10) + '  в ' + $item.file + ': ' + $item.other)
+        Emit ('    ' + $name.PadRight(34) + ' smb5: ' + ([string]$item.primary).PadRight(10) + '  in ' + $item.file + ': ' + $item.other)
     }
     Emit ''
-    Emit '    Эти имена означают разное в разных поколениях; наш планшет — SM8150/PM8150B,'
-    Emit '    поэтому приоритет у smb5-reg.h, и код совпадает именно с ним.'
+    Emit '    These names mean different things in different generations; our tablet is SM8150/PM8150B,'
+    Emit '    so smb5-reg.h has priority, and the code matches exactly that one.'
 }
 
 Emit ''
 Emit '========================================================================='
-Emit (' Итог: проверок ' + $checked + ', расхождений ' + $mismatch)
+Emit (' Result: ' + $checked + ' checks, ' + $mismatch + ' mismatches')
 Emit '========================================================================='
 
 $outPath = [IO.Path]::GetFullPath($Out)
 New-Item -ItemType Directory -Path (Split-Path $outPath) -Force | Out-Null
 $report | Set-Content -LiteralPath $outPath -Encoding utf8
 Write-Host ''
-Write-Host ('Отчёт: ' + $outPath) -ForegroundColor Green
+Write-Host ('Report: ' + $outPath) -ForegroundColor Green
 
 if ($mismatch -gt 0) { exit 1 }
 exit 0

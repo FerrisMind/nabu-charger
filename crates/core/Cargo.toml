@@ -1,6 +1,6 @@
 [package]
 name = "charger-core"
-description = "Транспорт-независимое ядро драйвера зарядки Xiaomi Pad 5 (nabu): детекция адаптера по APSD и политика входного тока"
+description = "Transport-independent core of the Xiaomi Pad 5 (nabu) charging driver: adapter detection via APSD and input current policy"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,13 +15,13 @@ name = "charger_core"
 doctest = false
 
 [features]
-# `testkit` входит в стандартную сборку, чтобы примеры из документации собирались
-# и исполнялись в `cargo test`. Драйвер режима ядра подключает крейт с
-# `default-features = false` и мок не тянет.
+# `testkit` is part of the default build so that the doc examples compile and run
+# under `cargo test`. The kernel-mode driver pulls the crate with
+# `default-features = false` and does not pull the mock.
 default = ["std", "testkit"]
-# `std` используется тестами и хост-инструментами; ядро собирается и без него.
+# `std` is used by the tests and host tools; the core builds without it.
 std = []
-# `testkit` добавляет эталонный мок-транспорт и журнал в память.
+# `testkit` adds the reference mock transport and the in-memory journal.
 testkit = []
 
 [lints]

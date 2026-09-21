@@ -1,39 +1,39 @@
-//! Разбор результата аппаратной детекции адаптера (APSD).
+//! Parsing of the hardware adapter detection (APSD) result.
 //!
-//! Логика повторяет функцию `smblib_get_apsd_result()` из эталонного драйвера
-//! Android (`qcom/smb5-lib.c`, ветка 16.0, конфигурация `CONFIG_MACH_XIAOMI_NABU`),
-//! чтобы под Windows тип адаптера определялся так же, как под Android.
+//! The logic mirrors the `smblib_get_apsd_result()` function of the reference Android
+//! driver (`qcom/smb5-lib.c`, branch 16.0, configuration `CONFIG_MACH_XIAOMI_NABU`),
+//! so that under Windows the adapter type is identified the same way as under Android.
 
 use crate::error::ChargerError;
 use crate::policy::Qc35Support;
 use crate::regs;
 
-/// Тип подключённого адаптера питания.
+/// Type of the connected power adapter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum AdapterType {
-    /// Питание отсутствует или тип не определён.
+    /// No power, or the type is not identified.
     Unknown,
-    /// Стандартный порт USB (предел 500 мА).
+    /// Standard USB port (500 mA limit).
     Sdp,
-    /// Прочий порт зарядки.
+    /// Other charging port.
     Ocp,
-    /// Порт зарядки с данными.
+    /// Charging port with data.
     Cdp,
-    /// Порт только зарядки.
+    /// Charging-only port.
     Dcp,
-    /// Нестандартный источник (FLOAT).
+    /// Non-standard source (FLOAT).
     Float,
     /// Quick Charge 2.0.
     Hvdcp2,
     /// Quick Charge 3.0.
     Hvdcp3,
-    /// Quick Charge 3.5 (режим, который использует родной блок планшета).
+    /// Quick Charge 3.5 (the mode used by the tablet's own power brick).
     Hvdcp3P5,
 }
 
 impl AdapterType {
-    /// Стабильное короткое имя для журнала и таблиц.
+    /// Stable short name for the journal and tables.
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
@@ -49,17 +49,17 @@ impl AdapterType {
         }
     }
 
-    /// Является ли адаптер быстрым (Quick Charge).
+    /// Whether the adapter is a fast one (Quick Charge).
     #[must_use]
     pub const fn is_hvdcp(self) -> bool {
         matches!(self, Self::Hvdcp2 | Self::Hvdcp3 | Self::Hvdcp3P5)
     }
 
-    /// Образец, который аппаратура выставляет в `APSD_RESULT_STATUS`.
+    /// Pattern the hardware sets in `APSD_RESULT_STATUS`.
     ///
-    /// Для [`AdapterType::Hvdcp3P5`] отдельного образца нет: аппаратура сообщает
-    /// HVDCP3, а версия 3.5 подтверждается отдельной аутентификацией, поэтому
-    /// возвращается образец HVDCP3.
+    /// There is no separate pattern for [`AdapterType::Hvdcp3P5`]: the hardware reports
+    /// HVDCP3, and version 3.5 is confirmed by separate authentication, so the HVDCP3
+    /// pattern is returned.
     #[must_use]
     pub const fn apsd_pattern(self) -> u8 {
         match self {
@@ -74,15 +74,15 @@ impl AdapterType {
         }
     }
 
-    /// Разбирает образец без учёта признака Quick Charge.
+    /// Parses a pattern without considering the Quick Charge flag.
     ///
-    /// Возвращает [`ChargerError::UnknownAdapterPattern`], если сочетание битов
-    /// не описано аппаратурой.
+    /// Returns [`ChargerError::UnknownAdapterPattern`] if the combination of bits is
+    /// not described by the hardware.
     ///
     /// # Errors
     ///
-    /// [`ChargerError::UnknownAdapterPattern`] — если значение не совпало ни с
-    /// одним известным образцом.
+    /// [`ChargerError::UnknownAdapterPattern`] - if the value matched none of the
+    /// known patterns.
     pub fn from_pattern(raw: u8) -> Result<Self, ChargerError> {
         match raw {
             0 => Ok(Self::Unknown),
@@ -97,22 +97,22 @@ impl AdapterType {
         }
     }
 
-    /// Полный разбор пары регистров `APSD_STATUS` и `APSD_RESULT_STATUS`.
+    /// Full parse of the `APSD_STATUS` and `APSD_RESULT_STATUS` register pair.
     ///
-    /// Повторяет `smblib_get_apsd_result()`:
+    /// Mirrors `smblib_get_apsd_result()`:
     ///
-    /// 1. бит «детекция завершена» обязателен, иначе [`ChargerError::DetectionNotComplete`];
-    /// 2. бит таймаута проверки HVDCP даёт [`ChargerError::AdapterCheckTimeout`];
-    /// 3. образец из `APSD_RESULT_STATUS` переводится в базовый тип;
-    /// 4. если выставлен бит Quick Charge, базовый тип уточняется: HVDCP3 остаётся
-    ///    HVDCP3 (или становится HVDCP3P5 при подтверждённой аутентификации),
-    ///    всё остальное считается HVDCP2.
+    /// 1. the "detection complete" bit is required, else [`ChargerError::DetectionNotComplete`];
+    /// 2. the HVDCP check timeout bit gives [`ChargerError::AdapterCheckTimeout`];
+    /// 3. the pattern from `APSD_RESULT_STATUS` is mapped to a base type;
+    /// 4. if the Quick Charge bit is set, the base type is refined: HVDCP3 stays
+    ///    HVDCP3 (or becomes HVDCP3P5 when authentication is confirmed),
+    ///    everything else is treated as HVDCP2.
     ///
     /// # Errors
     ///
-    /// * [`ChargerError::DetectionNotComplete`] — детекция ещё идёт.
-    /// * [`ChargerError::AdapterCheckTimeout`] — аппаратура зафиксировала таймаут HVDCP.
-    /// * [`ChargerError::UnknownAdapterPattern`] — неизвестное сочетание битов.
+    /// * [`ChargerError::DetectionNotComplete`] - detection is still running.
+    /// * [`ChargerError::AdapterCheckTimeout`] - the hardware recorded an HVDCP timeout.
+    /// * [`ChargerError::UnknownAdapterPattern`] - unknown combination of bits.
     pub fn decode(
         apsd_status: u8,
         apsd_result: u8,
@@ -133,7 +133,7 @@ impl AdapterType {
             return Ok(base);
         }
 
-        // QC3.5 подтверждается отдельной аутентификацией; без неё честно сообщаем HVDCP3.
+        // QC3.5 is confirmed by separate authentication; without it we honestly report HVDCP3.
         let resolved = match base {
             Self::Hvdcp3P5 => Self::Hvdcp3P5,
             Self::Hvdcp3 => {
@@ -154,9 +154,9 @@ impl AdapterType {
         Ok(resolved)
     }
 
-    /// Загружен ли порт зарядкой с точки зрения операционной системы.
+    /// Whether the port is charging as seen by the operating system.
     ///
-    /// Любой тип, кроме [`AdapterType::Unknown`], означает присутствие источника.
+    /// Any type other than [`AdapterType::Unknown`] means a source is present.
     #[must_use]
     pub const fn is_power_present(self) -> bool {
         !matches!(self, Self::Unknown)
@@ -209,7 +209,7 @@ mod tests {
                 .expect("HVDCP3"),
             AdapterType::Hvdcp3
         );
-        // Признак QC при неизвестном базовом типе трактуется как HVDCP2.
+        // The QC flag with an unknown base type is treated as HVDCP2.
         assert_eq!(
             AdapterType::decode(done, regs::PATTERN_SDP, Qc35Support::Unsupported).expect("HVDCP2"),
             AdapterType::Hvdcp2
@@ -246,7 +246,7 @@ mod tests {
     #[test]
     fn incomplete_detection_is_reported() {
         let err = AdapterType::decode(0, regs::PATTERN_DCP, Qc35Support::Unsupported)
-            .expect_err("детекция не завершена");
+            .expect_err("detection not complete");
         assert!(matches!(err, crate::ChargerError::DetectionNotComplete));
     }
 
@@ -254,7 +254,7 @@ mod tests {
     fn hvdcp_check_timeout_is_reported() {
         let status = regs::APSD_DTC_STATUS_DONE | regs::HVDCP_CHECK_TIMEOUT;
         let err = AdapterType::decode(status, regs::PATTERN_HVDCP3, Qc35Support::Unsupported)
-            .expect_err("адаптер нестабилен");
+            .expect_err("adapter is unstable");
         assert!(matches!(
             err,
             crate::ChargerError::AdapterCheckTimeout { .. }
@@ -264,7 +264,7 @@ mod tests {
     #[test]
     fn unknown_pattern_is_reported() {
         let err = AdapterType::decode(regs::APSD_DTC_STATUS_DONE, 0x3F, Qc35Support::Unsupported)
-            .expect_err("неизвестный образец");
+            .expect_err("unknown pattern");
         assert!(matches!(
             err,
             crate::ChargerError::UnknownAdapterPattern { raw: 0x3F }

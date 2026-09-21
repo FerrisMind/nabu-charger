@@ -1,26 +1,26 @@
-//! Ядро драйвера зарядки Xiaomi Pad 5 (`nabu`) под Windows on ARM.
+//! Charging driver core for the Xiaomi Pad 5 (`nabu`) on Windows on ARM.
 //!
-//! Крейт не зависит от платформы, не требует `std` и не выполняет ввод-вывод
-//! самостоятельно: доступ к железу идёт через [`ChargerTransport`], время — через
-//! [`Clock`], журнал — через [`Journal`]. Благодаря этому вся логика детекции
-//! адаптера и выставления лимита тока проверяется на моке без реального устройства.
+//! The crate is platform-independent, does not require `std` and performs no
+//! input/output of its own: hardware access goes through [`ChargerTransport`], time
+//! through [`Clock`], the journal through [`Journal`]. This makes all adapter detection
+//! and current limit logic testable on a mock without real hardware.
 //!
-//! # Зачем это нужно
+//! # Why this is needed
 //!
-//! Под Windows планшет не заряжается ни от одного блока: аппаратная детекция
-//! адаптера (APSD) в PMIC выполняется, но ни один компонент Windows её результат
-//! не читает, поэтому входной ток не поднимается. Ядро закрывает ровно этот
-//! пробел: читает результат детекции и применяет политику тока.
+//! Under Windows the tablet does not charge from any power brick: the hardware adapter
+//! detection (APSD) in the PMIC does run, but no Windows component reads its result,
+//! so the input current is never raised. The core closes exactly this gap: it reads the
+//! detection result and applies the current policy.
 //!
-//! # Что делает ядро
+//! # What the core does
 //!
-//! 1. Проверяет связь с периферией зарядника ([`Charger::open`]).
-//! 2. Дожидается окончания APSD и разбирает тип адаптера ([`Charger::detect_step`]).
-//! 3. Считает и применяет лимит входного тока ([`Charger::apply`]).
-//! 4. Следит за сменой адаптера ([`Charger::monitor`]).
-//! 5. Корректно освобождает ресурсы ([`Charger::close`] и [`Drop`]).
+//! 1. Verifies the link to the charger peripheral ([`Charger::open`]).
+//! 2. Waits for APSD to finish and parses the adapter type ([`Charger::detect_step`]).
+//! 3. Computes and applies the input current limit ([`Charger::apply`]).
+//! 4. Watches for an adapter change ([`Charger::monitor`]).
+//! 5. Releases resources cleanly ([`Charger::close`] and [`Drop`]).
 //!
-//! # Пример
+//! # Examples
 //!
 //! ```no_run
 //! use core::testkit::ScriptedMockTransport;
@@ -41,12 +41,12 @@
 //! # }
 //! ```
 //!
-//! # Границы ответственности
+//! # Scope of responsibility
 //!
-//! Крейт **не** пишет в реестр Windows, не управляет charge pump (LN8000) и не
-//! работает с файловой системой. Транспорт к регистрам PMIC предоставляется
-//! уровнем выше: в хост-инструментах это мок или TCP, в драйвере режима ядра —
-//! SPMI через устройство `\Device\RESOURCE_HUB`.
+//! The crate does **not** write to the Windows registry, does not drive the charge pump
+//! (LN8000) and does not touch the file system. The transport to the PMIC registers is
+//! provided by the layer above: in the host tools it is a mock or TCP, in the kernel-mode
+//! driver it is SPMI through the `\Device\RESOURCE_HUB` device.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]

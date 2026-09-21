@@ -1,22 +1,22 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 <#
-    remote-bringup.ps1 — вся работа на планшете выполняется с этого компьютера.
+    remote-bringup.ps1 - all the work on the tablet is done from this computer.
 
-    Запуск (здесь, на компьютере разработки):
+    Run (here, on the development computer):
         .\remote-bringup.ps1 -Computer 192.168.1.50 -User nabuagent -Password 'Nb!...'
 
-    Что делает по шагам:
-      1) проверяет связь с планшетом и открывает сессию удалённого управления;
-      2) копирует комплект драйвера на планшет;
-      3) проверяет режим подписи и, если он был выключен, включает его и просит
-         вас перезагрузить планшет (после перезагрузки запустите скрипт снова);
-      4) ставит драйвер и запускает сбор отчёта (bring-up.ps1) прямо на планшете;
-      5) приносит отчёт, архив, протокол приёмки и отчёт Windows о питании в
-         папку G:\nabu-fast-charge\12-reports;
-      6) по ключу -RemoveAccess удаляет временный доступ на планшете.
+    What it does, step by step:
+      1) checks connectivity to the tablet and opens a remote management session;
+      2) copies the driver package to the tablet;
+      3) checks the signing mode and, if it was off, turns it on and asks
+         you to reboot the tablet (after the reboot run the script again);
+      4) installs the driver and starts the report collection (bring-up.ps1) right on the tablet;
+      5) brings back the report, the archive, the acceptance protocol and the Windows
+         power report into the folder G:\nabu-fast-charge\12-reports;
+      6) with the -RemoveAccess switch removes the temporary access on the tablet.
 
-    Оговорка: удалённое управление по WinRM в локальной сети шифрует трафик
-    слабо. Годится для доверенной домашней сети; в открытой сети так делать не надо.
+    Caveat: WinRM remote management over the local network encrypts traffic
+    weakly. It is fine for a trusted home network; do not do this on an open network.
 #>
 [CmdletBinding()]
 param(
@@ -39,49 +39,49 @@ New-Item -ItemType Directory -Path $InboxDir -Force | Out-Null
 $securePassword = ConvertTo-SecureString $Password -AsPlainText -Force
 $credential = New-Object System.Management.Automation.PSCredential($User, $securePassword)
 
-Write-Host ('=== планшет ' + $Computer + ' ===') -ForegroundColor Cyan
+Write-Host ('=== tablet ' + $Computer + ' ===') -ForegroundColor Cyan
 
-Write-Host '1. проверяю связь' -ForegroundColor Cyan
+Write-Host '1. checking connectivity' -ForegroundColor Cyan
 try {
     $wsman = Test-WSMan -ComputerName $Computer -Credential $credential -ErrorAction Stop
-    Write-Host ('  связь есть: ' + $wsman.ProductVendor + ' ' + $wsman.ProductVersion)
+    Write-Host ('  connection OK: ' + $wsman.ProductVendor + ' ' + $wsman.ProductVersion)
 } catch {
-    throw ('планшет недоступен: ' + $_.Exception.Message +
-           '. Проверьте адрес, что на планшете выполнен enable-remote.ps1 и что вы в одной сети')
+    throw ('tablet unreachable: ' + $_.Exception.Message +
+           '. Check the address, that enable-remote.ps1 has been run on the tablet and that you are on the same network')
 }
 
 $options = New-PSSessionOption -OperationTimeout 300000 -IdleTimeout 600000
 $session = New-PSSession -ComputerName $Computer -Credential $credential -SessionOption $options
-Write-Host ('  сессия открыта: ' + $session.Id)
+Write-Host ('  session opened: ' + $session.Id)
 
 try {
-    Write-Host '2. копирую комплект' -ForegroundColor Cyan
+    Write-Host '2. copying the package' -ForegroundColor Cyan
     Invoke-Command -Session $session -ScriptBlock {
         param($dir)
         New-Item -ItemType Directory -Path $dir -Force | Out-Null
     } -ArgumentList $RemoteDir | Out-Null
     Copy-Item -Path (Join-Path $kit '*') -Destination $RemoteDir -ToSession $session -Force -Recurse
-    Write-Host ('  файлов отправлено: ' + (Get-ChildItem $kit -File).Count)
+    Write-Host ('  files sent: ' + (Get-ChildItem $kit -File).Count)
 
-    Write-Host '3. проверяю режим подписи драйверов' -ForegroundColor Cyan
+    Write-Host '3. checking the driver signing mode' -ForegroundColor Cyan
     $signing = Invoke-Command -Session $session -ScriptBlock {
         $out = & bcdedit /enum '{current}' 2>&1 | Out-String
         [pscustomobject]@{ Enabled = ($out -match 'testsigning\s+Yes') }
     }
     if (-not $signing.Enabled -and -not $SkipSignatureCheck) {
-        Write-Host '  режим выключен — включаю и перезагружаю планшет' -ForegroundColor Yellow
+        Write-Host '  mode is off - enabling it and rebooting the tablet' -ForegroundColor Yellow
         Invoke-Command -Session $session -ScriptBlock {
             & bcdedit /set testsigning on | Out-Null
             Restart-Computer -Force
         } | Out-Null
         Write-Host ''
-        Write-Host '  Планшет уходит на перезагрузку. Когда он поднимется —' -ForegroundColor Yellow
-        Write-Host '  запустите этот же скрипт ещё раз (он увидит, что режим уже включён).' -ForegroundColor Yellow
+        Write-Host '  The tablet is going for a reboot. Once it is up,' -ForegroundColor Yellow
+        Write-Host '  run this same script again (it will see that the mode is already on).' -ForegroundColor Yellow
         return
     }
-    Write-Host '  режим подписи включён'
+    Write-Host '  signing mode is on'
 
-    Write-Host '4. запускаю сбор отчёта на планшете' -ForegroundColor Cyan
+    Write-Host '4. starting the report collection on the tablet' -ForegroundColor Cyan
     $result = Invoke-Command -Session $session -ScriptBlock {
         param($dir, $seconds)
         Set-Location $dir
@@ -95,39 +95,39 @@ try {
         }
     } -ArgumentList $RemoteDir, $ChargeSampleSeconds
 
-    Write-Host '5. забираю отчёт' -ForegroundColor Cyan
+    Write-Host '5. fetching the report' -ForegroundColor Cyan
     $copied = 0
     foreach ($file in $result.Files) {
         Copy-Item -LiteralPath $file.FullName -Destination $InboxDir -FromSession $session -Force
         $copied++
-        Write-Host ('  получено: ' + $file.Name)
+        Write-Host ('  received: ' + $file.Name)
     }
 
     Write-Host ''
-    Write-Host ('=== ключевые строки отчёта (всего файлов: ' + $copied + ') ===') -ForegroundColor Cyan
+    Write-Host ('=== key report lines (total files: ' + $copied + ') ===') -ForegroundColor Cyan
     $result.Output -split "`r?`n" |
-        Where-Object { $_ -match 'вывод\s*:|разница|узел|Problem|режим|заряд|ОШИБКА|не удалось' } |
+        Where-Object { $_ -match 'output\s*:|difference|node|Problem|mode|charge|ERROR|failed' } |
         Select-Object -First 20 | ForEach-Object { Write-Host ('  ' + $_.Trim()) }
 
     Write-Host ''
-    Write-Host ('Отчёты лежат в: ' + $InboxDir) -ForegroundColor Green
+    Write-Host ('Reports are in: ' + $InboxDir) -ForegroundColor Green
 } finally {
     if ($RemoveAccess) {
-        Write-Host '6. убираю временный доступ на планшете' -ForegroundColor Cyan
+        Write-Host '6. removing the temporary access on the tablet' -ForegroundColor Cyan
         try {
             Invoke-Command -Session $session -ScriptBlock {
                 param($name)
                 Remove-LocalUser -Name $name -ErrorAction SilentlyContinue
                 Remove-NetFirewallRule -DisplayName 'nabu remote 5985' -ErrorAction SilentlyContinue
                 Disable-PSRemoting -Force -ErrorAction SilentlyContinue
-                'доступ убран'
+                'access removed'
             } -ArgumentList $User | ForEach-Object { Write-Host ('  ' + $_) }
         } catch {
-            Write-Host ('  не удалось убрать автоматически: ' + $_.Exception.Message) -ForegroundColor Yellow
-            Write-Host '  выполните на планшете: Remove-LocalUser -Name ' -NoNewline
+            Write-Host ('  could not remove automatically: ' + $_.Exception.Message) -ForegroundColor Yellow
+            Write-Host '  run this on the tablet: Remove-LocalUser -Name ' -NoNewline
             Write-Host $User
         }
     }
     Remove-PSSession -Session $session -ErrorAction SilentlyContinue
-    Write-Host 'сессия закрыта'
+    Write-Host 'session closed'
 }

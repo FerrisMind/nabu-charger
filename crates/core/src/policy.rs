@@ -1,44 +1,44 @@
-//! Политика входного тока: сколько можно взять от распознанного адаптера.
+//! Input current policy: how much may be drawn from the identified adapter.
 //!
-//! Константы взяты из эталонного драйвера Android
-//! (`qcom/smb5-lib.h`, `ti/cp_qc30.h`, ветка 16.0). Токи — в микроамперax.
+//! The constants are taken from the reference Android driver
+//! (`qcom/smb5-lib.h`, `ti/cp_qc30.h`, branch 16.0). Currents are in microamperes.
 
 use crate::apsd::AdapterType;
 
-/// Минимальный лимит входного тока (`DCIN_ICL_MIN_UA` в Android).
+/// Minimum input current limit (`DCIN_ICL_MIN_UA` in Android).
 pub const MIN_ICL_UA: u32 = 100_000;
 
-/// Верхняя граница, которую ядро разрешает выставить (`DCIN_ICL_MAX_UA` плюс запас).
+/// Upper bound the core allows to apply (`DCIN_ICL_MAX_UA` plus margin).
 pub const MAX_ICL_UA: u32 = 4_500_000;
 
-/// Ток стандартного порта USB 2.0/3.x — 500 мА.
+/// Current of a standard USB 2.0/3.x port: 500 mA.
 pub const ICL_SDP_UA: u32 = 500_000;
-/// Ток порта зарядки по BC1.2 — 1.5 А.
+/// Charging port current per BC1.2: 1.5 A.
 pub const ICL_DCP_UA: u32 = 1_500_000;
-/// Ток порта зарядки с данными по BC1.2 — 1.5 А.
+/// Charging port with data current per BC1.2: 1.5 A.
 pub const ICL_CDP_UA: u32 = 1_500_000;
-/// Ток для HVDCP2 (`HVDCP2_CURRENT_UA`).
+/// Current for HVDCP2 (`HVDCP2_CURRENT_UA`).
 pub const ICL_HVDCP2_UA: u32 = 1_500_000;
-/// Ток для HVDCP3 (`HVDCP_CURRENT_UA`).
+/// Current for HVDCP3 (`HVDCP_CURRENT_UA`).
 pub const ICL_HVDCP3_UA: u32 = 3_000_000;
-/// Ток для HVDCP3.5 на стороне SMB (ограничение одного ключа).
+/// Current for HVDCP3.5 on the SMB side (single switch limit).
 pub const ICL_HVDCP3P5_SMB_UA: u32 = 3_000_000;
-/// Паспортный ток родного блока при работе через charge pump (`HVDCP3P5_40W_CURRENT_UA`).
+/// Rated current of the own power brick through the charge pump (`HVDCP3P5_40W_CURRENT_UA`).
 pub const HVDCP3P5_PUMP_BUS_UA: u32 = 4_500_000;
 
-/// Напряжение, запрашиваемое у адаптера в режиме QC2.
+/// Voltage requested from the adapter in QC2 mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Qc2Voltage {
-    /// 5 В.
+    /// 5 V.
     V5,
-    /// 9 В.
+    /// 9 V.
     V9,
-    /// 12 В.
+    /// 12 V.
     V12,
 }
 
 impl Qc2Voltage {
-    /// Значение битов 7:6 регистра `HVDCP_PULSE_COUNT_MAX`.
+    /// Value of bits 7:6 of the `HVDCP_PULSE_COUNT_MAX` register.
     #[must_use]
     pub const fn raw(self) -> u8 {
         match self {
@@ -48,7 +48,7 @@ impl Qc2Voltage {
         }
     }
 
-    /// Подпись для журнала.
+    /// Label for the journal.
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
@@ -59,44 +59,44 @@ impl Qc2Voltage {
     }
 }
 
-/// Состояние поддержки Quick Charge 3.5 на этой платформе.
+/// Quick Charge 3.5 support state on this platform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Qc35Support {
-    /// Платформа не поддерживает QC3.5, тип понижается до HVDCP3/HVDCP2.
+    /// The platform does not support QC3.5; the type is downgraded to HVDCP3/HVDCP2.
     Unsupported,
-    /// Платформа поддерживает QC3.5; `authenticated` — прошла ли аутентификация.
+    /// The platform supports QC3.5; `authenticated` says whether authentication passed.
     Supported {
-        /// Результат аутентификации QC3.5.
+        /// QC3.5 authentication result.
         authenticated: bool,
     },
 }
 
 impl Default for Qc35Support {
     fn default() -> Self {
-        // Планшет nabu поддерживает QC3.5, но аутентификация по умолчанию не пройдена.
+        // The nabu tablet supports QC3.5, but authentication has not passed by default.
         Self::Supported {
             authenticated: false,
         }
     }
 }
 
-/// Итоговое решение по распознанному адаптеру.
+/// Final decision for the identified adapter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChargePolicy {
-    /// Лимит входного тока в микроамперax.
+    /// Input current limit in microamperes.
     pub icl_ua: u32,
-    /// Требуется ли поднять напряжение у адаптера (QC2).
+    /// Whether the adapter voltage must be raised (QC2).
     pub qc2_voltage: Option<Qc2Voltage>,
-    /// Можно ли подключать charge pump на вторую ступень.
+    /// Whether the charge pump may be attached as a second stage.
     pub pump_eligible: bool,
-    /// Обоснование для журнала.
+    /// Rationale for the journal.
     pub rationale: &'static str,
 }
 
-/// Считает политику по типу адаптера.
+/// Computes the policy for an adapter type.
 ///
-/// Для неизвестного источника выставляется минимальный безопасный ток: лучше
-/// медленная зарядка, чем перегрузка порта.
+/// For an unknown source the minimum safe current is applied: slow charging is
+/// better than overloading the port.
 #[must_use]
 pub fn policy_for(adapter: AdapterType, qc35: Qc35Support) -> ChargePolicy {
     match adapter {
@@ -104,37 +104,37 @@ pub fn policy_for(adapter: AdapterType, qc35: Qc35Support) -> ChargePolicy {
             icl_ua: ICL_SDP_UA,
             qc2_voltage: None,
             pump_eligible: false,
-            rationale: "стандартный порт USB, предел 500 мА",
+            rationale: "standard USB port, 500 mA limit",
         },
         AdapterType::Cdp => ChargePolicy {
             icl_ua: ICL_CDP_UA,
             qc2_voltage: None,
             pump_eligible: false,
-            rationale: "порт зарядки с данными, BC1.2 1.5 А",
+            rationale: "charging port with data, BC1.2 1.5 A",
         },
         AdapterType::Dcp => ChargePolicy {
             icl_ua: ICL_DCP_UA,
             qc2_voltage: None,
             pump_eligible: false,
-            rationale: "порт только зарядки, BC1.2 1.5 А",
+            rationale: "charging-only port, BC1.2 1.5 A",
         },
         AdapterType::Ocp | AdapterType::Float | AdapterType::Unknown => ChargePolicy {
             icl_ua: MIN_ICL_UA,
             qc2_voltage: None,
             pump_eligible: false,
-            rationale: "источник не опознан, минимальный безопасный ток",
+            rationale: "source not identified, minimum safe current",
         },
         AdapterType::Hvdcp2 => ChargePolicy {
             icl_ua: ICL_HVDCP2_UA,
             qc2_voltage: Some(Qc2Voltage::V9),
             pump_eligible: false,
-            rationale: "Quick Charge 2.0, 9 В и 1.5 А",
+            rationale: "Quick Charge 2.0, 9 V and 1.5 A",
         },
         AdapterType::Hvdcp3 => ChargePolicy {
             icl_ua: ICL_HVDCP3_UA,
             qc2_voltage: Some(Qc2Voltage::V9),
             pump_eligible: true,
-            rationale: "Quick Charge 3.0, 9 В и 3 А, возможен charge pump",
+            rationale: "Quick Charge 3.0, 9 V and 3 A, charge pump possible",
         },
         AdapterType::Hvdcp3P5 => {
             let pump_eligible = matches!(
@@ -147,18 +147,18 @@ pub fn policy_for(adapter: AdapterType, qc35: Qc35Support) -> ChargePolicy {
                 icl_ua: ICL_HVDCP3P5_SMB_UA,
                 qc2_voltage: Some(Qc2Voltage::V9),
                 pump_eligible,
-                rationale: "Quick Charge 3.5, родной блок планшета",
+                rationale: "Quick Charge 3.5, the tablet's own power brick",
             }
         }
     }
 }
 
-/// Ограничивает лимит тока сверху значениями из конфигурации ядра.
+/// Bounds the current limit from above by the values from the core configuration.
 ///
 /// # Errors
 ///
-/// [`crate::ChargerError::CurrentOutOfRange`] — если ток ниже минимума или выше
-/// разрешённого максимума.
+/// [`crate::ChargerError::CurrentOutOfRange`] - if the current is below the minimum
+/// or above the allowed maximum.
 pub fn clamp_icl(icl_ua: u32, max_ua: u32) -> Result<u32, crate::error::ChargerError> {
     if icl_ua < MIN_ICL_UA {
         return Err(crate::error::ChargerError::CurrentOutOfRange {

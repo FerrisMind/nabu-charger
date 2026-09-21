@@ -1,18 +1,18 @@
 /*
- * ln8000_charger_extract.h — выдержка из эталонного заголовка LN8000.
+ * ln8000_charger_extract.h - excerpt from the LN8000 reference header.
  *
- * Источник : https://github.com/EmanuelCN/kernel_xiaomi_sm8250
- * Путь     : drivers/power/supply/lionsemi/ln8000_charger.h
- * Коммит   : 9e94307b9c1994cba25849099a0582ad3ab00390
- * Лицензия : GPL-2.0, Copyright (C) 2021 Lion Semiconductor Inc.
+ * Source   : https://github.com/EmanuelCN/kernel_xiaomi_sm8250
+ * Path     : drivers/power/supply/lionsemi/ln8000_charger.h
+ * Commit   : 9e94307b9c1994cba25849099a0582ad3ab00390
+ * License  : GPL-2.0, Copyright (C) 2021 Lion Semiconductor Inc.
  *
- * Это НЕ файл целиком: оставлены только те определения, которые нужны для
- * машинной сверки адресов регистров и битовых масок. Полный файл можно
- * восстановить из указанного коммита — команда в reference/README.md.
- * Ничего из этого файла в сборку драйвера не попадает.
+ * This is NOT the whole file: only the definitions needed for the machine
+ * cross-check of register addresses and bit masks are kept. The full file can be
+ * restored from the commit above - the command is in reference/README.md.
+ * Nothing from this file ends up in the driver build.
  */
 
-/* ---- маски битов ---- */
+/* ---- bit masks ---- */
 
 enum ln8000_int1_desc {
 	LN8000_MASK_FAULT_INT = BIT(7),
@@ -60,7 +60,7 @@ enum ln8000_ldo_sts_desc {
 	LN8000_MASK_RECHARGE_STS = BIT(4),
 };
 
-/* ---- номера битов в управляющих регистрах ---- */
+/* ---- bit numbers in the control registers ---- */
 
 enum ln8000_regulation_ctrl_desc {
 	LN8000_BIT_ENABLE_VFLOAT_LOOP_INT = 7,
@@ -91,7 +91,7 @@ enum ln8000_bc_op1_desc {
 	LN8000_BIT_DUAL_LOCKOUT_EN = 0,
 };
 
-/* ---- адреса регистров: то, чего не было в комплекте источников ---- */
+/* ---- register addresses: what was missing from the source set ---- */
 
 enum ln8000_reg_addr {
 	LN8000_REG_DEVICE_ID = 0x00,
@@ -139,7 +139,7 @@ enum ln8000_reg_addr {
 	LN8000_REG_BC_STS_E = 0x4D,
 };
 
-/* ---- коды каналов АЦП и их регистры ---- */
+/* ---- ADC channel codes and their registers ---- */
 
 enum ln8000_adc_channel_index {
 	LN8000_ADC_CH_VOUT = 1,
@@ -153,8 +153,8 @@ enum ln8000_adc_channel_index {
 	LN8000_ADC_CH_ALL
 };
 
-/* Ключевое для сверки каналов: эталон читает именно эти регистры
-   (ln8000_get_adc_data, switch по каналу):
+/* Key to the channel cross-check: the reference reads exactly these registers
+   (ln8000_get_adc_data, switch by channel):
 	VOUT    -> LN8000_REG_ADC04_STS
 	VIN     -> LN8000_REG_ADC03_STS
 	VBAT    -> LN8000_REG_ADC06_STS
@@ -163,9 +163,9 @@ enum ln8000_adc_channel_index {
 	DIETEMP -> LN8000_REG_ADC07_STS
 	TSBAT   -> LN8000_REG_ADC08_STS
 	TSBUS   -> LN8000_REG_ADC09_STS
-   и на время чтения ставит бит паузы в LN8000_REG_TIMER_CTRL (бит 1). */
+   and sets the pause bit in LN8000_REG_TIMER_CTRL (bit 1) for the duration of the read. */
 
-/* ---- числовые константы ---- */
+/* ---- numeric constants ---- */
 
 #define LN8000_DEVICE_ID 0x42
 #define LN8000_VBAT_FLOAT_MIN 3725000

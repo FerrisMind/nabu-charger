@@ -1,8 +1,8 @@
 ; =====================================================================
-; nabu-charger — драйвер зарядки Xiaomi Pad 5 (nabu)
+; nabu-charger - Xiaomi Pad 5 charging driver (nabu)
 ;
-; Модуль: kmdf.inx → kmdf.inf (шаблон, из него cargo-wdk собирает INF)
-; Целевая платформа: Windows on ARM64 (aarch64-pc-windows-msvc)
+; Module: kmdf.inx -> kmdf.inf (template from which cargo-wdk builds the INF)
+; Target platform: Windows on ARM64 (aarch64-pc-windows-msvc)
 ; =====================================================================
 
 [Version]
@@ -22,9 +22,9 @@ DefaultDestDir = 13
 [SourceDisksFiles]
 kmdf.sys = 1,,
 
-; ================= Установка устройства =================
-; Секция [ClassInstall32] здесь НЕ нужна: класс System объявлен Microsoft,
-; и infverif запрещает переопределять его (ERROR 1285).
+; ================= Device installation =================
+; The [ClassInstall32] section is NOT needed here: the System class is declared
+; by Microsoft, and infverif forbids redefining it (ERROR 1285).
 
 [Manufacturer]
 %StdMfg% = NabuCharger,NT$ARCH$.10.0...16299
@@ -38,7 +38,7 @@ CopyFiles = Drivers_Dir
 [Drivers_Dir]
 kmdf.sys
 
-; ================= Установка службы =================
+; ================= Service installation =================
 
 [NabuCharger_Device.NT$ARCH$.Services]
 AddService = kmdf, %SPSVCINST_ASSOCSERVICE%, NabuCharger_Service_Inst
@@ -50,17 +50,17 @@ StartType      = 3               ; SERVICE_DEMAND_START
 ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
 ServiceBinary  = %13%\kmdf.sys
 
-; ================= Удаление устройства (rollback) =================
+; ================= Device removal (rollback) =================
 
 [NabuCharger_Device.NT$ARCH$.HW]
-; Настройки устройства не требуются: параметры берутся из ядра логики.
+; No device settings are required: the parameters come from the logic core.
 
-; ================= Строки =================
+; ================= Strings =================
 
 [Strings]
 SPSVCINST_ASSOCSERVICE = 0x00000002
 ProviderString         = "nabu-fastcharge"
-StdMfg                 = "(Стандартные системные устройства)"
-DiskId1                = "nabu-charger, установочный диск #1"
-NabuCharger.DeviceDesc = "nabu-charger — контроллер зарядки Xiaomi Pad 5"
-NabuCharger.SVCDESC    = "nabu-charger — служба контроллера зарядки"
+StdMfg                 = "(Standard system devices)"
+DiskId1                = "nabu-charger, installation disk #1"
+NabuCharger.DeviceDesc = "nabu-charger - Xiaomi Pad 5 charging controller"
+NabuCharger.SVCDESC    = "nabu-charger - charging controller service"

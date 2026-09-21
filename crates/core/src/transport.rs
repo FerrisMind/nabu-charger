@@ -1,63 +1,63 @@
-//! Абстракция транспорта: как ядро попадает в регистры PMIC.
+//! Transport abstraction: how the core reaches the PMIC registers.
 //!
-//! Ядро знает только этот трейт. Реализации:
+//! The core knows only this trait. Implementations:
 //!
-//! | Реализация | Где живёт | Назначение |
+//! | Implementation | Where it lives | Purpose |
 //! |---|---|---|
-//! | [`crate::testkit::ScriptedMockTransport`] | этот крейт (`testkit`) | тесты и демо без железа |
-//! | `MockTransport` | `host` | мок с журналом транзакций |
-//! | `TcpTransport` | `host` | реальный транспорт по сети (стенд, эмулятор) |
-//! | `SpmiTransport` | `kmdf` | реальное железо: SPMI через `\Device\RESOURCE_HUB` |
+//! | [`crate::testkit::ScriptedMockTransport`] | this crate | tests and demos without hardware |
+//! | `MockTransport` | `host` | mock with a transaction journal |
+//! | `TcpTransport` | `host` | real transport over the network (bench, emulator) |
+//! | `SpmiTransport` | `kmdf` | real hardware: SPMI through `\Device\RESOURCE_HUB` |
 
 use crate::error::TransportError;
 use crate::regs::RegAddr;
 
-/// Доступ к регистрам периферии зарядника.
+/// Access to the charger peripheral registers.
 ///
-/// Реализация обязана быть устойчивой к повторным вызовам после сбоя: ядро
-/// вызывает [`ChargerTransport::reset`] и продолжает работу, не перезапуская
-/// процесс.
+/// The implementation must tolerate repeated calls after a failure: the core
+/// calls [`ChargerTransport::reset`] and continues working without restarting
+/// the process.
 pub trait ChargerTransport {
-    /// Читает один байт регистра.
+    /// Reads one byte of a register.
     ///
     /// # Errors
     ///
-    /// Любая ошибка доступа к железу возвращается как [`TransportError`].
+    /// Any hardware access error is returned as [`TransportError`].
     fn read(&mut self, addr: RegAddr) -> Result<u8, TransportError>;
 
-    /// Записывает один байт регистра.
+    /// Writes one byte of a register.
     ///
     /// # Errors
     ///
-    /// Любая ошибка доступа к железу возвращается как [`TransportError`].
+    /// Any hardware access error is returned as [`TransportError`].
     fn write(&mut self, addr: RegAddr, value: u8) -> Result<(), TransportError>;
 
-    /// Сбрасывает состояние канала связи (переоткрытие устройства, очистка буферов).
+    /// Resets the link state (reopens the device, clears the buffers).
     ///
-    /// Вызывается ядром при восстановлении после сбоя транспорта.
+    /// Called by the core when recovering from a transport failure.
     ///
     /// # Errors
     ///
-    /// [`TransportError`], если канал не удалось восстановить.
+    /// [`TransportError`] if the link could not be recovered.
     fn reset(&mut self) -> Result<(), TransportError>;
 
-    /// Короткое имя транспорта для журнала (например, `mock`, `tcp`, `spmi`).
+    /// Short transport name for the journal (for example `mock`, `tcp`, `spmi`).
     fn name(&self) -> &'static str;
 
-    /// Читает регистр с маской: возвращает только значимые биты.
+    /// Reads a register with a mask: returns only the significant bits.
     ///
     /// # Errors
     ///
-    /// Пробрасывает ошибку [`ChargerTransport::read`].
+    /// Propagates the [`ChargerTransport::read`] error.
     fn read_masked(&mut self, addr: RegAddr, mask: u8) -> Result<u8, TransportError> {
         Ok(self.read(addr)? & mask)
     }
 
-    /// Обновляет биты регистра, не трогая остальные (read-modify-write).
+    /// Updates register bits without touching the rest (read-modify-write).
     ///
     /// # Errors
     ///
-    /// Пробрасывает ошибку чтения или записи.
+    /// Propagates a read or write error.
     fn update_bits(&mut self, addr: RegAddr, mask: u8, value: u8) -> Result<(), TransportError> {
         let current = self.read(addr)?;
         let updated = (current & !mask) | (value & mask);

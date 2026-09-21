@@ -1,10 +1,10 @@
-//! Эталонный мок шины I²C с моделью поведения чипа.
+//! Reference I²C bus mock with a model of the chip's behaviour.
 //!
-//! Мок не просто хранит регистры: он **моделирует смену режима** — запись в
-//! `SYS_CTRL` меняет биты в `SYS_STS` так же, как это делает LN8000. Благодаря
-//! этому тесты проверяют реальный сценарий, а не заглушку.
+//! The mock does not merely store registers: it **models mode changes**. A write
+//! to `SYS_CTRL` changes bits in `SYS_STS` just as the LN8000 does. Thanks to
+//! that the tests check a real scenario rather than a stub.
 //!
-//! Модуль включается фичей `testkit` и в боевую сборку драйвера не попадает.
+//! The module is gated by the `testkit` feature and is not part of a release build.
 
 use crate::error::{BusError, BusErrorKind};
 use crate::regs;
@@ -14,44 +14,44 @@ use core::cell::Cell;
 const MAX_REGS: usize = 64;
 const MAX_FAULTS: usize = 8;
 
-/// Внесённый сбой или особенность поведения.
+/// An injected fault or behaviour quirk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fault {
-    /// Следующие `times` чтений регистра падают.
+    /// The next `times` reads of the register fail.
     ReadError {
-        /// Адрес регистра.
+        /// Register address.
         addr: u8,
-        /// Сколько раз повторить.
+        /// How many times to repeat.
         times: u8,
     },
-    /// Следующие `times` записей регистра падают.
+    /// The next `times` writes to the register fail.
     WriteError {
-        /// Адрес регистра.
+        /// Register address.
         addr: u8,
-        /// Сколько раз повторить.
+        /// How many times to repeat.
         times: u8,
     },
-    /// Чтение возвращает другое значение (проверка верификации записи).
+    /// A read returns a different value (write verification check).
     WrongReadBack {
-        /// Адрес регистра.
+        /// Register address.
         addr: u8,
-        /// Что вернуть.
+        /// What to return.
         value: u8,
-        /// Сколько раз повторить.
+        /// How many times to repeat.
         times: u8,
     },
-    /// `SYS_STS` зафиксирован: чип «не слышит» команду смены режима.
+    /// `SYS_STS` is stuck: the chip "does not hear" the mode change command.
     StuckSysSts {
-        /// Какое значение всегда возвращать.
+        /// Which value to always return.
         value: u8,
     },
-    /// `SYS_STS` зафиксирован и **после** POR: отказ переживает `soft_reset`.
+    /// `SYS_STS` is stuck and stays so **after** POR: the fault survives `soft_reset`.
     ///
-    /// Отличие от [`Fault::StuckSysSts`] принципиально: тот снимается
-    /// soft-reset'ом, как защёлка на живом LN8000, а этот моделирует настоящую
-    /// негодность входа, от которой POR не спасает.
+    /// The difference from [`Fault::StuckSysSts`] is fundamental: that one clears on
+    /// soft-reset, like a latch on a live LN8000, while this one models a real
+    /// input defect that POR does not rescue.
     RefuseSysSts {
-        /// Какое значение всегда возвращать.
+        /// Which value to always return.
         value: u8,
     },
 }
@@ -73,7 +73,7 @@ struct FaultSlot {
     remaining: u8,
 }
 
-/// Мок шины I²C для LN8000.
+/// I²C bus mock for the LN8000.
 #[derive(Debug)]
 pub struct MockPumpBus {
     regs: [(u8, u8); MAX_REGS],
@@ -90,7 +90,7 @@ impl Default for MockPumpBus {
 }
 
 impl MockPumpBus {
-    /// Создаёт мок с корректным идентификатором устройства и нулевым состоянием.
+    /// Creates a mock with a correct device identifier and zeroed state.
     #[must_use]
     pub fn new() -> Self {
         let mut bus = Self {
@@ -108,7 +108,7 @@ impl MockPumpBus {
         bus
     }
 
-    /// Задаёт значение регистра модели.
+    /// Sets the value of a model register.
     pub fn set_reg(&mut self, addr: u8, value: u8) {
         for index in 0..self.count {
             if let Some(slot) = self.regs.get_mut(index) {
@@ -126,7 +126,7 @@ impl MockPumpBus {
         }
     }
 
-    /// Значение регистра модели.
+    /// Value of a model register.
     #[must_use]
     pub fn reg(&self, addr: u8) -> u8 {
         self.regs
@@ -136,7 +136,7 @@ impl MockPumpBus {
             .map_or(0, |slot| slot.1)
     }
 
-    /// Вносит сбой или особое поведение.
+    /// Injects a fault or a special behaviour.
     pub fn push_fault(&mut self, fault: Fault) {
         if self.fault_count < MAX_FAULTS {
             if let Some(slot) = self.faults.get_mut(self.fault_count) {
@@ -147,7 +147,7 @@ impl MockPumpBus {
         }
     }
 
-    /// Сколько раз шину сбрасывали.
+    /// How many times the bus was reset.
     #[must_use]
     pub fn reset_count(&self) -> u32 {
         self.reset_count.get()
@@ -177,7 +177,7 @@ impl MockPumpBus {
         None
     }
 
-    /// Пересчитывает `SYS_STS` так, как это делает настоящий чип.
+    /// Recomputes `SYS_STS` the way the real chip does.
     fn apply_sys_ctrl(&mut self, value: u8) {
         let sys_sts = if value & regs::SYS_CTRL_STANDBY_EN != 0 {
             regs::SYS_STS_STANDBY
@@ -209,7 +209,7 @@ impl RegisterBus for MockPumpBus {
             return Err(BusError::new(
                 BusErrorKind::Timeout,
                 0,
-                "внесённый сбой чтения",
+                "injected read fault",
             ));
         }
         if addr == regs::SYS_STS {
@@ -218,8 +218,8 @@ impl RegisterBus for MockPumpBus {
             {
                 return Ok(value);
             }
-            // `RefuseSysSts` не потребляется: отказ обязан держаться до конца
-            // прогона, иначе тест стадии 3 не дойдёт до маски.
+            // `RefuseSysSts` is not consumed: the fault must hold until the end
+            // of the run, otherwise the stage 3 test will never reach the mask.
             if let Some(Fault::RefuseSysSts { value }) =
                 self.consume(|f| matches!(f, Fault::RefuseSysSts { .. }))
             {
@@ -238,7 +238,7 @@ impl RegisterBus for MockPumpBus {
         if let Some(_fault) =
             self.consume(|f| matches!(f, Fault::WriteError { addr: a, .. } if *a == addr))
         {
-            return Err(BusError::new(BusErrorKind::Io, 0, "внесённый сбой записи"));
+            return Err(BusError::new(BusErrorKind::Io, 0, "injected write fault"));
         }
         self.set_reg(addr, value);
         if addr == regs::SYS_CTRL {

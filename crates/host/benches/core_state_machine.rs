@@ -1,6 +1,6 @@
-//! Замеры ядра драйвера: открытие, детекция, применение политики, полная сессия.
+//! Driver core measurements: open, detection, policy application, full session.
 //!
-//! Запуск:
+//! Run with:
 //!
 //! ```text
 //! cargo bench -p host --bench core_state_machine

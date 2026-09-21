@@ -1,12 +1,12 @@
 <!DOCTYPE html>
-<html lang="ru">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>LN8000 — протокол приёмки и состояние поставки</title>
+<title>LN8000 - acceptance protocol and delivery state</title>
 <style>
-  /* Оформление: preset 11 Build — «дорогая простота»: много воздуха,
-     контраст начертаний (200→700), один акцент, мягкие тени, без декора. */
+  /* Styling: preset 11 Build - "expensive simplicity": plenty of air,
+     weight contrast (200->700), one accent, soft shadows, no decoration. */
   html { font-size: 17px; }
   body {
     margin: 0; background: #fbfaf9; color: #14161a;
@@ -54,91 +54,91 @@
 <body>
 <div class="wrap">
 
-<h1>Charge pump <b>LN8000</b>: готовность к поставке</h1>
-<p class="sub">Xiaomi Pad 5 (nabu) · Windows on ARM64 · драйвер <code>ln8000_kmdf.sys</code> · 16.09.2026</p>
+<h1>Charge pump <b>LN8000</b>: delivery readiness</h1>
+<p class="sub">Xiaomi Pad 5 (nabu) · Windows on ARM64 · driver <code>ln8000_kmdf.sys</code> · 2026-09-16</p>
 
-<p class="lead">Драйвер charge pump собран под ARM64, подписан и упакован. Логика управления чипом перенесена из GPL-драйвера Android один в один, покрыта тестами и заведена в драйвер ядра через шину I²C узла <code>PEIC</code>. Ниже — что именно проверено машинно, что требует планшета и как откатиться.</p>
+<p class="lead">The charge pump driver is built for ARM64, signed and packaged. The chip control logic is ported one-to-one from the GPL Android driver, covered by tests and wired into the kernel driver through the I²C bus of the <code>PEIC</code> node. Below - what exactly is checked mechanically, what requires the tablet, and how to roll back.</p>
 
-<h2>Тракт управления</h2>
+<h2>Control path</h2>
 <div class="flow">
-  <div class="node"><div class="t">ACPI PEIC</div><div class="d"><code>QCOM057E</code>, I²C 0x51 на <code>\_SB.I2C5</code>, <code>_STA=0x0F</code></div></div>
+  <div class="node"><div class="t">ACPI PEIC</div><div class="d"><code>QCOM057E</code>, I²C 0x51 on <code>\_SB.I2C5</code>, <code>_STA=0x0F</code></div></div>
   <div class="arrow">→</div>
-  <div class="node"><div class="t">Resource Hub</div><div class="d"><code>\Device\RESOURCE_HUB\</code> + 16 hex от connection ID из <code>_CRS</code></div></div>
+  <div class="node"><div class="t">Resource Hub</div><div class="d"><code>\Device\RESOURCE_HUB\</code> + 16 hex from the connection ID in <code>_CRS</code></div></div>
   <div class="arrow">→</div>
   <div class="node"><div class="t">SPB / SPB_TRANSFER_LIST</div><div class="d"><code>IOCTL_SPB_EXECUTE_SEQUENCE</code> = 0x041808</div></div>
   <div class="arrow">→</div>
-  <div class="node"><div class="t">Драйвер ядра</div><div class="d">probe 0x42 → пороги → режим 2:1 → телеметрия и защита</div></div>
+  <div class="node"><div class="t">Kernel driver</div><div class="d">probe 0x42 -> thresholds -> 2:1 mode -> telemetry and protection</div></div>
 </div>
-<p>Каждый шаг тракта сверен с источником: адрес и режимы — с <code>ln8000_charger.c/.h</code>, путь шины — с <code>reshub.h</code>, список передач — с <code>spb.h</code>, структура узла — с живым дампом DSDT планшета.</p>
+<p>Every step of the path is cross-checked against a source: the address and modes against <code>ln8000_charger.c/.h</code>, the bus path against <code>reshub.h</code>, the transfer list against <code>spb.h</code>, the node structure against a live DSDT dump of the tablet.</p>
 
-<h2>Проверено машинно</h2>
+<h2>Checked mechanically</h2>
 <div class="grid">
-  <div class="card"><div class="k">Драйвер ARM64</div><div class="v"><b>0xAA64</b></div><div class="n">PE Machine, <code>ln8000_kmdf.sys</code> 60 КБ, подписан, <code>infverif</code> пройден</div></div>
-  <div class="card"><div class="k">Тесты</div><div class="v"><b>97</b></div><div class="n">37 ядро SMB · 43 ядро LN8000 · 9 интеграционных · 4 CLI · doctests</div></div>
-  <div class="card"><div class="k">Линтеры</div><div class="v"><b>0</b></div><div class="n">clippy <code>-D warnings</code>, fmt, doc — чисто</div></div>
-  <div class="card"><div class="k">Без std</div><div class="v"><b>2/2</b></div><div class="n">оба ядра собираются без стандартной библиотеки</div></div>
+  <div class="card"><div class="k">ARM64 driver</div><div class="v"><b>0xAA64</b></div><div class="n">PE Machine, <code>ln8000_kmdf.sys</code> 60 KB, signed, <code>infverif</code> passed</div></div>
+  <div class="card"><div class="k">Tests</div><div class="v"><b>97</b></div><div class="n">37 SMB core · 43 LN8000 core · 9 integration · 4 CLI · doctests</div></div>
+  <div class="card"><div class="k">Linters</div><div class="v"><b>0</b></div><div class="n">clippy <code>-D warnings</code>, fmt, doc - clean</div></div>
+  <div class="card"><div class="k">No std</div><div class="v"><b>2/2</b></div><div class="n">both cores build without the standard library</div></div>
 </div>
 
 <table>
-  <tr><th>Что</th><th>Команда</th><th>Итог</th></tr>
-  <tr><td>Сборка драйвера LN8000</td><td><code>cargo wdk build --target-arch arm64 --profile release</code></td><td class="ok">Finished building ln8000-kmdf</td></tr>
-  <tr><td>Сборка драйвера SMB</td><td>то же в <code>crates/kmdf</code></td><td class="ok">Finished building kmdf</td></tr>
-  <tr><td>Демонстрация режима 2:1</td><td><code>cargo run -p cli -- pump --profile qc35</code></td><td class="ok">SWITCHING, отказов нет</td></tr>
-  <tr><td>Самопроверка таблиц</td><td><code>cargo run -p cli -- verify</code></td><td class="ok">пройдена</td></tr>
-  <tr><td>Синтаксис скриптов развёртывания</td><td>разбор всех четырёх <code>.ps1</code></td><td class="ok">ошибок нет</td></tr>
+  <tr><th>What</th><th>Command</th><th>Result</th></tr>
+  <tr><td>LN8000 driver build</td><td><code>cargo wdk build --target-arch arm64 --profile release</code></td><td class="ok">Finished building ln8000-kmdf</td></tr>
+  <tr><td>SMB driver build</td><td>the same in <code>crates/kmdf</code></td><td class="ok">Finished building kmdf</td></tr>
+  <tr><td>2:1 mode demo</td><td><code>cargo run -p cli -- pump --profile qc35</code></td><td class="ok">SWITCHING, no faults</td></tr>
+  <tr><td>Table self-check</td><td><code>cargo run -p cli -- verify</code></td><td class="ok">passed</td></tr>
+  <tr><td>Deployment script syntax</td><td>parse of all four <code>.ps1</code></td><td class="ok">no errors</td></tr>
 </table>
 
-<h2>Границы и честные оговорки</h2>
+<h2>Limits and honest caveats</h2>
 <div class="callout warn">
-<p><b>Физическая проверка не выполнена.</b> Протокол приёмки из десяти пунктов подготовлен (ниже), но не заполнен замерами: для этого нужен планшет с установленным драйвером и внешний USB-мультиметр. Всё, что можно проверить без железа, — проверено и подтверждено командами.</p>
+<p><b>The physical check has not been performed.</b> The ten-point acceptance protocol is prepared (below) but not filled with measurements: that needs a tablet with the driver installed and an external USB multimeter. Everything that can be checked without hardware is checked and confirmed by commands.</p>
 </div>
 <div class="callout">
-<p><b>Согласование 9/11 В — не задача charge pump.</b> Повышенное напряжение с блоком согласует Type-C/PD-часть платформы (PM8150B). Без неё LN8000 работает в bypass 1:1 от 5 В либо удерживает уже согласованное напряжение. Это зафиксировано в дорожной карте проекта.</p>
+<p><b>9/11 V negotiation is not the charge pump's job.</b> The increased voltage with the power brick is negotiated by the Type-C/PD part of the platform (PM8150B). Without it LN8000 runs in 1:1 bypass from 5 V or holds the already negotiated voltage. This is recorded in the project roadmap.</p>
 </div>
 <div class="callout">
-<p><b>Все семь управляющих кодов реализованы.</b> Состояние, чтение и запись регистра, лимиты, режим, сеансы и выгрузка отсчётов — без заглушек. Применённый ток и режим возвращаются такими, какими их подтвердил чип, а не такими, какими их запросил клиент.</p>
+<p><b>All seven control codes are implemented.</b> State, register read and write, limits, mode, sessions and sample dump - no stubs. The applied current and mode are returned as the chip confirmed them, not as the client requested them.</p>
 </div>
 
-<h2>Протокол приёмки на устройстве</h2>
-<p>Прогон автоматизирован: на планшете достаточно выполнить <code>run-acceptance.ps1</code> — он проведёт по пунктам, снимает телеметрию драйвера, соберёт показания мультиметра и сам сформирует протокол в HTML, Markdown и JSON с приложенным журналом. Режим <code>-DryRun</code> проверяет конвейер без железа и помечает отчёт как непроверочный.</p>
+<h2>Acceptance protocol on the device</h2>
+<p>The run is automated: on the tablet it is enough to execute <code>run-acceptance.ps1</code> - it walks through the points, captures driver telemetry, collects multimeter readings and generates the protocol itself in HTML, Markdown and JSON with the journal attached. The <code>-DryRun</code> mode checks the pipeline without hardware and marks the report as not verified.</p>
 <table>
-  <tr><th>№</th><th>Сценарий</th><th>Критерий</th><th>Статус</th></tr>
-  <tr><td>1</td><td>Базовый режим 5 В</td><td>зафиксированы ток, напряжение, мощность</td><td class="todo">нужен стенд</td></tr>
-  <tr><td>2</td><td>Ускоренный режим</td><td>режим <code>SWITCHING</code>, рост мощности относительно п. 1</td><td class="todo">нужен стенд</td></tr>
-  <tr><td>3</td><td>Удержание режима 10 минут</td><td>режим не откатывается, температура ниже 43 °C</td><td class="todo">нужен стенд</td></tr>
-  <tr><td>4</td><td>Тепловая защита</td><td>событие в журнале, ток снижен либо bypass</td><td class="todo">нужен стенд</td></tr>
-  <tr><td>5</td><td>Смена блока на несовместимый</td><td>сеанс закрыт, новый открыт, зависаний нет</td><td class="todo">нужен стенд</td></tr>
-  <tr><td>6</td><td>Обрыв кабеля</td><td>устройство возвращается в рабочее состояние</td><td class="todo">нужен стенд</td></tr>
-  <tr><td>7</td><td>Перезагрузка</td><td>драйвер поднимается, режим восстанавливается</td><td class="todo">нужен стенд</td></tr>
-  <tr><td>8</td><td>Чистая установка</td><td><code>install-driver.ps1</code> без ошибок, без правок реестра</td><td class="todo">нужен стенд</td></tr>
-  <tr><td>9</td><td>Откат</td><td>штатное поведение зарядки, остатков нет</td><td class="todo">нужен стенд</td></tr>
-  <tr><td>10</td><td>Повторная установка</td><td>проходит успешно, счётчики с нуля</td><td class="todo">нужен стенд</td></tr>
+  <tr><th>No.</th><th>Scenario</th><th>Criterion</th><th>Status</th></tr>
+  <tr><td>1</td><td>Basic 5 V mode</td><td>current, voltage and power are recorded</td><td class="todo">bench needed</td></tr>
+  <tr><td>2</td><td>Accelerated mode</td><td>mode <code>SWITCHING</code>, power gain relative to item 1</td><td class="todo">bench needed</td></tr>
+  <tr><td>3</td><td>Mode held for 10 minutes</td><td>the mode does not roll back, temperature below 43 °C</td><td class="todo">bench needed</td></tr>
+  <tr><td>4</td><td>Thermal protection</td><td>an event in the journal, current reduced or bypass</td><td class="todo">bench needed</td></tr>
+  <tr><td>5</td><td>Switching to an incompatible brick</td><td>the session is closed, a new one opened, no hangs</td><td class="todo">bench needed</td></tr>
+  <tr><td>6</td><td>Cable disconnect</td><td>the device returns to a working state</td><td class="todo">bench needed</td></tr>
+  <tr><td>7</td><td>Reboot</td><td>the driver comes up, the mode is restored</td><td class="todo">bench needed</td></tr>
+  <tr><td>8</td><td>Clean install</td><td><code>install-driver.ps1</code> with no errors, no registry edits</td><td class="todo">bench needed</td></tr>
+  <tr><td>9</td><td>Rollback</td><td>stock charging behavior, no leftovers</td><td class="todo">bench needed</td></tr>
+  <tr><td>10</td><td>Reinstall</td><td>it succeeds, counters start from zero</td><td class="todo">bench needed</td></tr>
 </table>
 
-<h2>Риски и откат</h2>
+<h2>Risks and rollback</h2>
 <table>
-  <tr><th>Риск</th><th>Оценка</th><th>Мера</th></tr>
-  <tr><td>Перегрев при ускоренном режиме</td><td>средний</td><td>три уровня защиты: снижение тока (43 °C) → bypass (48 °C) → stop (55 °C), каждое событие в журнале</td></tr>
-  <tr><td>Ложные показания АЦП</td><td>низкий</td><td>решение по трём каналам, пороги с запасом, каждая запись проверяется чтением</td></tr>
-  <tr><td>Отсутствие ответа шины</td><td>средний</td><td>таймаут 1 с, две попытки, при отказе — bypass/standby и запись в журнал</td></tr>
-  <tr><td>Некорректный адрес регистра</td><td>средний</td><td>адреса сверены с GPL-драйвером, значения проверяются обратным чтением</td></tr>
+  <tr><th>Risk</th><th>Rating</th><th>Mitigation</th></tr>
+  <tr><td>Overheating in accelerated mode</td><td>medium</td><td>three protection levels: current reduction (43 °C) -> bypass (48 °C) -> stop (55 °C), every event in the journal</td></tr>
+  <tr><td>False ADC readings</td><td>low</td><td>a decision from three channels, thresholds with margin, every write is verified by a read</td></tr>
+  <tr><td>No bus response</td><td>medium</td><td>a 1 s timeout, two attempts, on failure bypass/standby and a journal entry</td></tr>
+  <tr><td>Incorrect register address</td><td>medium</td><td>the addresses are cross-checked against the GPL driver, values are verified by read-back</td></tr>
 </table>
-<p><b>Откат:</b> <code>uninstall-driver.ps1</code> останавливает службу и удаляет пакет, ведёт транскрипт в <code>%ProgramData%\nabu-fastcharge\uninstall.log</code>. Драйвер не пишет в прошивку и не меняет настройки питания — удаление возвращает устройство к поведению до установки. Предыдущая версия сохраняется в <code>%ProgramData%\nabu-fastcharge\backup</code> и возвращается одной командой <code>pnputil</code>.</p>
+<p><b>Rollback:</b> <code>uninstall-driver.ps1</code> stops the service and removes the package, keeping a transcript in <code>%ProgramData%\nabu-fastcharge\uninstall.log</code>. The driver does not write to the firmware and does not change power settings - removal returns the device to its pre-installation behavior. The previous version is saved in <code>%ProgramData%\nabu-fastcharge\backup</code> and restored with one <code>pnputil</code> command.</p>
 
-<h2>Материалы поставки</h2>
+<h2>Delivery materials</h2>
 <table>
-  <tr><th>Файл</th><th>Назначение</th></tr>
-  <tr><td><code>artifacts/driver-ln8000-arm64/</code></td><td>пакет драйвера: <code>ln8000_kmdf.sys</code> (SHA-256 <code>27db2f4468c5e834…</code>), <code>.inf</code>, <code>.cat</code>, сертификат тестовой подписи</td></tr>
-  <tr><td><code>deploy/install-driver.ps1</code>, <code>update-driver.ps1</code>, <code>uninstall-driver.ps1</code></td><td>установка, обновление, откат</td></tr>
-  <tr><td><code>deploy/nabu-ln8000.ps1</code></td><td>диагностика: <code>status</code>, <code>sessions</code>, <code>read</code>, <code>write</code>, <code>journal</code></td></tr>
-  <tr><td><code>deploy/run-acceptance.ps1</code></td><td>автоматический прогон протокола и сборка отчёта</td></tr>
-  <tr><td><code>docs/DEPLOY-LN8000.md</code></td><td>руководство: установка, профили, сбои, риски, протокол</td></tr>
-  <tr><td><code>docs/LN8000.md</code></td><td>карта регистров, режимы, формулы кодирования</td></tr>
+  <tr><th>File</th><th>Purpose</th></tr>
+  <tr><td><code>artifacts/driver-ln8000-arm64/</code></td><td>the driver package: <code>ln8000_kmdf.sys</code> (SHA-256 <code>27db2f4468c5e834...</code>), <code>.inf</code>, <code>.cat</code>, the test signing certificate</td></tr>
+  <tr><td><code>deploy/install-driver.ps1</code>, <code>update-driver.ps1</code>, <code>uninstall-driver.ps1</code></td><td>installation, update, rollback</td></tr>
+  <tr><td><code>deploy/nabu-ln8000.ps1</code></td><td>diagnostics: <code>status</code>, <code>sessions</code>, <code>read</code>, <code>write</code>, <code>journal</code></td></tr>
+  <tr><td><code>deploy/run-acceptance.ps1</code></td><td>automated protocol run and report generation</td></tr>
+  <tr><td><code>docs/DEPLOY-LN8000.md</code></td><td>guide: installation, profiles, failures, risks, protocol</td></tr>
+  <tr><td><code>docs/LN8000.md</code></td><td>register map, modes, encoding formulas</td></tr>
 </table>
 
 <footer>
-Состояние: код и сборка готовы, физическая приёмка ожидает планшета и мультиметра.
-Все технические утверждения имеют источник: GPL-драйвер Android, заголовки WDK, живой дамп DSDT, драйверы Qualcomm — ссылки в документах.
+State: the code and the build are ready, the physical acceptance awaits the tablet and a multimeter.
+Every technical statement has a source: the GPL Android driver, the WDK headers, a live DSDT dump, the Qualcomm drivers - links in the documents.
 </footer>
 
 </div>

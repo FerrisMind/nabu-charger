@@ -1,14 +1,14 @@
 [package]
 name = "ln8000-kmdf"
-description = "KMDF-драйвер charge pump LN8000 для Xiaomi Pad 5: узел PEIC (QCOM057E) поверх I²C через SpbCx"
+description = "LN8000 charge pump KMDF driver for Xiaomi Pad 5: PEIC node (QCOM057E) over I2C via SpbCx"
 version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 publish = false
 
-# Крейт исключён из воркспейса: сборка требует WDK, LLVM/clang (bindgen)
-# и cargo-wdk. Обычный CI воркспейса собирает только хост-часть.
+# The crate is excluded from the workspace: the build needs the WDK, LLVM/clang
+# (bindgen) and cargo-wdk. The workspace's regular CI builds only the host part.
 [workspace]
 
 [lib]

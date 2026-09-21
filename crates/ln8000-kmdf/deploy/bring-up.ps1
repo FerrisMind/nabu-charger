@@ -1,22 +1,21 @@
 ﻿#Requires -Version 5.1
 <#
-    bring-up.ps1 — один прогон на планшете: проверка → установка → сбор доказательств.
+    bring-up.ps1 - one run on the tablet: check -> install -> collect evidence.
 
-    Запуск (PowerShell от имени администратора, из папки комплекта):
+    Run (PowerShell as administrator, from the driver package folder):
         .\bring-up.ps1
 
-    Что делает:
-      1) фиксирует состояние системы (сборка Windows, архитектура, тестовая подпись);
-      2) ищет узел ACPI\QCOM057E и службу драйвера;
-      3) ставит драйвер, если рядом лежит пакет и он ещё не установлен;
-      4) снимает телеметрию драйвера (режим, сеансы, журнал);
-      5) с двумя интервалами измеряет заряд батареи через WMI — это показывает,
-         идёт ли заряд вообще, без всякого мультиметра;
-      6) складывает всё в ОДИН текстовый файл и один архив, которые нужно
-         прислать назад.
+    What it does:
+      1) records the system state (Windows build, architecture, test signing);
+      2) looks for the ACPI\QCOM057E node and the driver service;
+      3) installs the driver if a package lies nearby and it is not installed yet;
+      4) captures driver telemetry (mode, sessions, journal);
+      5) measures the battery charge through WMI at two intervals - that shows
+         whether charging happens at all, without any multimeter;
+      6) puts everything into ONE text file and one archive to be sent back.
 
-    Ничего не пишет в прошивку и не меняет настройки питания. Откат —
-    uninstall-driver.ps1 из этого же комплекта.
+    It writes nothing to firmware and changes no power settings. Rollback:
+    uninstall-driver.ps1 from this same package.
 #>
 [CmdletBinding()]
 param(
@@ -48,8 +47,8 @@ function Capture {
         Add-Content -LiteralPath $log -Value $output
         return $output
     } catch {
-        Add-Content -LiteralPath $log -Value ("ОШИБКА: " + $_.Exception.Message)
-        Write-Host ("  ошибка: " + $_.Exception.Message) -ForegroundColor Yellow
+        Add-Content -LiteralPath $log -Value ("ERROR: " + $_.Exception.Message)
+        Write-Host ("  error: " + $_.Exception.Message) -ForegroundColor Yellow
         return ''
     }
 }
@@ -60,16 +59,16 @@ function Is-Admin {
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-Add-Content -LiteralPath $log -Value 'Отчёт по быстрой зарядке nabu (Xiaomi Pad 5)'
-Add-Content -LiteralPath $log -Value ("Время запуска: " + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
+Add-Content -LiteralPath $log -Value 'Fast charging report for nabu (Xiaomi Pad 5)'
+Add-Content -LiteralPath $log -Value ("Start time: " + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
 Write-Host ''
-Write-Host '=== сбор доказательств по зарядке nabu ===' -ForegroundColor Cyan
-Write-Host ("отчёт будет здесь: " + $log)
+Write-Host '=== collecting charging evidence for nabu ===' -ForegroundColor Cyan
+Write-Host ("the report will be here: " + $log)
 
 $admin = Is-Admin
-Capture 'ПРАВА' { if ($admin) { 'администратор: да' } else { 'администратор: НЕТ — часть шагов будет недоступна' } }
+Capture 'RIGHTS' { if ($admin) { 'administrator: yes' } else { 'administrator: NO - some steps will be unavailable' } }
 
-Capture 'СИСТЕМА' {
+Capture 'SYSTEM' {
     $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
     [pscustomobject]@{
         ComputerName   = $env:COMPUTERNAME
@@ -82,12 +81,12 @@ Capture 'СИСТЕМА' {
     } | Format-List
 }
 
-Capture 'ПОДПИСЬ ДРАЙВЕРОВ' { & bcdedit /enum '{current}' | Select-String -Pattern 'testsigning|nointegritychecks|hypervisorlaunchtype' }
+Capture 'DRIVER SIGNING' { & bcdedit /enum '{current}' | Select-String -Pattern 'testsigning|nointegritychecks|hypervisorlaunchtype' }
 
-Capture 'УЗЕЛ ACPI\QCOM057E' {
+Capture 'ACPI\QCOM057E NODE' {
     $device = Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |
         Where-Object { $_.InstanceId -like '*QCOM057E*' }
-    if (-not $device) { return 'узел не найден — драйверу не на чем стартовать' }
+    if (-not $device) { return 'node not found - the driver has nothing to start on' }
     foreach ($item in $device) {
         $service = (Get-PnpDeviceProperty -InstanceId $item.InstanceId -KeyName 'DEVPKEY_Device_Service' -ErrorAction SilentlyContinue).Data
         $problem = (Get-PnpDeviceProperty -InstanceId $item.InstanceId -KeyName 'DEVPKEY_Device_ProblemCode' -ErrorAction SilentlyContinue).Data
@@ -101,12 +100,12 @@ Capture 'УЗЕЛ ACPI\QCOM057E' {
     }
 }
 
-Capture 'ПАКЕТ ДРАЙВЕРА В ХРАНИЛИЩЕ' {
+Capture 'DRIVER PACKAGE IN THE STORE' {
     (& pnputil /enum-drivers | Out-String) -split "`r?`n`r?`n" |
         Where-Object { $_ -match 'ln8000|nabu' }
 }
 
-Capture 'СЛУЖБА ДРАЙВЕРА' {
+Capture 'DRIVER SERVICE' {
     & sc.exe query ln8000_kmdf
     & sc.exe qc ln8000_kmdf
 }
@@ -114,106 +113,106 @@ Capture 'СЛУЖБА ДРАЙВЕРА' {
 $inf = Join-Path $PackageDir 'ln8000_kmdf.inf'
 $skipReason = ''
 if ($SkipInstall) {
-    $skipReason = 'указан -SkipInstall'
+    $skipReason = '-SkipInstall was given'
 } elseif (-not (Test-Path -LiteralPath $inf)) {
-    $skipReason = "нет файла $inf"
+    $skipReason = "no file $inf"
 } elseif (-not $admin) {
-    $skipReason = 'нет прав администратора'
+    $skipReason = 'no administrator rights'
 }
 
 if ([string]::IsNullOrEmpty($skipReason)) {
-    Capture 'УСТАНОВКА ДРАЙВЕРА' {
+    Capture 'DRIVER INSTALLATION' {
         & pnputil /add-driver $inf /install
         & sc.exe start ln8000_kmdf
     }
 } else {
-    Capture 'УСТАНОВКА ДРАЙВЕРА' { 'пропущена: ' + $skipReason }
+    Capture 'DRIVER INSTALLATION' { 'skipped: ' + $skipReason }
 }
 
 $diag = Join-Path $PackageDir 'nabu-ln8000.ps1'
 if (Test-Path -LiteralPath $diag) {
-    Capture 'ДРАЙВЕР: СОСТОЯНИЕ' { & $diag status }
-    Capture 'ДРАЙВЕР: СЕАНСЫ' { & $diag sessions }
-    Capture 'ДРАЙВЕР: СНИМОК В ЖУРНАЛ' { & $diag journal (Join-Path $OutDir "driver-journal-$stamp.jsonl") }
+    Capture 'DRIVER: STATE' { & $diag status }
+    Capture 'DRIVER: SESSIONS' { & $diag sessions }
+    Capture 'DRIVER: JOURNAL SNAPSHOT' { & $diag journal (Join-Path $OutDir "driver-journal-$stamp.jsonl") }
 } else {
-    Capture 'ДРАЙВЕР' { 'утилита nabu-ln8000.ps1 не найдена рядом со скриптом' }
+    Capture 'DRIVER' { 'tool nabu-ln8000.ps1 not found next to the script' }
 }
 
-Capture 'БАТАРЕЯ: ПЕРВЫЙ ЗАМЕР' {
+Capture 'BATTERY: FIRST MEASUREMENT' {
     Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue |
         Select-Object Name, DeviceID, BatteryStatus, EstimatedChargeRemaining,
                       EstimatedRunTime, DesignVoltage, Chemistry |
         Format-List
 }
 
-Section ("БАТАРЕЯ: ВТОРОЙ ЗАМЕР ЧЕРЕЗ " + $ChargeSampleSeconds + " с")
-Write-Host ("  ждём " + $ChargeSampleSeconds + " с для оценки изменения заряда...") -ForegroundColor Yellow
+Section ("BATTERY: SECOND MEASUREMENT AFTER " + $ChargeSampleSeconds + " s")
+Write-Host ("  waiting " + $ChargeSampleSeconds + " s to estimate the charge change...") -ForegroundColor Yellow
 $first = Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue | Select-Object -First 1
 Start-Sleep -Seconds $ChargeSampleSeconds
 $second = Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue | Select-Object -First 1
 if ($first -and $second) {
     $delta = [int]$second.EstimatedChargeRemaining - [int]$first.EstimatedChargeRemaining
     if ($delta -gt 0) {
-        $verdict = 'заряд РАСТЁТ'
+        $verdict = 'charge is RISING'
     } elseif ($delta -lt 0) {
-        $verdict = 'заряд ПАДАЕТ'
+        $verdict = 'charge is FALLING'
     } else {
-        $verdict = 'заряд НЕ МЕНЯЕТСЯ'
+        $verdict = 'charge is UNCHANGED'
     }
     $lines = @(
-        ("начало: заряд " + $first.EstimatedChargeRemaining + " %, состояние " + $first.BatteryStatus),
-        ("конец : заряд " + $second.EstimatedChargeRemaining + " %, состояние " + $second.BatteryStatus),
-        ("разница: " + $delta + " % за " + $ChargeSampleSeconds + " с"),
-        ("вывод  : " + $verdict)
+        ("start  : charge " + $first.EstimatedChargeRemaining + " %, status " + $first.BatteryStatus),
+        ("end    : charge " + $second.EstimatedChargeRemaining + " %, status " + $second.BatteryStatus),
+        ("delta  : " + $delta + " % over " + $ChargeSampleSeconds + " s"),
+        ("verdict: " + $verdict)
     )
     $lines | ForEach-Object { Add-Content -LiteralPath $log -Value $_ }
     $lines | ForEach-Object { Write-Host ("  " + $_) }
 } else {
-    Add-Content -LiteralPath $log -Value 'WMI не вернул сведений о батарее'
+    Add-Content -LiteralPath $log -Value 'WMI did not return battery information'
 }
 
-Capture 'ОТЧЁТ WINDOWS О ПИТАНИИ' {
+Capture 'WINDOWS POWER REPORT' {
     $batteryReport = Join-Path $OutDir "battery-report-$stamp.html"
     & powercfg /batteryreport /output $batteryReport | Out-String
-    "файл: $batteryReport"
+    "file: $batteryReport"
 }
 
 $acceptance = Join-Path $PackageDir 'run-acceptance.ps1'
 if ((Test-Path -LiteralPath $acceptance) -and $admin) {
-    Capture 'ПРОТОКОЛ ПРИЁМКИ' { & $acceptance -OutDir $OutDir -DeviceLabel $env:COMPUTERNAME }
+    Capture 'ACCEPTANCE PROTOCOL' { & $acceptance -OutDir $OutDir -DeviceLabel $env:COMPUTERNAME }
 } else {
-    Capture 'ПРОТОКОЛ ПРИЁМКИ' { 'пропущен: нет run-acceptance.ps1 или прав администратора' }
+    Capture 'ACCEPTANCE PROTOCOL' { 'skipped: no run-acceptance.ps1 or no administrator rights' }
 }
 
-# --- итог ---------------------------------------------------------------
-Section 'СОБРАННЫЕ ФАЙЛЫ'
+# --- summary ------------------------------------------------------------
+Section 'FILES COLLECTED'
 $files = Get-ChildItem $OutDir -File | Where-Object { $_.LastWriteTime -gt (Get-Date).AddMinutes(-30) }
-$files | ForEach-Object { Add-Content -LiteralPath $log -Value ($_.Name + '  ' + $_.Length + ' байт') }
+$files | ForEach-Object { Add-Content -LiteralPath $log -Value ($_.Name + '  ' + $_.Length + ' bytes') }
 $files | ForEach-Object { Write-Host ("  " + $_.Name) -ForegroundColor Green }
 
 $archive = Join-Path $OutDir "nabu-report-$stamp.zip"
-$archivePath = 'архив не создался — пришлите текстовый отчёт'
+$archivePath = 'the archive was not created - send the text report'
 try {
     Compress-Archive -Path ($files | Where-Object { $_.Name -ne (Split-Path $archive -Leaf) }).FullName `
                      -DestinationPath $archive -Force
     $archivePath = $archive
-    Write-Host ("  архив: " + $archive) -ForegroundColor Green
-    Add-Content -LiteralPath $log -Value ("архив: " + $archive)
+    Write-Host ("  archive: " + $archive) -ForegroundColor Green
+    Add-Content -LiteralPath $log -Value ("archive: " + $archive)
 } catch {
-    Add-Content -LiteralPath $log -Value ("архив не создан: " + $_.Exception.Message)
+    Add-Content -LiteralPath $log -Value ("archive not created: " + $_.Exception.Message)
 }
 
-Section 'ЧТО ПРИСЛАТЬ'
+Section 'WHAT TO SEND'
 $tail = @(
-    'Пришлите, пожалуйста, два файла из папки:',
+    'Please send back two files from the folder:',
     ('  1) ' + $log),
     ('  2) ' + $archivePath),
     '',
-    'Если передать файлы неудобно — достаточно скопировать сюда текст этого отчёта.',
-    'В отчёте уже есть: сборка Windows, состояние узла и службы, телеметрия драйвера',
-    'и главное — изменение заряда батареи за интервал.'
+    'If sending files is inconvenient, it is enough to copy the text of this report here.',
+    'The report already contains: the Windows build, the state of the node and the service,',
+    'the driver telemetry and, most importantly, the battery charge change over the interval.'
 )
 $tail | ForEach-Object { Add-Content -LiteralPath $log -Value $_; Write-Host $_ }
 
 Write-Host ''
-Write-Host ("Готово. Отчёт: " + $log) -ForegroundColor Cyan
+Write-Host ("Done. Report: " + $log) -ForegroundColor Cyan

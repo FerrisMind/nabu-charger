@@ -1,22 +1,22 @@
 ﻿#Requires -Version 5.1
 <#
-    run-acceptance.ps1 — автоматический прогон протокола приёмки драйвера LN8000.
+    run-acceptance.ps1 - automatic run of the LN8000 driver acceptance protocol.
 
-    Проводит оператора по десяти пунктам протокола, снимает телеметрию драйвера,
-    собирает показания внешнего измерителя и формирует итоговый протокол:
-    Markdown + HTML + машинночитаемый JSON + приложенный журнал сеансов.
+    Walks the operator through the ten protocol items, captures driver telemetry,
+    collects the readings of an external meter and produces the final protocol:
+    Markdown + HTML + machine-readable JSON + the attached session journal.
 
-    Запуск на планшете (от администратора, из папки комплекта):
+    Run on the tablet (as administrator, from the driver package folder):
         .\run-acceptance.ps1
 
-    Проверка самого конвейера без железа (синтетические данные, отчёт помечается
-    как сухой прогон и не является измерением):
+    Checking the pipeline itself without hardware (synthetic data, the report is
+    marked as a dry run and is not a measurement):
         .\run-acceptance.ps1 -DryRun
 
-    Показания можно подать файлом, чтобы прогон был без диалога:
+    The readings can be supplied as a file so the run is non-interactive:
         .\run-acceptance.ps1 -MeterJson .\meter.json
 
-    Формат meter.json:
+    meter.json format:
         { "base_volt": 5.05, "base_amp": 1.80, "fast_volt": 9.02, "fast_amp": 2.95,
           "hold_volt": 9.01, "hold_amp": 2.90, "hold_minutes": 10 }
 #>
@@ -33,18 +33,18 @@ param(
 $ErrorActionPreference = 'Stop'
 $stamp = Get-Date -Format 'yyyy-MM-dd-HHmmss'
 
-# Данные сухого прогона: правдоподобные, но синтетические. Отчёт явно помечается,
-# чтобы такой файл нельзя было принять за результат реальных измерений.
+# Dry-run data: plausible but synthetic. The report is explicitly marked so that
+# such a file cannot be mistaken for the result of real measurements.
 $dryRunData = [ordered]@{
     base_volt  = 5.05; base_amp = 1.80
     fast_volt  = 9.02; fast_amp = 2.95
     hold_volt  = 9.01; hold_amp = 2.90
     hold_minutes = $HoldMinutes
-    note       = 'СУХОЙ ПРОГОН: значения синтетические, не измерение'
+    note       = 'DRY RUN: the values are synthetic, not a measurement'
 }
 
 $meter = if ($MeterJson) {
-    if (-not (Test-Path -LiteralPath $MeterJson)) { throw "нет файла показаний: $MeterJson" }
+    if (-not (Test-Path -LiteralPath $MeterJson)) { throw "no meter reading file: $MeterJson" }
     $parsed = @{}
     (Get-Content -LiteralPath $MeterJson -Raw | ConvertFrom-Json).PSObject.Properties |
         ForEach-Object { $parsed[$_.Name] = $_.Value }
@@ -60,7 +60,7 @@ function Read-Safe {
     try {
         return (Read-Host $Prompt)
     } catch {
-        Write-Host '    (нет интерактивного ввода — берётся значение по умолчанию)' -ForegroundColor Yellow
+        Write-Host '    (no interactive input - the default value is used)' -ForegroundColor Yellow
         return ''
     }
 }
@@ -96,7 +96,7 @@ function Get-Telemetry {
         $line = Get-Content -LiteralPath $journalPath -Tail 1 -ErrorAction SilentlyContinue
         if ($line) { return ($line | ConvertFrom-Json) }
     } catch {
-        Write-Host ('    телеметрия недоступна: ' + $_.Exception.Message) -ForegroundColor Yellow
+        Write-Host ('    telemetry unavailable: ' + $_.Exception.Message) -ForegroundColor Yellow
     }
     return $null
 }
@@ -104,96 +104,96 @@ function Get-Telemetry {
 New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
 
 Write-Host ''
-Write-Host '=== Протокол приёмки LN8000 ===' -ForegroundColor Cyan
-if ($DryRun) { Write-Host 'РЕЖИМ СУХОГО ПРОГОНА: данные синтетические, отчёт помечается как непроверочный' -ForegroundColor Yellow }
-Write-Host ("устройство: " + $DeviceLabel + ";  вывод: " + $OutDir)
+Write-Host '=== LN8000 acceptance protocol ===' -ForegroundColor Cyan
+if ($DryRun) { Write-Host 'DRY RUN MODE: the data is synthetic, the report is marked as unverified' -ForegroundColor Yellow }
+Write-Host ("device: " + $DeviceLabel + ";  output: " + $OutDir)
 Write-Host ''
 
-# --- 1. Базовый режим 5 В -------------------------------------------------
-Write-Host '1. Базовый режим: подключите блок, дающий 5 В' -ForegroundColor Cyan
-$baseV = Ask-Value -Prompt 'напряжение с мультиметра, В' -Key 'base_volt' -Default 5.0
-$baseA = Ask-Value -Prompt 'ток с мультиметра, А' -Key 'base_amp' -Default 1.5
+# --- 1. Base 5 V mode -----------------------------------------------------
+Write-Host '1. Base mode: connect a brick that delivers 5 V' -ForegroundColor Cyan
+$baseV = Ask-Value -Prompt 'voltage from the multimeter, V' -Key 'base_volt' -Default 5.0
+$baseA = Ask-Value -Prompt 'current from the multimeter, A' -Key 'base_amp' -Default 1.5
 $baseW = $baseV * $baseA
-Add-Result 'base-5v' 'Базовый режим 5 В' 'ток, напряжение и мощность зафиксированы' 'зафиксировано' `
-    ("{0:N2} В × {1:N2} А = {2:N2} Вт" -f $baseV, $baseA, $baseW)
+Add-Result 'base-5v' 'Base 5 V mode' 'current, voltage and power recorded' 'recorded' `
+    ("{0:N2} V x {1:N2} A = {2:N2} W" -f $baseV, $baseA, $baseW)
 $telemetryBase = Get-Telemetry -Pd 1
 
-# --- 2. Ускоренный режим --------------------------------------------------
-Write-Host '2. Ускоренный режим: подключите совместимый блок' -ForegroundColor Cyan
-$fastV = Ask-Value -Prompt 'напряжение с мультиметра, В' -Key 'fast_volt' -Default 9.0
-$fastA = Ask-Value -Prompt 'ток с мультиметра, А' -Key 'fast_amp' -Default 2.5
+# --- 2. Fast mode ---------------------------------------------------------
+Write-Host '2. Fast mode: connect a compatible brick' -ForegroundColor Cyan
+$fastV = Ask-Value -Prompt 'voltage from the multimeter, V' -Key 'fast_volt' -Default 9.0
+$fastA = Ask-Value -Prompt 'current from the multimeter, A' -Key 'fast_amp' -Default 2.5
 $fastW = $fastV * $fastA
 $gain = if ($baseW -gt 0) { (($fastW - $baseW) / $baseW) * 100 } else { 0 }
 $telemetryFast = Get-Telemetry -Pd 2
 $modeOk = $telemetryFast -and ([int]$telemetryFast.mode -eq 3)
-$status = if ($gain -gt 5 -and $modeOk) { 'пройдено' } elseif ($gain -gt 5) { 'частично' } else { 'провалено' }
-$detail = ("{0:N2} В × {1:N2} А = {2:N2} Вт; прирост {3:N1} %; режим драйвера: {4}" -f `
-    $fastV, $fastA, $fastW, $gain, $(if ($telemetryFast) { $telemetryFast.mode } else { 'нет данных' }))
-Add-Result 'fast-mode' 'Ускоренный режим' 'режим switching и рост мощности относительно 5 В' $status $detail
+$status = if ($gain -gt 5 -and $modeOk) { 'passed' } elseif ($gain -gt 5) { 'partial' } else { 'failed' }
+$detail = ("{0:N2} V x {1:N2} A = {2:N2} W; gain {3:N1} %; driver mode: {4}" -f `
+    $fastV, $fastA, $fastW, $gain, $(if ($telemetryFast) { $telemetryFast.mode } else { 'no data' }))
+Add-Result 'fast-mode' 'Fast mode' 'switching mode and power growth relative to 5 V' $status $detail
 
-# --- 3. Удержание режима --------------------------------------------------
-Write-Host ("3. Удержание режима: оставьте заряжаться на " + $HoldMinutes + " мин") -ForegroundColor Cyan
-$holdV = Ask-Value -Prompt 'напряжение после удержания, В' -Key 'hold_volt' -Default $fastV
-$holdA = Ask-Value -Prompt 'ток после удержания, А' -Key 'hold_amp' -Default $fastA
+# --- 3. Mode hold ---------------------------------------------------------
+Write-Host ("3. Mode hold: leave it charging for " + $HoldMinutes + " min") -ForegroundColor Cyan
+$holdV = Ask-Value -Prompt 'voltage after the hold, V' -Key 'hold_volt' -Default $fastV
+$holdA = Ask-Value -Prompt 'current after the hold, A' -Key 'hold_amp' -Default $fastA
 $holdW = $holdV * $holdA
 $telemetryHold = Get-Telemetry -Pd 2
 $tempDc = if ($telemetryHold) { [int]$telemetryHold.die_temp_dc } else { 0 }
 $holdOk = ($tempDc -lt 430) -and ($telemetryHold -and ([int]$telemetryHold.mode -eq 3))
-Add-Result 'hold' ("Удержание режима " + $HoldMinutes + ' мин') 'режим не откатился, температура ниже 43 °C' `
-    $(if ($holdOk) { 'пройдено' } else { 'проверить' }) `
-    ("после удержания {0:N2} Вт; температура кристалла {1:N1} °C" -f $holdW, ($tempDc / 10.0))
+Add-Result 'hold' ("Mode hold " + $HoldMinutes + ' min') 'the mode did not revert, temperature below 43 °C' `
+    $(if ($holdOk) { 'passed' } else { 'check' }) `
+    ("after the hold {0:N2} W; die temperature {1:N1} °C" -f $holdW, ($tempDc / 10.0))
 
-# --- 4. Тепловая защита ---------------------------------------------------
-Write-Host '4. Тепловая защита: прогрейте устройство или включите строгий профиль' -ForegroundColor Cyan
+# --- 4. Thermal protection ------------------------------------------------
+Write-Host '4. Thermal protection: heat the device up or enable a strict profile' -ForegroundColor Cyan
 $guardSeen = $false
 $sessions = Get-Telemetry
 if ($DryRun) { $guardSeen = $true }
 else {
-    $answer = Read-Safe '    сработала защита (снижение тока или bypass)? д/н'
-    $guardSeen = ($answer -eq 'д')
+    $answer = Read-Safe '    did the protection trip (current step-down or bypass)? y/n'
+    $guardSeen = ($answer -eq 'y')
 }
-Add-Result 'thermal-guard' 'Тепловая защита' 'событие защиты зафиксировано, заряд не оборван аварийно' `
-    $(if ($guardSeen) { 'пройдено' } else { 'не наблюдалось' }) `
-    'уровни: снижение тока с 43 °C, bypass с 48 °C, остановка с 55 °C'
+Add-Result 'thermal-guard' 'Thermal protection' 'protection event recorded, charging not aborted abnormally' `
+    $(if ($guardSeen) { 'passed' } else { 'not observed' }) `
+    'levels: current step-down from 43 °C, bypass from 48 °C, stop from 55 °C'
 
-# --- 5. Смена блока -------------------------------------------------------
-Write-Host '5. Смена блока: отключите совместимый блок и подключите несовместимый' -ForegroundColor Cyan
+# --- 5. Brick swap --------------------------------------------------------
+Write-Host '5. Brick swap: disconnect the compatible brick and connect an incompatible one' -ForegroundColor Cyan
 $afterSwap = Get-Telemetry
-Add-Result 'swap' 'Смена блока на несовместимый' 'сеанс закрыт, новый открыт, зависаний нет' `
-    $(if ($afterSwap) { 'пройдено' } else { 'нет данных' }) `
-    ("сеансов в драйвере: " + $(if ($afterSwap) { $afterSwap.sessions } else { '?' }))
+Add-Result 'swap' 'Swap to an incompatible brick' 'session closed, a new one opened, no hangs' `
+    $(if ($afterSwap) { 'passed' } else { 'no data' }) `
+    ("sessions in the driver: " + $(if ($afterSwap) { $afterSwap.sessions } else { '?' }))
 
-# --- 6. Обрыв кабеля ------------------------------------------------------
-Write-Host '6. Обрыв кабеля: выньте и снова вставьте кабель' -ForegroundColor Cyan
+# --- 6. Cable unplug ------------------------------------------------------
+Write-Host '6. Cable unplug: unplug and plug the cable back in' -ForegroundColor Cyan
 $afterUnplug = Get-Telemetry
-Add-Result 'unplug' 'Обрыв кабеля при согласовании' 'устройство возвращается в рабочее состояние' `
-    $(if ($afterUnplug) { 'пройдено' } else { 'нет данных' }) 'событие закрытия сеанса попадает в журнал'
+Add-Result 'unplug' 'Cable unplug during negotiation' 'the device returns to a working state' `
+    $(if ($afterUnplug) { 'passed' } else { 'no data' }) 'the session close event goes into the journal'
 
-# --- 7. Перезагрузка ------------------------------------------------------
-Add-Result 'reboot' 'Перезагрузка' 'драйвер поднимается, режим восстанавливается' 'проверить вручную' `
-    'выполните Restart-Computer и повторите пункт 1'
+# --- 7. Reboot ------------------------------------------------------------
+Add-Result 'reboot' 'Reboot' 'the driver comes up, the mode is restored' 'manual check' `
+    'run Restart-Computer and repeat item 1'
 
-# --- 8. Чистая установка --------------------------------------------------
+# --- 8. Clean install -----------------------------------------------------
 $testSigning = (& bcdedit /enum '{current}' 2>&1 | Out-String) -match 'testsigning\s+Yes'
 $service = (& sc.exe query ln8000_kmdf 2>&1 | Out-String)
 $serviceOk = $service -match 'RUNNING|STOPPED'
-Add-Result 'clean-install' 'Чистая установка без ошибок' 'пакет ставится без предупреждений, режим доступен без правок реестра' `
-    $(if ($serviceOk) { 'пройдено' } else { 'проверить' }) `
-    ("служба ln8000_kmdf: " + $(if ($serviceOk) { 'зарегистрирована' } else { 'не найдена' }) + `
-     "; тестовая подпись: " + $(if ($testSigning) { 'включена' } else { 'выключена' }))
+Add-Result 'clean-install' 'Clean install without errors' 'the package installs without warnings, the mode is available without registry edits' `
+    $(if ($serviceOk) { 'passed' } else { 'check' }) `
+    ("service ln8000_kmdf: " + $(if ($serviceOk) { 'registered' } else { 'not found' }) + `
+     "; test signing: " + $(if ($testSigning) { 'enabled' } else { 'disabled' }))
 
-# --- 9. Откат -------------------------------------------------------------
-Add-Result 'rollback' 'Откат' 'штатное поведение зарядки, остаточных служб нет' 'проверить вручную' `
-    'выполните uninstall-driver.ps1 и убедитесь, что служба удалена, а зарядка осталась штатной'
+# --- 9. Rollback ----------------------------------------------------------
+Add-Result 'rollback' 'Rollback' 'stock charging behaviour, no leftover services' 'manual check' `
+    'run uninstall-driver.ps1 and make sure the service is removed and charging stays stock'
 
-# --- 10. Повторная установка ---------------------------------------------
-Add-Result 'reinstall' 'Повторная установка' 'проходит успешно, счётчики сеансов с нуля' 'проверить вручную' `
-    'выполните install-driver.ps1 заново'
+# --- 10. Reinstall --------------------------------------------------------
+Add-Result 'reinstall' 'Reinstall' 'succeeds, session counters start from zero' 'manual check' `
+    'run install-driver.ps1 again'
 
-# --- итог -----------------------------------------------------------------
-$passed = ($results | Where-Object { $_.status -eq 'пройдено' }).Count
-$failed = ($results | Where-Object { $_.status -eq 'провалено' }).Count
-$manual = ($results | Where-Object { $_.status -like '*вручную*' }).Count
+# --- summary --------------------------------------------------------------
+$passed = ($results | Where-Object { $_.status -eq 'passed' }).Count
+$failed = ($results | Where-Object { $_.status -eq 'failed' }).Count
+$manual = ($results | Where-Object { $_.status -like '*manual*' }).Count
 
 $summary = [ordered]@{
     schema       = 'nabu-ln8000-acceptance/1'
@@ -213,27 +213,27 @@ $jsonPath = Join-Path $OutDir "acceptance-$stamp.json"
 $summary | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $jsonPath -Encoding utf8
 
 $md = New-Object System.Text.StringBuilder
-[void]$md.AppendLine('# Протокол приёмки LN8000 — ' + $DeviceLabel)
+[void]$md.AppendLine('# LN8000 acceptance protocol - ' + $DeviceLabel)
 [void]$md.AppendLine('')
-[void]$md.AppendLine('Дата: ' + (Get-Date -Format 'yyyy-MM-dd HH:mm'))
+[void]$md.AppendLine('Date: ' + (Get-Date -Format 'yyyy-MM-dd HH:mm'))
 if ($DryRun) {
     [void]$md.AppendLine('')
-    [void]$md.AppendLine('> **ВНИМАНИЕ: сухой прогон.** Данные синтетические. Этот файл проверяет')
-    [void]$md.AppendLine('> работу конвейера отчёта и **не является** результатом измерений.')
+    [void]$md.AppendLine('> **WARNING: dry run.** The data is synthetic. This file checks')
+    [void]$md.AppendLine('> the report pipeline and **is not** a measurement result.')
 }
 [void]$md.AppendLine('')
-[void]$md.AppendLine('## Мощность')
+[void]$md.AppendLine('## Power')
 [void]$md.AppendLine('')
-[void]$md.AppendLine('| Режим | Мощность |')
+[void]$md.AppendLine('| Mode | Power |')
 [void]$md.AppendLine('|---|---|')
-[void]$md.AppendLine(('| Базовый 5 В | {0:N2} Вт |' -f $baseW))
-[void]$md.AppendLine(('| Ускоренный | {0:N2} Вт |' -f $fastW))
-[void]$md.AppendLine(('| Прирост | {0:N1} % |' -f $gain))
-[void]$md.AppendLine(('| После удержания | {0:N2} Вт |' -f $holdW))
+[void]$md.AppendLine(('| Base 5 V | {0:N2} W |' -f $baseW))
+[void]$md.AppendLine(('| Fast | {0:N2} W |' -f $fastW))
+[void]$md.AppendLine(('| Gain | {0:N1} % |' -f $gain))
+[void]$md.AppendLine(('| After hold | {0:N2} W |' -f $holdW))
 [void]$md.AppendLine('')
-[void]$md.AppendLine('## Пункты протокола')
+[void]$md.AppendLine('## Protocol items')
 [void]$md.AppendLine('')
-[void]$md.AppendLine('| № | Сценарий | Критерий | Статус | Что зафиксировано |')
+[void]$md.AppendLine('| No. | Scenario | Criterion | Status | Recorded |')
 [void]$md.AppendLine('|---|---|---|---|---|')
 $index = 0
 foreach ($r in $results) {
@@ -241,24 +241,24 @@ foreach ($r in $results) {
     [void]$md.AppendLine(('| {0} | {1} | {2} | {3} | {4} |' -f $index, $r.title, $r.criterion, $r.status, $r.detail))
 }
 [void]$md.AppendLine('')
-[void]$md.AppendLine('## Драйвер в моменты замеров')
+[void]$md.AppendLine('## Driver at the moments of measurement')
 [void]$md.AppendLine('')
-foreach ($pair in @(@('базовый режим', $telemetryBase), @('ускоренный режим', $telemetryFast), @('удержание', $telemetryHold))) {
+foreach ($pair in @(@('base mode', $telemetryBase), @('fast mode', $telemetryFast), @('hold', $telemetryHold))) {
     if ($pair[1]) {
-        [void]$md.AppendLine(('* {0}: режим {1}, вход {2:N2} А, напряжение входа {3:N2} В, температура {4:N1} °C, отказы 0x{5:X2}/0x{6:X2}' -f `
+        [void]$md.AppendLine(('* {0}: mode {1}, input {2:N2} A, input voltage {3:N2} V, temperature {4:N1} °C, faults 0x{5:X2}/0x{6:X2}' -f `
             $pair[0], $pair[1].mode, ([double]$pair[1].iin_ua / 1e6), ([double]$pair[1].vbus_uv / 1e6), ([double]$pair[1].die_temp_dc / 10), [int]$pair[1].fault1_sts, [int]$pair[1].fault2_sts))
     }
 }
 [void]$md.AppendLine('')
-[void]$md.AppendLine(('Итог: пройдено {0}, провалено {1}, требует ручной проверки {2}.' -f $passed, $failed, $manual))
+[void]$md.AppendLine(('Total: passed {0}, failed {1}, manual check {2}.' -f $passed, $failed, $manual))
 $mdPath = Join-Path $OutDir "acceptance-$stamp.md"
 $md.ToString() | Set-Content -LiteralPath $mdPath -Encoding utf8
 
 $rows = ($results | ForEach-Object { "      <tr><td>$($_.title)</td><td>$($_.criterion)</td><td>$($_.status)</td><td>$($_.detail)</td></tr>" }) -join "`n"
-$warn = if ($DryRun) { '<p class="warn">Сухой прогон: данные синтетические, не измерение.</p>' } else { '' }
+$warn = if ($DryRun) { '<p class="warn">Dry run: the data is synthetic, not a measurement.</p>' } else { '' }
 $html = @"
 <!DOCTYPE html>
-<html lang="ru"><head><meta charset="utf-8"><title>Протокол приёмки LN8000</title>
+<html lang="en"><head><meta charset="utf-8"><title>LN8000 acceptance protocol</title>
 <style>
 body{font-family:-apple-system,"Segoe UI",Roboto,Arial,sans-serif;font-weight:300;background:#fbfaf9;color:#14161a;margin:0;padding:4rem 1.5rem;line-height:1.6}
 .wrap{max-width:60rem;margin:0 auto}
@@ -275,20 +275,20 @@ td{padding:.8rem .8rem .8rem 0;border-bottom:1px solid #f0eeeb}
 .warn{border-left:2px solid #c8860d;padding:.2rem 0 .2rem 1.1rem;color:#8a5a06}
 code{background:#f1efec;padding:.1em .35em;border-radius:4px;font-size:.86em}
 </style></head><body><div class="wrap">
-<h1>Протокол приёмки <b>LN8000</b></h1>
+<h1>Acceptance protocol <b>LN8000</b></h1>
 <p class="sub">$DeviceLabel · $(Get-Date -Format 'yyyy-MM-dd HH:mm')</p>
 $warn
 <div class="metrics">
-<div class="card"><div class="k">Базовый 5 В</div><div class="v">$([math]::Round($baseW,2)) Вт</div></div>
-<div class="card"><div class="k">Ускоренный</div><div class="v">$([math]::Round($fastW,2)) Вт</div></div>
-<div class="card"><div class="k">Прирост</div><div class="v">$([math]::Round($gain,1)) %</div></div>
-<div class="card"><div class="k">Итог</div><div class="v">$passed / $($results.Count)</div></div>
+<div class="card"><div class="k">Base 5 V</div><div class="v">$([math]::Round($baseW,2)) W</div></div>
+<div class="card"><div class="k">Fast</div><div class="v">$([math]::Round($fastW,2)) W</div></div>
+<div class="card"><div class="k">Gain</div><div class="v">$([math]::Round($gain,1)) %</div></div>
+<div class="card"><div class="k">Total</div><div class="v">$passed / $($results.Count)</div></div>
 </div>
-<h2>Пункты протокола</h2>
-<table><tr><th>Сценарий</th><th>Критерий</th><th>Статус</th><th>Что зафиксировано</th></tr>
+<h2>Protocol items</h2>
+<table><tr><th>Scenario</th><th>Criterion</th><th>Status</th><th>Recorded</th></tr>
 $rows
 </table>
-<h2>Машинночитаемые данные</h2>
+<h2>Machine-readable data</h2>
 <p><code>$jsonPath</code></p>
 </div></body></html>
 "@
@@ -296,8 +296,8 @@ $htmlPath = Join-Path $OutDir "acceptance-$stamp.html"
 $html | Set-Content -LiteralPath $htmlPath -Encoding utf8
 
 Write-Host ''
-Write-Host '=== итог ===' -ForegroundColor Cyan
-Write-Host ("  пройдено: {0}; провалено: {1}; вручную: {2}" -f $passed, $failed, $manual)
-Write-Host ("  отчёт:    " + $htmlPath) -ForegroundColor Green
-Write-Host ("  разметка: " + $mdPath)
-Write-Host ("  данные:   " + $jsonPath)
+Write-Host '=== summary ===' -ForegroundColor Cyan
+Write-Host ("  passed: {0}; failed: {1}; manual: {2}" -f $passed, $failed, $manual)
+Write-Host ("  report:    " + $htmlPath) -ForegroundColor Green
+Write-Host ("  markup:    " + $mdPath)
+Write-Host ("  data:      " + $jsonPath)

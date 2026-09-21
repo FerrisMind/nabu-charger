@@ -1,7 +1,7 @@
-//! Замеры транспорта: сколько обращений к регистрам выдерживает канал.
+//! Transport measurements: how many register accesses the channel sustains.
 //!
-//! Сравниваются два транспорта: мок в памяти (верхняя граница) и реальный TCP к
-//! симулятору устройства (нижняя граница для сети).
+//! Two transports are compared: the in-memory mock (upper bound) and real TCP to
+//! the device simulator (lower bound for the network).
 //!
 //! ```text
 //! cargo bench -p host --bench transport_throughput
@@ -54,7 +54,7 @@ fn bench_tcp(c: &mut Criterion) {
         return;
     };
     let mut group = c.benchmark_group("transport/tcp_simulator");
-    // Сеть медленнее памяти: уменьшаем объём, чтобы прогон не занимал минуты.
+    // The network is slower than memory: reduce the volume so a run is not slow.
     group.throughput(Throughput::Elements(64));
     group.sample_size(30);
     group.bench_function("read", |b| {

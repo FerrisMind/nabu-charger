@@ -1,95 +1,95 @@
-//! Паспорт драйвера: версия, железо, карта регистров, таблица политик.
+//! Driver specification: version, hardware, register map, policy table.
 //!
-//! Используется командой `verify` и попадает в отчёт о приёмке, чтобы спецификация
-//! была проверяемой, а не пересказанной.
+//! Used by the `verify` command and included in the acceptance report, so that the
+//! specification is checkable rather than retold.
 
 use crate::apsd::AdapterType;
 use crate::policy::{self, Qc35Support};
 
-/// Версия крейта.
+/// Crate version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Модель устройства.
+/// Device model.
 pub const MODEL: &str = "Xiaomi Pad 5 (nabu)";
 
-/// Платформа.
+/// Platform.
 pub const PLATFORM: &str = "Qualcomm SM8150 (Snapdragon 860), Windows on ARM64";
 
-/// Зарядник в PMIC.
-pub const CHARGER_BLOCK: &str = "PM8150B SMB (периферия USBIN, база 0x1300)";
+/// Charger in the PMIC.
+pub const CHARGER_BLOCK: &str = "PM8150B SMB (USBIN peripheral, base 0x1300)";
 
-/// Внешний charge pump.
-pub const CHARGE_PUMP: &str = "LN8000, I2C 0x51, узел ACPI PEIC (QCOM057E)";
+/// External charge pump.
+pub const CHARGE_PUMP: &str = "LN8000, I2C 0x51, ACPI node PEIC (QCOM057E)";
 
-/// Один регистр из спецификации.
+/// One register from the specification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RegisterSpec {
-    /// Адрес.
+    /// Address.
     pub addr: u16,
-    /// Имя из документации.
+    /// Name from the documentation.
     pub name: &'static str,
-    /// Назначение.
+    /// Purpose.
     pub purpose: &'static str,
 }
 
-/// Регистры, с которыми работает драйвер.
+/// Registers the driver works with.
 pub const REGISTERS: &[RegisterSpec] = &[
     RegisterSpec {
         addr: crate::regs::APSD_STATUS,
         name: "APSD_STATUS",
-        purpose: "состояние автомата детекции: готовность и признак Quick Charge",
+        purpose: "detection state machine status: readiness and the Quick Charge flag",
     },
     RegisterSpec {
         addr: crate::regs::APSD_RESULT_STATUS,
         name: "APSD_RESULT_STATUS",
-        purpose: "результат детекции: тип адаптера в битах 6:0",
+        purpose: "detection result: adapter type in bits 6:0",
     },
     RegisterSpec {
         addr: crate::regs::QC_CHANGE_STATUS,
         name: "QC_CHANGE_STATUS",
-        purpose: "состояние переговоров Quick Charge",
+        purpose: "Quick Charge negotiation state",
     },
     RegisterSpec {
         addr: crate::regs::CMD_APSD,
         name: "CMD_APSD",
-        purpose: "перезапуск детекции (бит APSD_RERUN)",
+        purpose: "detection rerun (APSD_RERUN bit)",
     },
     RegisterSpec {
         addr: crate::regs::CMD_ICL_OVERRIDE,
         name: "CMD_ICL_OVERRIDE",
-        purpose: "разрешение принудительного лимита входного тока",
+        purpose: "enable the forced input current limit",
     },
     RegisterSpec {
         addr: crate::regs::USBIN_CURRENT_LIMIT_CFG,
         name: "USBIN_CURRENT_LIMIT_CFG",
-        purpose: "код лимита входного тока (сетка 100 мА)",
+        purpose: "input current limit code (100 mA grid)",
     },
     RegisterSpec {
         addr: crate::regs::USBIN_ICL_OPTIONS,
         name: "USBIN_ICL_OPTIONS",
-        purpose: "дополнительные опции лимита тока",
+        purpose: "extra current limit options",
     },
     RegisterSpec {
         addr: crate::regs::HVDCP_PULSE_COUNT_MAX,
         name: "HVDCP_PULSE_COUNT_MAX",
-        purpose: "выбор напряжения Quick Charge 2.0 (биты 7:6)",
+        purpose: "Quick Charge 2.0 voltage selection (bits 7:6)",
     },
 ];
 
-/// Строка таблицы политик.
+/// Policy table row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AdapterSpec {
-    /// Тип адаптера.
+    /// Adapter type.
     pub adapter: AdapterType,
-    /// Образец в `APSD_RESULT_STATUS`.
+    /// Pattern in `APSD_RESULT_STATUS`.
     pub pattern: u8,
-    /// Лимит входного тока по политике.
+    /// Input current limit from the policy.
     pub icl_ua: u32,
-    /// Допустим ли charge pump.
+    /// Whether the charge pump is eligible.
     pub pump_eligible: bool,
 }
 
-/// Таблица политик по умолчанию (QC3.5 без аутентификации).
+/// Default policy table (QC3.5 without authentication).
 #[must_use]
 pub fn adapter_table() -> [AdapterSpec; 7] {
     let qc35 = Qc35Support::default();
@@ -113,19 +113,19 @@ pub fn adapter_table() -> [AdapterSpec; 7] {
     })
 }
 
-/// Текстовый паспорт драйвера.
+/// Textual driver specification.
 #[cfg(feature = "std")]
 #[must_use]
 pub fn render_spec() -> String {
     use std::fmt::Write as _;
 
     let mut out = String::new();
-    let _ = writeln!(out, "драйвер     : core {VERSION}");
-    let _ = writeln!(out, "устройство  : {MODEL}");
-    let _ = writeln!(out, "платформа   : {PLATFORM}");
-    let _ = writeln!(out, "зарядник    : {CHARGER_BLOCK}");
+    let _ = writeln!(out, "driver      : core {VERSION}");
+    let _ = writeln!(out, "device      : {MODEL}");
+    let _ = writeln!(out, "platform    : {PLATFORM}");
+    let _ = writeln!(out, "charger     : {CHARGER_BLOCK}");
     let _ = writeln!(out, "charge pump : {CHARGE_PUMP}");
-    let _ = writeln!(out, "\nрегистры:");
+    let _ = writeln!(out, "\nregisters:");
     for spec in REGISTERS {
         let _ = writeln!(
             out,
@@ -133,15 +133,15 @@ pub fn render_spec() -> String {
             spec.addr, spec.name, spec.purpose
         );
     }
-    let _ = writeln!(out, "\nполитика тока по типам адаптера:");
+    let _ = writeln!(out, "\ncurrent policy by adapter type:");
     for spec in adapter_table() {
         let _ = writeln!(
             out,
-            "  {:<9} образец 0x{:02X}  {:>8} мкА  pump: {}",
+            "  {:<9} pattern 0x{:02X}  {:>8} µA  pump: {}",
             spec.adapter.label(),
             spec.pattern,
             spec.icl_ua,
-            if spec.pump_eligible { "да" } else { "нет" }
+            if spec.pump_eligible { "yes" } else { "no" }
         );
     }
     out

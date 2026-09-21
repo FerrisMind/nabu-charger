@@ -39,7 +39,7 @@ pub const fn superuser_retry_due(pending: bool, attempts: u32, now_ms: u64, next
 
 /// Rising cable edge after 5 V bypass / failed open / prior Done → re-negotiate.
 ///
-/// `phase` uses the KMDF [`HvdcpPhase`] numeric codes.
+/// `phase` uses the KMDF `HvdcpPhase` numeric codes.
 #[must_use]
 pub const fn should_renegotiate_on_input_edge(
     phase: u32,
@@ -89,8 +89,8 @@ pub enum Force9vWait {
 
 /// One step of the `FORCE_9V` wait loop.
 ///
-/// `switching_min_uv` is the caller's 2:1 gate ([`SWITCHING_MIN_VIN_UV`] in the
-/// KMDF layer) — passed in so this module stays free of pump encoding.
+/// `switching_min_uv` is the caller's 2:1 gate ([`crate::encoding::SWITCHING_MIN_VIN_UV`]
+/// in the KMDF layer) - passed in so this module stays free of pump encoding.
 #[must_use]
 pub const fn force9v_step(
     vin_uv: i32,
@@ -114,7 +114,8 @@ pub const fn force9v_extended_deadline(deadline_ms: u32) -> u32 {
     if deadline_ms.saturating_add(FORCE9V_EXTEND_MS) > FORCE9V_HARD_CAP_MS {
         FORCE9V_HARD_CAP_MS
     } else {
-        deadline_ms + FORCE9V_EXTEND_MS
+        // The test above proved this cannot saturate, so the sum is exact.
+        deadline_ms.saturating_add(FORCE9V_EXTEND_MS)
     }
 }
 
@@ -322,7 +323,13 @@ mod tests {
             Force9vWait::Continue
         );
         assert_eq!(
-            force9v_step(4_800_000, FORCE9V_SETTLE_MS, FORCE9V_SETTLE_MS, false, 8_000_000),
+            force9v_step(
+                4_800_000,
+                FORCE9V_SETTLE_MS,
+                FORCE9V_SETTLE_MS,
+                false,
+                8_000_000
+            ),
             Force9vWait::Stop
         );
     }
@@ -362,7 +369,13 @@ mod tests {
         assert_eq!(force9v_extended_deadline(u32::MAX), FORCE9V_HARD_CAP_MS);
         // A deadline that is already past the cap stops without extending.
         assert_eq!(
-            force9v_step(6_000_000, FORCE9V_HARD_CAP_MS, FORCE9V_HARD_CAP_MS, false, 8_200_000),
+            force9v_step(
+                6_000_000,
+                FORCE9V_HARD_CAP_MS,
+                FORCE9V_HARD_CAP_MS,
+                false,
+                8_200_000
+            ),
             Force9vWait::Stop
         );
     }

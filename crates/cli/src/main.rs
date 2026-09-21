@@ -1,15 +1,15 @@
-//! `nabu-charger` — утилита драйвера зарядки Xiaomi Pad 5.
+//! `nabu-charger`: the CLI of the Xiaomi Pad 5 charging driver.
 //!
-//! Подкоманды:
+//! Subcommands:
 //!
-//! | Команда | Что делает |
+//! | Command | What it does |
 //! |---|---|
-//! | `demo` | прогоняет сценарии на мок-транспорте и пишет журнал |
-//! | `detect` | прогоняет детекцию на моке или на реальном транспорте по TCP |
-//! | `sim` | поднимает симулятор устройства (стенд без железа) |
-//! | `verify` | самопроверка: политики, декодирование APSD, сетка тока |
+//! | `demo` | runs the scenarios on the mock transport and writes the journal |
+//! | `detect` | runs one detection on the mock or on the real TCP transport |
+//! | `sim` | starts the device simulator (a bench without hardware) |
+//! | `verify` | self-check: policies, APSD decoding, current grid |
 //!
-//! Примеры:
+//! Examples:
 //!
 //! ```text
 //! cargo run -p cli -- demo
@@ -33,23 +33,23 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-/// Каким транспортом пользоваться.
+/// Which transport to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum TransportKind {
-    /// Мок-транспорт в памяти.
+    /// In-memory mock transport.
     Mock,
-    /// Реальный TCP-транспорт.
+    /// Real TCP transport.
     Tcp,
 }
 
-/// Какой адаптер подключён.
+/// Which adapter is connected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum AdapterKind {
-    /// Питания нет.
+    /// No power.
     Detached,
-    /// Стандартный порт USB.
+    /// Standard USB port.
     Sdp,
-    /// Порт зарядки BC1.2.
+    /// BC1.2 charging port.
     Dcp,
     /// Quick Charge 2.0.
     Hvdcp2,
@@ -57,7 +57,7 @@ enum AdapterKind {
     Hvdcp3,
     /// Quick Charge 3.5.
     Hvdcp3p5,
-    /// Неизвестный образец детекции.
+    /// Unknown detection pattern.
     Unknown,
 }
 
@@ -98,7 +98,7 @@ impl AdapterKind {
     }
 }
 
-/// Как собрать мок для сценария.
+/// How to build the mock for the scenario.
 #[derive(Debug, Clone, Copy)]
 enum MockBuilder {
     Detached,
@@ -120,13 +120,13 @@ impl MockBuilder {
 #[command(
     name = "nabu-charger",
     version,
-    about = "Драйвер зарядки Xiaomi Pad 5 (nabu): детекция адаптера и политика входного тока"
+    about = "Xiaomi Pad 5 (nabu) charging driver: adapter detection and input current policy"
 )]
 struct Cli {
-    /// Подробность журнала в stderr: error, warn, info, debug, trace.
+    /// Log verbosity on stderr: error, warn, info, debug, trace.
     #[arg(long, default_value = "info", global = true)]
     log: String,
-    /// Куда писать JSON-журнал операций.
+    /// Where to write the JSON journal of operations.
     #[arg(long, global = true)]
     journal: Option<PathBuf>,
     #[command(subcommand)]
@@ -135,48 +135,48 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Прогоняет все сценарии на моке и печатает таблицу результатов.
+    /// Runs all scenarios on the mock and prints a table of results.
     Demo,
-    /// Прогоняет одну детекцию и печатает результат.
+    /// Runs one detection and prints the result.
     Detect {
-        /// Тип транспорта.
+        /// Transport type.
         #[arg(long, value_enum, default_value_t = TransportKind::Mock)]
         transport: TransportKind,
-        /// Какой адаптер подключён (для мока).
+        /// Which adapter is connected (for the mock).
         #[arg(long, value_enum, default_value_t = AdapterKind::Hvdcp3)]
         adapter: AdapterKind,
-        /// Адрес устройства для транспорта TCP.
+        /// Device address for the TCP transport.
         #[arg(long, default_value = "127.0.0.1:9700")]
         addr: String,
-        /// Таймаут ожидания детекции, мс.
+        /// Detection wait timeout, ms.
         #[arg(long, default_value_t = 3_000)]
         timeout_ms: u64,
     },
-    /// Поднимает симулятор устройства (стенд без железа).
+    /// Starts the device simulator (a bench without hardware).
     Sim {
-        /// Какой адаптер эмулировать.
+        /// Which adapter to emulate.
         #[arg(long, value_enum, default_value_t = AdapterKind::Hvdcp3)]
         adapter: AdapterKind,
-        /// Адрес прослушивания.
+        /// Listen address.
         #[arg(long, default_value = "127.0.0.1:9700")]
         listen: String,
     },
-    /// Проверка charge pump LN8000 на мок-шине I²C.
+    /// Checks the LN8000 charge pump on the mock I²C bus.
     Pump {
-        /// Профиль настроек
+        /// Settings profile
         #[arg(long, value_enum, default_value_t = PumpProfile::Qc35)]
         profile: PumpProfile,
     },
-    /// Самопроверка таблиц, математики и ошибочных путей.
+    /// Self-check of the tables, the math and the error paths.
     Verify,
 }
 
-/// Профиль настроек charge pump.
+/// Charge pump settings profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum PumpProfile {
-    /// Класс B для Quick Charge 3.5 (13 В, 2.8 А).
+    /// Class B for Quick Charge 3.5 (13 V, 2.8 A).
     Qc35,
-    /// Осторожный режим: 6.5 В, 1 А.
+    /// Conservative mode: 6.5 V, 1 A.
     Conservative,
 }
 
@@ -206,7 +206,7 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
-            eprintln!("ошибка: {message}");
+            eprintln!("error: {message}");
             ExitCode::FAILURE
         }
     }
@@ -231,35 +231,35 @@ fn journal_path(given: Option<&PathBuf>) -> PathBuf {
 fn run_demo(journal_arg: Option<&PathBuf>) -> Result<(), String> {
     let path = journal_path(journal_arg);
     let journal =
-        JsonlJournal::create(&path).map_err(|err| format!("не удалось открыть журнал: {err}"))?;
+        JsonlJournal::create(&path).map_err(|err| format!("failed to open the journal: {err}"))?;
     let clock = SystemClock::start();
 
     let scenarios = [
         (
             AdapterKind::Hvdcp3p5,
-            "родной блок: до аутентификации QC3.5 виден как HVDCP3",
+            "stock power brick: before authentication QC3.5 appears as HVDCP3",
         ),
         (AdapterKind::Hvdcp3, "Quick Charge 3.0"),
         (AdapterKind::Hvdcp2, "Quick Charge 2.0"),
-        (AdapterKind::Dcp, "порт зарядки BC1.2"),
-        (AdapterKind::Sdp, "стандартный порт USB"),
+        (AdapterKind::Dcp, "BC1.2 charging port"),
+        (AdapterKind::Sdp, "standard USB port"),
+        (AdapterKind::Detached, "no power: a timeout is expected"),
         (
-            AdapterKind::Detached,
-            "питание отсутствует: ожидается таймаут",
+            AdapterKind::Unknown,
+            "unknown pattern: a failure is expected",
         ),
-        (AdapterKind::Unknown, "неизвестный образец: ожидается отказ"),
     ];
 
     println!(
-        "{:<10} {:<6} {:<10} {:<7} {:<6} пояснение",
-        "сценарий", "итог", "адаптер", "ток,мкА", "pump"
+        "{:<10} {:<6} {:<10} {:<7} {:<6} note",
+        "scenario", "result", "adapter", "current,µA", "pump"
     );
     println!("{}", "-".repeat(78));
 
     let mut failures = Vec::new();
     for (kind, note) in scenarios {
-        // Два сценария обязаны закончиться типизированной ошибкой: это проверка
-        // ошибочных путей, а не сбой демонстрации.
+        // Two scenarios must end with a typed error: this is a check of the
+        // error paths, not a demo failure.
         let expected_code = match kind {
             AdapterKind::Detached => Some("detection_timeout"),
             AdapterKind::Unknown => Some("unknown_adapter_pattern"),
@@ -269,12 +269,12 @@ fn run_demo(journal_arg: Option<&PathBuf>) -> Result<(), String> {
             Ok(line) => println!("{line}"),
             Err(err) if expected_code == Some(err.code()) => {
                 println!(
-                    "{:<10} {:<6} {:<10} {:<7} {:<6} ошибка {} — {note}",
+                    "{:<10} {:<6} {:<10} {:<7} {:<6} error {} - {note}",
                     kind.name(),
-                    "отказ",
-                    "—",
-                    "—",
-                    "—",
+                    "failure",
+                    "-",
+                    "-",
+                    "-",
                     err.code()
                 );
             }
@@ -282,10 +282,10 @@ fn run_demo(journal_arg: Option<&PathBuf>) -> Result<(), String> {
                 println!(
                     "{:<10} {:<6} {:<10} {:<7} {:<6} {note}",
                     kind.name(),
-                    "ошибка",
-                    "—",
-                    "—",
-                    "—"
+                    "error",
+                    "-",
+                    "-",
+                    "-"
                 );
                 failures.push(format!("{}: {err}", kind.name()));
             }
@@ -295,11 +295,11 @@ fn run_demo(journal_arg: Option<&PathBuf>) -> Result<(), String> {
     emit(&journal, &clock, EventKind::Close { ok: true });
     let _ = journal.flush();
     println!();
-    println!("журнал: {}", journal.path().display());
+    println!("journal: {}", journal.path().display());
     if failures.is_empty() {
         Ok(())
     } else {
-        Err(format!("сценарии с ошибками: {}", failures.join("; ")))
+        Err(format!("scenarios with errors: {}", failures.join("; ")))
     }
 }
 
@@ -314,13 +314,13 @@ fn demo_one(
     Ok(format!(
         "{:<10} {:<6} {:<10} {:<7} {:<6} {}",
         kind.name(),
-        "ок",
+        "ok",
         outcome.adapter.label(),
         outcome.plan.applied_icl_ua,
         if outcome.plan.policy.pump_eligible {
-            "да"
+            "yes"
         } else {
-            "нет"
+            "no"
         },
         outcome.plan.policy.rationale,
     ))
@@ -343,18 +343,18 @@ fn run_detect(
         TransportKind::Mock => {
             let path = journal_path(journal_arg);
             let journal = JsonlJournal::create(&path)
-                .map_err(|err| format!("не удалось открыть журнал: {err}"))?;
+                .map_err(|err| format!("failed to open the journal: {err}"))?;
             let mock = adapter.mock().build();
             let mut charger =
                 Charger::open(mock, &clock, &journal, config).map_err(|err| err.to_string())?;
             let outcome = run_until_ready(&mut charger, &clock, RunOptions::default(), |value| {
-                println!("распознан адаптер: {value}");
+                println!("adapter detected: {value}");
                 Ok(())
             })
             .map_err(|err| err.to_string())?;
             let _ = journal.flush();
             print_outcome(&outcome, &charger);
-            println!("журнал: {}", journal.path().display());
+            println!("journal: {}", journal.path().display());
             Ok(())
         }
         TransportKind::Tcp => {
@@ -363,7 +363,7 @@ fn run_detect(
             let mut charger = Charger::open(transport, &clock, &NullJournal, config)
                 .map_err(|err| err.to_string())?;
             let outcome = run_until_ready(&mut charger, &clock, RunOptions::default(), |value| {
-                println!("распознан адаптер: {value}");
+                println!("adapter detected: {value}");
                 Ok(())
             })
             .map_err(|err| err.to_string())?;
@@ -379,21 +379,21 @@ where
     C: Clock,
     J: Journal,
 {
-    println!("транспорт      : {}", charger.transport_name());
-    println!("адаптер        : {}", outcome.adapter.label());
-    println!("лимит тока     : {} мкА", outcome.plan.applied_icl_ua);
-    println!("код регистра   : 0x{:02X}", outcome.plan.icl_raw);
-    println!("обоснование    : {}", outcome.plan.policy.rationale);
+    println!("transport      : {}", charger.transport_name());
+    println!("adapter        : {}", outcome.adapter.label());
+    println!("current limit  : {} µA", outcome.plan.applied_icl_ua);
+    println!("register code  : 0x{:02X}", outcome.plan.icl_raw);
+    println!("rationale      : {}", outcome.plan.policy.rationale);
     println!(
         "charge pump    : {}",
         if outcome.plan.policy.pump_eligible {
-            "разрешён"
+            "allowed"
         } else {
-            "не требуется"
+            "not required"
         }
     );
     println!(
-        "счётчики       : чтений {}, записей {}, повторов {}, сбросов {}, ошибок {}",
+        "counters       : reads {}, writes {}, retries {}, resets {}, errors {}",
         outcome.stats.reads,
         outcome.stats.writes,
         outcome.stats.retries,
@@ -401,27 +401,27 @@ where
         outcome.stats.errors
     );
     println!(
-        "состояние      : {}",
+        "state          : {}",
         match outcome.state {
-            State::Ready => "готов",
-            State::Closed => "закрыт",
-            State::Detecting => "идёт детекция",
-            State::Idle => "ожидание",
-            State::Faulted => "неисправность",
+            State::Ready => "ready",
+            State::Closed => "closed",
+            State::Detecting => "detecting",
+            State::Idle => "idle",
+            State::Faulted => "faulted",
         }
     );
 }
 
 fn run_sim(adapter: AdapterKind, listen: &str) -> Result<(), String> {
     let value = adapter.to_adapter().unwrap_or(AdapterType::Unknown);
-    let sim = Simulator::start(value).map_err(|err| format!("симулятор не запустился: {err}"))?;
-    println!("симулятор слушает {}", sim.addr());
-    println!("запрошенный адрес: {listen} (для смены адреса запускайте из своей сети)");
+    let sim = Simulator::start(value).map_err(|err| format!("simulator failed to start: {err}"))?;
+    println!("simulator listening on {}", sim.addr());
+    println!("requested address: {listen} (to change the address, run it from your own network)");
     println!(
-        "подключение: nabu-charger detect --transport tcp --addr {}",
+        "connect with: nabu-charger detect --transport tcp --addr {}",
         sim.addr()
     );
-    println!("Ctrl+C — остановка");
+    println!("Ctrl+C to stop");
     loop {
         std::thread::sleep(Duration::from_secs(1));
     }
@@ -437,56 +437,56 @@ fn run_pump(profile: PumpProfile) -> Result<(), String> {
     };
 
     let mut bus = MockPumpBus::new();
-    // Мок моделирует чип: запись в SYS_CTRL меняет SYS_STS.
+    // The mock models the chip: a write to SYS_CTRL changes SYS_STS.
     //
-    // Показываем три канала, которые драйвер использует для алармов
-    // (IIN, VIN, VBAT): в моке их пары байт не пересекаются. Остальные каналы
-    // делят байты с соседями — это свойство аппаратуры, поэтому в демо они не
-    // выводятся, чтобы не показывать бессмысленные числа.
-    bus.set_reg(AdcChannel::Iin.register(), 0x64); // пара (0x64, 0x00) → 489 мА
-    bus.set_reg(AdcChannel::Vin.register(), 0xC8); // пара (0xC8, 0x00) → 3.2 В
-    bus.set_reg(AdcChannel::Vbat.register(), 0x9C); // пара (0x9C, 0x02) → 4.34 В
+    // We show the three channels the driver uses for alarms
+    // (IIN, VIN, VBAT): in the mock their byte pairs do not overlap. The other
+    // channels share bytes with their neighbors, which is a property of the
+    // hardware, so the demo does not print them to avoid meaningless numbers.
+    bus.set_reg(AdcChannel::Iin.register(), 0x64); // pair (0x64, 0x00) -> 489 mA
+    bus.set_reg(AdcChannel::Vin.register(), 0xC8); // pair (0xC8, 0x00) -> 3.2 V
+    bus.set_reg(AdcChannel::Vbat.register(), 0x9C); // pair (0x9C, 0x02) -> 4.34 V
     bus.set_reg(AdcChannel::Vbat.register().saturating_add(1), 0x02);
 
-    let mut pump = Pump::open(bus, config).map_err(|err| format!("открытие не удалось: {err}"))?;
-    println!("шина          : {}", pump.bus_name());
-    println!("состояние     : {}", pump.state().label());
+    let mut pump = Pump::open(bus, config).map_err(|err| format!("open failed: {err}"))?;
+    println!("bus           : {}", pump.bus_name());
+    println!("state         : {}", pump.state().label());
 
     pump.configure()
-        .map_err(|err| format!("настройка не удалась: {err}"))?;
-    println!("после настройки: {}", pump.state().label());
+        .map_err(|err| format!("configuration failed: {err}"))?;
+    println!("after configuration: {}", pump.state().label());
 
     let mode = pump
         .enable_switching()
-        .map_err(|err| format!("режим 2:1 не включился: {err}"))?;
-    println!("режим         : {} (код {})", mode.label(), mode.code());
+        .map_err(|err| format!("2:1 mode did not start: {err}"))?;
+    println!("mode          : {} (code {})", mode.label(), mode.code());
     assert_eq!(mode, OpMode::Switching);
 
     let status = pump.status().map_err(|err| err.to_string())?;
     println!(
-        "SYS_STS       : 0x{:02X} (петля тока: {}, петля напряжения: {})",
+        "SYS_STS       : 0x{:02X} (current loop: {}, voltage loop: {})",
         status.sys_sts,
         if status.iin_loop_active() {
-            "да"
+            "yes"
         } else {
-            "нет"
+            "no"
         },
         if status.vfloat_loop_active() {
-            "да"
+            "yes"
         } else {
-            "нет"
+            "no"
         }
     );
     println!(
-        "отказы        : {}",
+        "faults        : {}",
         if status.has_critical_fault() {
             status.fault_summary()
         } else {
-            "нет"
+            "none"
         }
     );
 
-    println!("\nпоказания АЦП (мок), каналы алармов:");
+    println!("\nADC readings (mock), alarm channels:");
     for channel in [AdcChannel::Iin, AdcChannel::Vin, AdcChannel::Vbat] {
         let value = pump.read_adc(channel).map_err(|err| err.to_string())?;
         println!(
@@ -499,9 +499,9 @@ fn run_pump(profile: PumpProfile) -> Result<(), String> {
     }
 
     let (writes, reads) = pump.counters();
-    println!("\nопераций      : записей {writes}, чтений {reads}");
+    println!("\noperations    : writes {writes}, reads {reads}");
     pump.standby().map_err(|err| err.to_string())?;
-    println!("после standby : {}", pump.op_mode().label());
+    println!("after standby : {}", pump.op_mode().label());
     Ok(())
 }
 
@@ -512,7 +512,7 @@ fn run_verify() -> Result<(), String> {
     let qc35 = Qc35Support::default();
     let encoding = IclEncoding::default();
 
-    // 1. Политика: ток соответствует таблице из эталонного драйвера.
+    // 1. Policy: the current matches the table from the reference driver.
     let expected = [
         (AdapterType::Sdp, 500_000_u32),
         (AdapterType::Dcp, 1_500_000),
@@ -524,13 +524,13 @@ fn run_verify() -> Result<(), String> {
         let got = policy_for(adapter, qc35).icl_ua;
         if got != want {
             problems.push(format!(
-                "политика {}: ожидалось {want} мкА, получено {got}",
+                "policy {}: expected {want} µA, got {got}",
                 adapter.label()
             ));
         }
     }
 
-    // 2. Сетка тока: кодирование и декодирование сходятся.
+    // 2. Current grid: encoding and decoding agree.
     for adapter in [
         AdapterType::Sdp,
         AdapterType::Dcp,
@@ -544,16 +544,16 @@ fn run_verify() -> Result<(), String> {
                 let back = encoding.decode(raw);
                 if back != target {
                     problems.push(format!(
-                        "{}: код 0x{raw:02X} даёт {back} вместо {target}",
+                        "{}: code 0x{raw:02X} gives {back} instead of {target}",
                         adapter.label()
                     ));
                 }
             }
-            Err(err) => problems.push(format!("{}: ошибка кодирования: {err}", adapter.label())),
+            Err(err) => problems.push(format!("{}: encoding error: {err}", adapter.label())),
         }
     }
 
-    // 3. Декодирование APSD по таблице образцов.
+    // 3. APSD decoding against the pattern table.
     for adapter in [
         AdapterType::Sdp,
         AdapterType::Cdp,
@@ -569,16 +569,14 @@ fn run_verify() -> Result<(), String> {
             };
         match AdapterType::decode(status, adapter.apsd_pattern(), qc35) {
             Ok(value) if value == adapter => {}
-            Ok(value) => problems.push(format!(
-                "{}: декодировано как {}",
-                adapter.label(),
-                value.label()
-            )),
-            Err(err) => problems.push(format!("{}: ошибка декодирования: {err}", adapter.label())),
+            Ok(value) => {
+                problems.push(format!("{}: decoded as {}", adapter.label(), value.label()));
+            }
+            Err(err) => problems.push(format!("{}: decoding error: {err}", adapter.label())),
         }
     }
 
-    // 4. Ошибочный путь: сбой чтения должен вернуться типизированной ошибкой.
+    // 4. Error path: a read failure must come back as a typed error.
     let clock = SystemClock::start();
     let journal = charger_core::testkit::VecJournal::new();
     let mut mock = MockTransport::hvdcp3();
@@ -592,24 +590,19 @@ fn run_verify() -> Result<(), String> {
         ..ChargerConfig::for_testing()
     };
     match Charger::open(mock, &clock, &journal, strict) {
-        Ok(_) => problems.push("сбой чтения при открытии не обнаружен".to_owned()),
+        Ok(_) => problems.push("read failure during open was not detected".to_owned()),
         Err(err) if err.code() == "transport" => {}
-        Err(err) => problems.push(format!("неожиданная ошибка открытия: {err}")),
+        Err(err) => problems.push(format!("unexpected open error: {err}")),
     }
 
     if problems.is_empty() {
-        println!(
-            "самопроверка: пройдена (политики, сетка тока, декодирование APSD, ошибочный путь)"
-        );
+        println!("self-check: passed (policies, current grid, APSD decoding, error path)");
         Ok(())
     } else {
         for problem in &problems {
-            println!("проблема: {problem}");
+            println!("problem: {problem}");
         }
-        Err(format!(
-            "самопроверка не пройдена: {} замечаний",
-            problems.len()
-        ))
+        Err(format!("self-check failed: {} findings", problems.len()))
     }
 }
 

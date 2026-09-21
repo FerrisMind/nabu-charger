@@ -1,16 +1,16 @@
-//! Минимальный пример: детекция адаптера на мок-транспорте.
+//! Minimal example: adapter detection on the mock transport.
 //!
-//! Запуск:
+//! Run with:
 //!
 //! ```text
 //! cargo run -p host --example minimal
 //! ```
 //!
-//! Ожидаемый вывод:
+//! Expected output:
 //!
 //! ```text
-//! адаптер: HVDCP3
-//! лимит входного тока: 3000000 мкА (код 0x1D)
+//! adapter: HVDCP3
+//! input current limit: 3000000 µA (code 0x1D)
 //! ```
 
 use charger_core::{ChargerConfig, ChargerError};
@@ -25,17 +25,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Charger::open(transport, &clock, &journal, ChargerConfig::for_nabu()).map_err(describe)?;
 
     let outcome = run_until_ready(&mut charger, &clock, RunOptions::default(), |adapter| {
-        println!("распознан адаптер: {adapter}");
+        println!("adapter detected: {adapter}");
         Ok(())
     })
     .map_err(describe)?;
 
-    println!("адаптер: {}", outcome.adapter.label());
+    println!("adapter: {}", outcome.adapter.label());
     println!(
-        "лимит входного тока: {} мкА (код 0x{:02X})",
+        "input current limit: {} µA (code 0x{:02X})",
         outcome.plan.applied_icl_ua, outcome.plan.icl_raw
     );
-    println!("обоснование: {}", outcome.plan.policy.rationale);
+    println!("rationale: {}", outcome.plan.policy.rationale);
     charger.close();
     Ok(())
 }

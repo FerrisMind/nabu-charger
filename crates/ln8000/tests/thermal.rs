@@ -1,16 +1,16 @@
-//! Сценарий нагрева от холодного состояния до останова: все три уровня защиты.
+//! Heating scenario from cold to stop: all three protection levels.
 //!
-//! Тест повторяет путь драйвера: читает температуру из АЦП, принимает решение
-//! защитой и **применяет его к чипу**, после чего проверяет регистры. Это не
-//! проверка одной формулы, а сверка всей цепочки «датчик → решение → запись».
+//! The test repeats the driver's path: it reads the temperature from the ADC, decides
+//! with the guard and **applies that decision to the chip**, then checks the registers.
+//! Not a check of one formula, but a cross-check of "sensor → decision → write".
 //!
-//! Уход в 1:1 разрешает только Vin в окне обхода: на повышенном входе защита
-//! снижает ток, а затем останавливает заряд (проверяется отдельным сценарием).
+//! A move to 1:1 is permitted only for Vin inside the bypass window: at a raised
+//! input the guard cuts current and then stops charging (a separate scenario).
 //!
-//! Ступени берутся от порогов профиля (`GuardLimits::standard`), а не зашиты
-//! числами: пороги обязаны лежать выше температуры покоя кристалла этой платы
-//! (живой замер 19.09 — 46,1 °C в простое), и зашитые значения разъезжались с
-//! ними молча.
+//! The steps come from the profile thresholds (`GuardLimits::standard`) and are not
+//! hard-coded numbers: the thresholds must sit above this board's crystal idle
+//! temperature (live measurement 19.09 - 46.1 °C at idle), and hard-coded values
+//! drifted apart from them silently.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -25,37 +25,35 @@ use ln8000::{
     TEMP_REDUCE_HYST_DC, TelemetrySample, evaluate, regs, resolve_bypass,
 };
 
-/// Записывает температуру кристалла в регистры АЦП так, как это сделал бы чип.
+/// Writes the die temperature into the ADC registers the way the chip would.
 ///
-/// Температура задаётся кодом канала: dC = (935 - code) * 4350 / 1000,
+/// The temperature is given as a channel code: dC = (935 - code) * 4350 / 1000,
 fn set_die_temp(pump: &mut Pump<MockPumpBus>, deci_celsius: i32) {
-    // Обратное преобразование: code = 935 - (dC * 1000) / 4350.
-    // то есть raw = 935 - (dC * 1000) / 4350. Значение ограничиваем диапазоном АЦП.
+    // Inverse conversion: code = 935 - (dC * 1000) / 4350,
+    // that is raw = 935 - (dC * 1000) / 4350. The value is clamped to the ADC range.
     let code = (935_i32 - (deci_celsius * 1000) / 4350).clamp(0, 1_023);
     let register = AdcChannel::DieTemp.register();
     let bus = pump.bus_mut();
-    // Код канала упакован в общий поток бит: 6 бит кода лежат в младшем
-    // байте со сдвигом 2, старшие 4 бита - в младших битах следующего.
+    // The channel code is packed into the common bit stream: 6 code bits sit in the
+    // low byte shifted by 2, the top 4 bits in the low bits of the next one.
     bus.set_reg(register, u8::try_from((code % 64) * 4).unwrap_or(0));
     bus.set_reg(register + 1, u8::try_from((code / 64) & 0x0F).unwrap_or(0));
 }
 
-/// Собирает отсчёт телеметрии: температура читается с чипа, остальные каналы —
-/// фиксированные и правдоподобные.
+/// Builds a telemetry sample: the temperature is read from the chip, the other
+/// channels are fixed and plausible.
 ///
-/// Так сделано намеренно: пары регистров АЦП перекрываются (напряжение батареи
-/// читается из `0x0E–0x0F`, температура из `0x0F–0x10`), поэтому подмена всех
-/// каналов через мок дала бы мусорный отсчёт. Сценарий проверяет температуру, а ток
-/// и напряжение держит в нормальном диапазоне, чтобы вмешивалась именно она.
+/// This is deliberate: the ADC register pairs overlap (battery voltage is read from
+/// `0x0E–0x0F`, temperature from `0x0F–0x10`), so substituting every channel via
+/// the mock would give a garbage sample. The scenario checks the temperature and
+/// keeps current and voltage in the normal range so that only it can interfere.
 fn sample_from(pump: &mut Pump<MockPumpBus>, now_ms: u64) -> TelemetrySample {
     sample_from_with_vin(pump, now_ms, 9_000_000)
 }
 
-/// [`sample_from`] с явным Vin: гейт обхода 1:1 зависит от входного напряжения.
+/// [`sample_from`] with an explicit Vin: the 1:1 bypass gate depends on the input voltage.
 fn sample_from_with_vin(pump: &mut Pump<MockPumpBus>, now_ms: u64, vin_uv: u32) -> TelemetrySample {
-    let temp = pump
-        .read_adc(AdcChannel::DieTemp)
-        .expect("температура кристалла");
+    let temp = pump.read_adc(AdcChannel::DieTemp).expect("die temperature");
     TelemetrySample {
         ts_ms: now_ms,
         vbat_uv: 3_900_000,
@@ -64,37 +62,39 @@ fn sample_from_with_vin(pump: &mut Pump<MockPumpBus>, now_ms: u64, vin_uv: u32) 
         die_temp_dc: temp,
         op_mode: pump.op_mode(),
         input_present: true,
-        // Температура только что прочитана с чипа; VBAT в этом сценарии —
-        // правдоподобная константа, а не результат чтения АЦП.
+        // The temperature was just read from the chip; VBAT in this scenario is a
+        // plausible constant, not the result of an ADC read.
         vbat_valid: true,
         die_temp_valid: true,
     }
 }
 
-/// Перегрев при повышенном Vin (живой сценарий QC/PD, 9 В).
+/// Overtemperature at a raised Vin (live QC/PD scenario, 9 V).
 ///
-/// 1:1 здесь — это 9 В на батарею, поэтому защита обязана вместо обхода снижать
-/// ток, а при упорной температуре — останавливать заряд. Бит `EN_1TO1` не должен
-/// появиться ни на одном шаге.
+/// 1:1 here means 9 V on the battery, so the guard must cut current instead of
+/// bypassing, and stop charging at a persistent temperature. The `EN_1TO1` bit
+/// must not appear at any step.
 #[test]
+// One ramp end to end: splitting it would hide the step sequence the test asserts on.
+#[allow(clippy::too_many_lines)]
 fn thermal_ramp_on_elevated_vin_never_uses_bypass() {
     let bus = MockPumpBus::new();
-    let mut pump = Pump::open(bus, PumpConfig::for_qc35_class_b()).expect("открытие чипа");
-    pump.configure().expect("настройка порогов");
+    let mut pump = Pump::open(bus, PumpConfig::for_qc35_class_b()).expect("chip open");
+    pump.configure().expect("threshold configuration");
     assert_eq!(
-        pump.enable_switching().expect("режим 2:1"),
+        pump.enable_switching().expect("2:1 mode"),
         OpMode::Switching
     );
 
-    // Снимок профильного лимита — как в `read_parameters`: защита возвращает ток
-    // именно к нему, и без снимка она бы «возвращала» к дефолтным 2 А.
+    // Snapshot of the profile limit, as in `read_parameters`: the guard brings
+    // current back exactly to it, and without the snapshot it would "restore" to 2 A.
     let mut limits = GuardLimits::standard();
     let target_before = pump.config().iin_limit_ua;
     limits.iin_profile_ua = target_before;
 
-    // Температура растёт: норма → снижение тока → отказ 1:1 (снижение) → останов.
-    // Ступени выводятся из порогов профиля: зашитые числа разъезжались с ними
-    // молча (пороги подняты над температурой покоя кристалла — 46,1 °C).
+    // Temperature rises: normal → current reduction → 1:1 refused (reduce) → stop.
+    // The steps are derived from the profile thresholds: hard-coded numbers drifted
+    // apart from them silently (the thresholds sit above crystal idle - 46.1 °C).
     let ramp = [
         limits.temp_reduce_dc - 100,
         limits.temp_reduce_dc + 10,
@@ -108,15 +108,15 @@ fn thermal_ramp_on_elevated_vin_never_uses_bypass() {
         set_die_temp(&mut pump, *temperature);
 
         let sample = sample_from(&mut pump, u64::try_from(index).unwrap_or(0) * 1_000);
-        // АЦП квантует значение, поэтому сверяем с допуском, а не точно.
+        // The ADC quantises the value, so we compare with a tolerance, not exactly.
         assert!(
             (sample.die_temp_dc - temperature).abs() <= 5,
-            "прочитанная температура {} должна быть близка к записанной {}",
+            "the temperature read {} must be close to the written {}",
             sample.die_temp_dc,
             temperature
         );
 
-        // Намеренной уставки (тапера) в этом сценарии нет: Vbat далеко от полосы.
+        // There is no deliberate setpoint (taper) in this scenario: Vbat is far from the band.
         let action = evaluate(
             &sample,
             &limits,
@@ -126,80 +126,82 @@ fn thermal_ramp_on_elevated_vin_never_uses_bypass() {
         match action {
             GuardAction::None => {
                 denied_strikes = 0;
-                seen.push("норма");
+                seen.push("normal");
             }
             GuardAction::ReduceCurrent { to_ua, .. } => {
                 denied_strikes = 0;
-                seen.push("снижение тока");
-                pump.set_iin_limit(to_ua).expect("снижение тока в чипе");
+                seen.push("current reduction");
+                pump.set_iin_limit(to_ua)
+                    .expect("current reduction in the chip");
             }
             GuardAction::FallbackToBypass { .. } => {
-                // Ровно то, что делает KMDF: решение разрешается с учётом Vin.
+                // Exactly what KMDF does: the decision is resolved with Vin taken into account.
                 match resolve_bypass(
-                    i32::try_from(sample.vbus_uv).expect("Vin в i32"),
+                    i32::try_from(sample.vbus_uv).expect("Vin into i32"),
                     sample.vbat_uv,
                     denied_strikes,
                     &limits,
                 ) {
-                    BypassResolution::Allowed => panic!("1:1 при 9 В недопустим"),
+                    BypassResolution::Allowed => panic!("1:1 at 9 V is not allowed"),
                     BypassResolution::ReduceCurrent { to_ua, .. } => {
                         denied_strikes = denied_strikes.saturating_add(1);
-                        seen.push("отказ 1:1 → снижение тока");
-                        pump.set_iin_limit(to_ua).expect("снижение тока в чипе");
+                        seen.push("1:1 refused -> current reduction");
+                        pump.set_iin_limit(to_ua)
+                            .expect("current reduction in the chip");
                     }
                     BypassResolution::Stop { .. } => {
-                        seen.push("отказ 1:1 → останов");
-                        pump.standby().expect("останов заряда");
+                        seen.push("1:1 refused -> stop");
+                        pump.standby().expect("charge stop");
                     }
-                    // Перечисление помечено `non_exhaustive`.
-                    _ => seen.push("прочее"),
+                    // The enum is marked `non_exhaustive`.
+                    _ => seen.push("other"),
                 }
             }
             GuardAction::Stop { .. } => {
-                seen.push("останов");
-                pump.standby().expect("останов заряда");
+                seen.push("stop");
+                pump.standby().expect("charge stop");
             }
-            // Перечисление помечено `non_exhaustive`: новых вариантов защита пока не выдаёт.
-            _ => seen.push("прочее"),
+            // The enum is marked `non_exhaustive`: the guard emits no new variants yet.
+            _ => seen.push("other"),
         }
 
         assert_eq!(
             pump.bus().reg(regs::SYS_CTRL) & regs::SYS_CTRL_EN_1TO1,
             0,
-            "при повышенном Vin бит 1:1 не должен появляться (шаг {temperature})"
+            "at a raised Vin the 1:1 bit must not appear (step {temperature})"
         );
     }
 
     assert_eq!(
         seen,
         vec![
-            "норма",
-            "снижение тока",
-            "отказ 1:1 → снижение тока",
-            "останов"
+            "normal",
+            "current reduction",
+            "1:1 refused -> current reduction",
+            "stop"
         ],
-        "на повышенном Vin защита не уходит в 1:1, а режет ток и останавливается"
+        "at a raised Vin the guard does not go to 1:1, it cuts current and stops"
     );
 
-    // Что реально произошло с чипом к концу сценария.
+    // What actually happened to the chip by the end of the scenario.
     let sys_ctrl = pump.bus().reg(regs::SYS_CTRL);
     assert_ne!(
         sys_ctrl & (1 << 3),
         0,
-        "к концу сценария в SYS_CTRL должен стоять бит standby"
+        "by the end of the scenario SYS_CTRL must have the standby bit set"
     );
     assert_eq!(
         pump.op_mode(),
         OpMode::Standby,
-        "после останова ожидается режим standby"
+        "standby mode is expected after a stop"
     );
     assert!(
         pump.config().iin_limit_ua <= target_before,
-        "лимит тока не должен вырасти от действий защиты"
+        "the current limit must not grow from the guard's actions"
     );
 }
 
-/// Кладёт в регистры АЦП Vin такое значение, чтобы `read_adc(Vin)` вернул ≈ `uv`.
+/// Puts a Vin value into the ADC registers so that `read_adc(Vin)` returns ≈ `uv`.
 fn set_vin_adc(pump: &mut Pump<MockPumpBus>, uv: i32) {
     let units = u16::try_from((uv / 16_000).clamp(0, 1023)).unwrap_or(0);
     let high = u8::try_from((units / 16) & 0x3F).unwrap_or(0);
@@ -209,13 +211,13 @@ fn set_vin_adc(pump: &mut Pump<MockPumpBus>, uv: i32) {
     pump.bus_mut().set_reg(register + 1, high);
 }
 
-/// Тот же перегрев, но вход в окне обхода (5 В): 1:1 разрешён и включается.
+/// The same overtemperature, but with the input in the bypass window (5 V): 1:1 is allowed.
 #[test]
 fn thermal_bypass_on_five_volts_is_allowed() {
     let bus = MockPumpBus::new();
-    let mut pump = Pump::open(bus, PumpConfig::for_qc35_class_b()).expect("открытие чипа");
-    pump.configure().expect("настройка порогов");
-    pump.enable_switching().expect("режим 2:1");
+    let mut pump = Pump::open(bus, PumpConfig::for_qc35_class_b()).expect("chip open");
+    pump.configure().expect("threshold configuration");
+    pump.enable_switching().expect("2:1 mode");
 
     let mut limits = GuardLimits::standard();
     limits.iin_profile_ua = pump.config().iin_limit_ua;
@@ -235,25 +237,25 @@ fn thermal_bypass_on_five_volts_is_allowed() {
         resolve_bypass(5_000_000, sample.vbat_uv, 0, &limits),
         BypassResolution::Allowed
     );
-    pump.enable_bypass().expect("уход в bypass на 5 В");
+    pump.enable_bypass().expect("move to bypass at 5 V");
     assert_eq!(
         pump.bus().reg(regs::SYS_CTRL) & regs::SYS_CTRL_EN_1TO1,
         regs::SYS_CTRL_EN_1TO1,
-        "на 5 В обход обязан включаться"
+        "at 5 V the bypass must engage"
     );
 }
 
 #[test]
 fn cooled_down_chip_returns_to_switching() {
     let bus = MockPumpBus::new();
-    let mut pump = Pump::open(bus, PumpConfig::for_qc35_class_b()).expect("открытие чипа");
-    pump.configure().expect("настройка");
-    pump.enable_switching().expect("режим 2:1");
+    let mut pump = Pump::open(bus, PumpConfig::for_qc35_class_b()).expect("chip open");
+    pump.configure().expect("configuration");
+    pump.enable_switching().expect("2:1 mode");
 
     let mut limits = GuardLimits::standard();
     limits.iin_profile_ua = pump.config().iin_limit_ua;
 
-    // Сначала перегрев: уходим в защиту.
+    // Overtemperature first: we enter protection.
     set_die_temp(&mut pump, limits.temp_stop_dc + 10);
     let hot = sample_from(&mut pump, 0);
     assert!(matches!(
@@ -265,9 +267,9 @@ fn cooled_down_chip_returns_to_switching() {
         ),
         GuardAction::Stop { .. }
     ));
-    pump.standby().expect("останов");
+    pump.standby().expect("stop");
 
-    // Затем остывание: чип можно вернуть в рабочий режим.
+    // Then cooling: the chip can be brought back to a working mode.
     set_die_temp(&mut pump, limits.temp_reduce_dc - TEMP_REDUCE_HYST_DC - 100);
     let cold = sample_from(&mut pump, 1_000);
     assert!(
@@ -280,12 +282,12 @@ fn cooled_down_chip_returns_to_switching() {
             ),
             GuardAction::None
         ),
-        "после остывания защита не должна вмешиваться"
+        "after cooling the guard must not interfere"
     );
-    pump.configure().expect("повторная настройка");
+    pump.configure().expect("reconfiguration");
     assert_eq!(
-        pump.enable_switching().expect("возврат в 2:1"),
+        pump.enable_switching().expect("return to 2:1"),
         OpMode::Switching,
-        "после остывания режим должен восстанавливаться"
+        "after cooling the mode must recover"
     );
 }

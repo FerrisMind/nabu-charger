@@ -1,37 +1,37 @@
-# Что нужно сделать руками на планшете
+# What has to be done by hand on the tablet
 
-Инструкция для человека. Агент работает на компьютере разработки и **не может
-сам зайти в сессию Windows на планшете**, поэтому есть два пути. Первый короче
-для вас: вы даёте агенту доступ, и дальше всю работу он делает сам.
+Instructions for a human. The agent works on the development computer and **cannot log
+into the Windows session on the tablet by itself**, so there are two paths. The first is
+shorter for you: you give the agent access, and from then on it does all the work itself.
 
 ---
 
-## Вариант А (рекомендуемый): агент делает всё сам
+## Option A (recommended): the agent does everything itself
 
-Вам нужно выполнить на планшете **одну команду** и передать агенту три строки,
-которые она напечатает.
+You need to run **one command** on the tablet and pass the agent the three lines
+it prints.
 
-1. Скопируйте на планшет папку комплекта
+1. Copy the driver package folder to the tablet
    (`G:\nabu-fast-charge\11-driver-rust\artifacts\driver-ln8000-arm64`),
-   например в `C:\nabu-ln8000`.
+   for example to `C:\nabu-ln8000`.
 
-2. На планшете откройте PowerShell **от имени администратора** и выполните:
+2. On the tablet open PowerShell **as administrator** and run:
 
    ```powershell
    cd C:\nabu-ln8000
    .\enable-remote.ps1
    ```
 
-3. Скрипт напечатает адрес планшета, имя пользователя и пароль. Передайте эти
-   три строки агенту — и всё: установку, проверку режима, сбор телеметрии,
-   замеры и разбор он делает сам с этого компьютера.
+3. The script prints the tablet address, the user name and the password. Pass those
+   three lines to the agent - and that is all: it does the installation, the mode check,
+   the telemetry collection, the measurements and the analysis itself from this computer.
 
-**Что при этом меняется на планшете:** включается служба удалённого управления
-WinRM, открывается её порт в частных сетях и создаётся отдельный локальный
-администратор `nabuagent` со случайным паролем. Ничего не перепрошивается,
-разделы и загрузчик не трогаются.
+**What this changes on the tablet:** the WinRM remote management service is enabled,
+its port is opened in private networks and a separate local administrator `nabuagent`
+is created with a random password. Nothing is reflashed, the partitions and the
+bootloader are not touched.
 
-**Когда закончим — удалить доступ (на планшете, от администратора):**
+**When we are done - remove the access (on the tablet, as administrator):**
 
 ```powershell
 Remove-LocalUser -Name nabuagent
@@ -39,23 +39,23 @@ Remove-NetFirewallRule -DisplayName 'nabu remote 5985'
 Disable-PSRemoting -Force
 ```
 
-Или попросите агента запустить `remote-bringup.ps1 -RemoveAccess` — он уберёт
-доступ сам после сбора отчёта.
+Or ask the agent to run `remote-bringup.ps1 -RemoveAccess` - it will remove the
+access itself after collecting the report.
 
-**Оговорка про безопасность:** WinRM в локальной сети шифрует трафик слабо.
-Годится для доверенной домашней сети; в открытой сети (кафе, гостиница) так
-делать не нужно — используйте вариант Б.
+**Security caveat:** WinRM on a local network encrypts traffic weakly.
+It is good enough for a trusted home network; on an open network (a cafe, a hotel)
+this should not be done - use option B.
 
 ---
 
-## Вариант Б: вручную, без удалённого доступа
+## Option B: by hand, without remote access
 
-### Шаг 1. Скопировать комплект
+### Step 1. Copy the package
 
-То же самое: папка `driver-ln8000-arm64` (12 файлов: драйвер, сертификат и
-скрипты) переносится на планшет, например в `C:\nabu-ln8000`.
+Same thing: the folder `driver-ln8000-arm64` (12 files: the driver, the certificate
+and the scripts) is moved to the tablet, for example to `C:\nabu-ln8000`.
 
-### Шаг 2. Включить тестовую подпись
+### Step 2. Enable test signing
 
 ```powershell
 cd C:\nabu-ln8000
@@ -63,88 +63,88 @@ bcdedit /set testsigning on
 Restart-Computer
 ```
 
-Драйвер подписан тестовым сертификатом WDK, без этого режима Windows его не
-загрузит.
+The driver is signed with the WDK test certificate, and without this mode Windows
+will not load it.
 
-### Шаг 3. Один прогон, который собирает всё
+### Step 3. One run that collects everything
 
-После перезагрузки, снова в PowerShell от администратора:
+After the reboot, again in PowerShell as administrator:
 
 ```powershell
 cd C:\nabu-ln8000
 .\bring-up.ps1
 ```
 
-Скрипт сам: проверит систему и узел `ACPI\QCOM057E`, поставит драйвер, снимет
-телеметрию, дважды с интервалом измерит заряд батареи через WMI и сложит всё в
-один отчёт с архивом. Около трёх минут, из них две — ожидание, чтобы стало
-видно, растёт заряд или стоит. **На эти две минуты оставьте планшет
-подключённым к тому блоку, который должен давать быстрый режим.**
+The script does everything itself: it checks the system and the `ACPI\QCOM057E` node, installs
+the driver, captures the telemetry, measures the battery charge through WMI twice with an
+interval and puts everything into one report with an archive. About three minutes, two of
+them are the wait that makes it visible whether the charge is rising or standing still. **For
+those two minutes keep the tablet connected to the supply that should provide the fast mode.**
 
-В конце скрипт напечатает пути, например:
+At the end the script prints the paths, for example:
 
 ```text
 C:\ProgramData\nabu-fastcharge\report\nabu-report-2026-09-16-140000.txt
 C:\ProgramData\nabu-fastcharge\report\nabu-report-2026-09-16-140000.zip
 ```
 
-### Шаг 4. Прислать отчёт (любой способ)
+### Step 4. Send the report (any way)
 
-* **Текстом** — откройте `.txt` блокнотом, скопируйте содержимое в чат.
-* **Файлом** — положите `.zip` в `G:\nabu-fast-charge\12-reports\` на этом
-  компьютере и скажите агенту, что файл на месте.
-* **По локальной сети** — запустите здесь `deploy\receive-report.ps1`
-  (от администратора, с ключом `-OpenFirewall`), он напечатает готовую команду
-  для планшета.
+* **As text** - open the `.txt` in Notepad, copy the contents into the chat.
+* **As a file** - put the `.zip` into `G:\nabu-fast-charge\12-reports\` on this
+  computer and tell the agent that the file is there.
+* **Over the local network** - run `deploy\receive-report.ps1` here
+  (as administrator, with the `-OpenFirewall` flag), it prints a ready-to-use command
+  for the tablet.
 
 ---
 
-## Отдельно: проверка комплекта без железа
+## Separate: checking the package without hardware
 
-Эту проверку может выполнить любой инженер на любом компьютере с Windows — она
-не требует планшета и подтверждает целостность пакета:
+Any engineer on any Windows computer can run this check - it does not require the
+tablet and confirms the integrity of the package:
 
 ```powershell
 cd G:\nabu-fast-charge\11-driver-rust\deploy
 .\verify-package.ps1
 ```
 
-Проверяются: наличие всех файлов, разрядность драйвера (`0xAA64`), содержимое
-INF (идентификатор `ACPI\QCOM057E`, имя службы, параметры профиля), совпадение
-контрольных сумм и разбор всех скриптов. Сейчас: **35 проверок, ноль проблем**.
+It checks: that all files are present, the driver bitness (`0xAA64`), the contents of the INF
+(the `ACPI\QCOM057E` identifier, the service name, the profile parameters), that the checksums
+match and that all scripts parse. Currently: **35 checks, zero problems**.
 
 ---
 
-## Если что-то не сработало
+## If something did not work
 
-Присылайте отчёт всё равно — он ценен именно тогда, когда не получилось. В нём
-уже есть: сборка Windows, состояние узла и службы, причина отказа устройства,
-телеметрия драйвера, изменение заряда за интервал.
+Send the report anyway - it is valuable exactly when things did not work. It already
+contains: the Windows build, the state of the node and the service, the reason the
+device failed, the driver telemetry, the charge change over the interval.
 
-| Что видно в отчёте | Что это значит |
+| What the report shows | What it means |
 |---|---|
-| `узел не найден — драйверу не на чем стартовать` | в этой загрузке Windows нет узла `QCOM057E` |
-| `Problem` не `0`, состояние не `OK` | устройство не поднялось: смотреть код проблемы в отчёте |
-| `заряд НЕ МЕНЯЕТСЯ` | подтверждение исходной проблемы: под Windows заряд не идёт |
-| `заряд ПАДАЕТ` | блок отдаёт меньше, чем потребляет планшет |
-| `режим 2:1 не включился; остаёмся в bypass` | драйвер отработал, но чип не подтвердил быстрый режим |
-| `не удалось открыть \\.\nabu_ln8000 (код 2)` | драйвер не установлен или не стартовал — смотреть службу в отчёте |
+| `node not found - the driver has nothing to start on` | there is no `QCOM057E` node in this Windows boot |
+| `Problem` is not `0`, the state is not `OK` | the device did not start: look at the problem code in the report |
+| `charge is UNCHANGED` | confirmation of the original problem: under Windows the charge does not go |
+| `charge is FALLING` | the supply delivers less than the tablet consumes |
+| `mode 2:1 did not engage, staying in bypass` | the driver did its job, but the chip did not confirm the fast mode |
+| `failed to open \\.\nabu_ln8000 (code 2)` | the driver is not installed or did not start - look at the service in the report |
 
 ---
 
-## Откат
+## Rollback
 
-Когда результаты сняты:
+When the results have been captured:
 
 ```powershell
 cd C:\nabu-ln8000
 .\uninstall-driver.ps1
 ```
 
-Драйвер удалится вместе со службой, зарядка вернётся к штатному поведению.
-Протокол удаления — `C:\ProgramData\nabu-fastcharge\uninstall.log`.
+The driver will be removed together with the service, and charging returns to the
+stock behavior. The removal transcript - `C:\ProgramData\nabu-fastcharge\uninstall.log`.
 
-Тестовый режим можно выключить обратно:
+The test mode can be turned off again:
 
 ```powershell
 bcdedit /set testsigning off
@@ -152,9 +152,9 @@ bcdedit /set testsigning off
 
 ---
 
-## Чего эти шаги не делают
+## What these steps do not do
 
-* не перепрошивают планшет и не меняют разделы;
-* не отключают проверку подписи драйверов навсегда — только стандартный
-  тестовый режим Windows, который выключается обратно;
-* не трогают пользовательские данные.
+* they do not reflash the tablet and do not change the partitions;
+* they do not disable driver signature verification forever - only the standard
+  Windows test mode, which is turned back off;
+* they do not touch user data.

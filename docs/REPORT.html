@@ -1,12 +1,12 @@
 <!DOCTYPE html>
-<html lang="ru">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>nabu-fastcharge — драйвер зарядки: отчёт о готовности</title>
+<title>nabu-fastcharge - charging driver: readiness report</title>
 <style>
-  /* Оформление: Information Architects — системные шрифты, ноль декора,
-     читаемая мера строки, классические синие ссылки. */
+  /* Styling: Information Architects - system fonts, zero decoration,
+     a readable line measure, classic blue links. */
   html { font-size: 17px; }
   body {
     margin: 0 auto; padding: 3rem 1.25rem 6rem; max-width: 44rem;
@@ -36,76 +36,76 @@
 </head>
 <body>
 
-<h1>nabu-fastcharge: драйвер зарядки для Xiaomi Pad 5 под Windows on ARM64</h1>
-<p class="lead">Отчёт о готовности. Проверка от 16.09.2026, сборка на Rust 1.97.0 (edition 2024), цель драйвера — <code>aarch64-pc-windows-msvc</code>.</p>
+<h1>nabu-fastcharge: charging driver for Xiaomi Pad 5 on Windows on ARM64</h1>
+<p class="lead">Readiness report. Check of 2026-09-16, build with Rust 1.97.0 (edition 2024), driver target - <code>aarch64-pc-windows-msvc</code>.</p>
 
-<h2>Задача</h2>
-<p>Под Windows планшет не заряжается ни от одного блока: от USB-A (Quick Charge) он разряжается, от USB-C (Power Delivery) ёмкость стоит на месте. Причина не в отсутствии «быстрой» зарядки, а в том, что <strong>аппаратная детекция адаптера в PMIC выполняется, но ни один компонент Windows не читает её результат</strong>, поэтому лимит входного тока не поднимается.</p>
-<p>Драйвер закрывает этот пробел: читает результат детекции (<code>APSD_RESULT_STATUS</code>) и выставляет лимит входного тока под распознанный тип адаптера.</p>
+<h2>The problem</h2>
+<p>Under Windows the tablet does not charge from any power brick: from USB-A (Quick Charge) it discharges, from USB-C (Power Delivery) the capacity stays put. The reason is not the absence of "fast" charging, but that <strong>the hardware adapter detection in the PMIC runs, yet no Windows component reads its result</strong>, so the input current limit is never raised.</p>
+<p>The driver closes this gap: it reads the detection result (<code>APSD_RESULT_STATUS</code>) and sets the input current limit for the recognized adapter type.</p>
 
-<h2>Что сделано</h2>
+<h2>What is done</h2>
 <table>
-  <tr><th>Часть</th><th>Содержимое</th><th>Проверка</th></tr>
-  <tr><td><code>crates/core</code></td><td>Ядро логики SMB: разбор APSD, политика тока, состояния, таймауты, повторы, журнал. Без <code>std</code>, без <code>unsafe</code></td><td class="ok">37 unit-тестов</td></tr>
-  <tr><td><code>crates/ln8000</code></td><td>Ядро драйвера charge pump LN8000: регистры, режимы, защиты, 10-битный АЦП</td><td class="ok">29 unit-тестов</td></tr>
-  <tr><td><code>crates/host</code></td><td>Транспорты (мок, мок с журналом, TCP), журнал JSON Lines, мост в <code>tracing</code>, симулятор устройства, бенчмарки</td><td class="ok">9 интеграционных тестов</td></tr>
-  <tr><td><code>crates/cli</code></td><td>Утилита <code>nabu-charger</code>: <code>demo</code>, <code>detect</code>, <code>sim</code>, <code>verify</code></td><td class="ok">4 теста</td></tr>
-  <tr><td><code>crates/kmdf</code></td><td>Драйвер режима ядра: устройство, очередь IOCTL, транспорт к шине SPMI <code>\Device\RESOURCE_HUB</code></td><td class="ok">собран под ARM64</td></tr>
+  <tr><th>Part</th><th>Contents</th><th>Check</th></tr>
+  <tr><td><code>crates/core</code></td><td>SMB logic core: APSD decoding, current policy, states, timeouts, retries, journal. No <code>std</code>, no <code>unsafe</code></td><td class="ok">37 unit tests</td></tr>
+  <tr><td><code>crates/ln8000</code></td><td>LN8000 charge pump driver core: registers, modes, protections, 10-bit ADC</td><td class="ok">29 unit tests</td></tr>
+  <tr><td><code>crates/host</code></td><td>Transports (mock, mock with a journal, TCP), JSON Lines journal, bridge to <code>tracing</code>, device simulator, benchmarks</td><td class="ok">9 integration tests</td></tr>
+  <tr><td><code>crates/cli</code></td><td>The <code>nabu-charger</code> CLI: <code>demo</code>, <code>detect</code>, <code>sim</code>, <code>verify</code></td><td class="ok">4 tests</td></tr>
+  <tr><td><code>crates/kmdf</code></td><td>Kernel-mode driver: device, IOCTL queue, transport to the SPMI bus <code>\Device\RESOURCE_HUB</code></td><td class="ok">built for ARM64</td></tr>
 </table>
 
-<h2>Доказательства</h2>
+<h2>Evidence</h2>
 <table>
-  <tr><th>Проверка</th><th>Команда</th><th>Итог</th></tr>
-  <tr><td>Форматирование</td><td><code>cargo fmt --all --check</code></td><td class="ok">код возврата 0</td></tr>
-  <tr><td>Линтеры (педантичные, предупреждения = ошибки)</td><td><code>cargo clippy --workspace --all-targets -- -D warnings</code></td><td class="ok">код возврата 0</td></tr>
-  <tr><td>Релизная сборка</td><td><code>cargo build --workspace --release</code></td><td class="ok">успех</td></tr>
-  <tr><td>Тесты</td><td><code>cargo test --workspace</code></td><td class="ok">83 теста пройдено</td></tr>
-  <tr><td>Документация</td><td><code>cargo doc --workspace --no-deps</code></td><td class="ok">без предупреждений</td></tr>
-  <tr><td>Ядро без стандартной библиотеки</td><td><code>cargo build -p charger-core --no-default-features</code></td><td class="ok">успех</td></tr>
-  <tr><td>Демонстрация</td><td><code>cargo run -p cli -- demo</code></td><td class="ok">7 сценариев, включая 2 ожидаемых отказа</td></tr>
-  <tr><td>Самопроверка</td><td><code>cargo run -p cli -- verify</code></td><td class="ok">пройдена</td></tr>
-  <tr><td>Charge pump LN8000</td><td><code>cargo run -p cli -- pump --profile qc35</code></td><td class="ok">режим SWITCHING, отказов нет</td></tr>
-  <tr><td>Сборка драйвера ARM64</td><td><code>cargo wdk build --target-arch arm64 --profile release</code></td><td class="ok">kmdf.sys, подписан, infverif пройден, PE = 0xAA64</td></tr>
+  <tr><th>Check</th><th>Command</th><th>Result</th></tr>
+  <tr><td>Formatting</td><td><code>cargo fmt --all --check</code></td><td class="ok">exit code 0</td></tr>
+  <tr><td>Linters (pedantic, warnings = errors)</td><td><code>cargo clippy --workspace --all-targets -- -D warnings</code></td><td class="ok">exit code 0</td></tr>
+  <tr><td>Release build</td><td><code>cargo build --workspace --release</code></td><td class="ok">success</td></tr>
+  <tr><td>Tests</td><td><code>cargo test --workspace</code></td><td class="ok">83 tests passed</td></tr>
+  <tr><td>Documentation</td><td><code>cargo doc --workspace --no-deps</code></td><td class="ok">no warnings</td></tr>
+  <tr><td>Core without the standard library</td><td><code>cargo build -p charger-core --no-default-features</code></td><td class="ok">success</td></tr>
+  <tr><td>Demo</td><td><code>cargo run -p cli -- demo</code></td><td class="ok">7 scenarios, including 2 expected failures</td></tr>
+  <tr><td>Self-check</td><td><code>cargo run -p cli -- verify</code></td><td class="ok">passed</td></tr>
+  <tr><td>Charge pump LN8000</td><td><code>cargo run -p cli -- pump --profile qc35</code></td><td class="ok">SWITCHING mode, no faults</td></tr>
+  <tr><td>ARM64 driver build</td><td><code>cargo wdk build --target-arch arm64 --profile release</code></td><td class="ok">kmdf.sys, signed, infverif passed, PE = 0xAA64</td></tr>
 </table>
 
-<h3>Сценарии демонстрации</h3>
-<pre>сценарий   итог   адаптер    ток,мкА pump   пояснение
-HVDCP3P5   ок     HVDCP3     3000000 да     Quick Charge 3.0, 9 В и 3 А, возможен charge pump
-HVDCP3     ок     HVDCP3     3000000 да     Quick Charge 3.0, 9 В и 3 А, возможен charge pump
-HVDCP2     ок     HVDCP2     1500000 нет    Quick Charge 2.0, 9 В и 1.5 А
-DCP        ок     DCP        1500000 нет    порт только зарядки, BC1.2 1.5 А
-SDP        ок     SDP        500000  нет    стандартный порт USB, предел 500 мА
-DETACHED   отказ  —          —       —      ошибка detection_timeout
-UNKNOWN    отказ  —          —       —      ошибка unknown_adapter_pattern</pre>
-<p class="meta">Родной блок планшета до аутентификации QC3.5 определяется как HVDCP3 — это ожидаемое поведение, а не дефект: версия 3.5 подтверждается отдельной аутентификацией.</p>
+<h3>Demo scenarios</h3>
+<pre>scenario   result adapter    current,µA pump   note
+HVDCP3P5   ok     HVDCP3     3000000 yes    Quick Charge 3.0, 9 V and 3 A, charge pump possible
+HVDCP3     ok     HVDCP3     3000000 yes    Quick Charge 3.0, 9 V and 3 A, charge pump possible
+HVDCP2     ok     HVDCP2     1500000 no     Quick Charge 2.0, 9 V and 1.5 A
+DCP        ok     DCP        1500000 no     charging-only port, BC1.2 1.5 A
+SDP        ok     SDP        500000  no     standard USB port, 500 mA limit
+DETACHED   failure -          -       -      error detection_timeout
+UNKNOWN    failure -          -       -      error unknown_adapter_pattern</pre>
+<p class="meta">Before QC3.5 authentication the tablet's own power brick is detected as HVDCP3 - this is expected behavior, not a defect: version 3.5 is confirmed by a separate authentication.</p>
 
-<h2>Производительность (базовая линия)</h2>
+<h2>Performance (baseline)</h2>
 <table>
-  <tr><th>Сценарий</th><th>Время</th></tr>
-  <tr><td>Полный цикл сессии (открытие → детекция → политика), HVDCP3</td><td>~0.9 мкс</td></tr>
-  <tr><td>Разбор результата детекции</td><td>305 пс</td></tr>
-  <tr><td>Чтение регистра на моке (512 операций)</td><td>3.15 мкс, 163 млн оп/с</td></tr>
-  <tr><td>Чтение по TCP к симулятору (64 операции)</td><td>8.38 мс, 7 640 оп/с</td></tr>
+  <tr><th>Scenario</th><th>Time</th></tr>
+  <tr><td>Full session cycle (open -> detection -> policy), HVDCP3</td><td>~0.9 µs</td></tr>
+  <tr><td>Detection result decoding</td><td>305 ps</td></tr>
+  <tr><td>Register read on the mock (512 operations)</td><td>3.15 µs, 163 million ops/s</td></tr>
+  <tr><td>Read over TCP to the simulator (64 operations)</td><td>8.38 ms, 7 640 ops/s</td></tr>
 </table>
-<p class="meta">Полная таблица и методика сравнения: <code>docs/PERFORMANCE.md</code>.</p>
+<p class="meta">Full table and comparison methodology: <code>docs/PERFORMANCE.md</code>.</p>
 
-<h2>Чего пока нет</h2>
+<h2>What is not there yet</h2>
 <table>
-  <tr><th>Пункт</th><th>Состояние</th><th>Причина</th></tr>
-  <tr><td>Таймер детекции в ядре</td><td class="wait">не подключён</td><td>IOCTL <code>DETECT_START</code>/<code>APPLY_POLICY</code> возвращают <code>STATUS_NOT_IMPLEMENTED</code>; логика под ними готова и проверена на моках</td></tr>
-  <tr><td>Чтение регистра через шину SPMI</td><td class="wait">типизированный отказ</td><td>Раскладка ответа шины не подтверждена реверсом; догадка за факт не выдаётся</td></tr>
-  <tr><td>Charge pump LN8000 (полные 33 Вт)</td><td class="wait">ядро готово</td><td>Логика перенесена из <code>ln8000_charger.c</code> и проверена 29 тестами; остался KMDF-модуль SpbCx для узла ACPI <code>PEIC</code> (I²C 0x51)</td></tr>
+  <tr><th>Item</th><th>State</th><th>Reason</th></tr>
+  <tr><td>Detection timer in the core</td><td class="wait">not wired up</td><td>The IOCTLs <code>DETECT_START</code>/<code>APPLY_POLICY</code> return <code>STATUS_NOT_IMPLEMENTED</code>; the logic behind them is ready and checked on mocks</td></tr>
+  <tr><td>Register read over the SPMI bus</td><td class="wait">typed failure</td><td>The bus response layout is not confirmed by reverse engineering; a guess is not passed off as a fact</td></tr>
+  <tr><td>Charge pump LN8000 (full 33 W)</td><td class="wait">core ready</td><td>The logic is ported from <code>ln8000_charger.c</code> and checked by 29 tests; what remains is a KMDF SpbCx module for the ACPI node <code>PEIC</code> (I²C 0x51)</td></tr>
 </table>
 
-<h3>Собранный драйвер</h3>
+<h3>The built driver</h3>
 <pre>artifacts/driver-arm64/
-  kmdf.sys   48.5 КБ   (PE Machine = 0xAA64 → ARM64, подписан тестовым сертификатом)
-  kmdf.inf    2.4 КБ   (infverif: INF is valid)
-  kmdf.cat    7.9 КБ
+  kmdf.sys   48.5 KB   (PE Machine = 0xAA64 -> ARM64, signed with the test certificate)
+  kmdf.inf    2.4 KB   (infverif: INF is valid)
+  kmdf.cat    7.9 KB
   WDRLocalTestCert.cer</pre>
 
-<h2>Как воспроизвести</h2>
-<pre>git clone &lt;репозиторий&gt;
+<h2>How to reproduce</h2>
+<pre>git clone &lt;repository&gt;
 cd nabu-fastcharge
 
 cargo fmt --all --check
@@ -115,26 +115,26 @@ cargo run -p cli -- --journal artifacts/journal-demo.jsonl demo
 cargo run -p cli -- pump --profile qc35
 cargo run -p cli -- verify
 
-# стенд без железа
+# hardware-free bench
 cargo run -p cli -- sim --adapter hvdcp3 --listen 127.0.0.1:9700
 cargo run -p cli -- detect --transport tcp --addr 127.0.0.1:9700
 
-# драйвер (нужны WDK и LLVM 17.x)
+# driver (WDK and LLVM 17.x required)
 cd crates/kmdf &amp;&amp; cargo wdk build --target-arch arm64 --profile release</pre>
 
-<h2>Документы</h2>
+<h2>Documents</h2>
 <ul>
-  <li><a href="../README.md">README.md</a> — быстрый старт и состав</li>
-  <li><a href="ARCHITECTURE.md">docs/ARCHITECTURE.md</a> — слои, решения, поток сессии</li>
-  <li><a href="LN8000.md">docs/LN8000.md</a> — карта регистров и режимы charge pump LN8000</li>
-  <li><a href="REGISTERS.md">docs/REGISTERS.md</a> — карта регистров SMB и образцы детекции</li>
-  <li><a href="PERFORMANCE.md">docs/PERFORMANCE.md</a> — базовая производительность</li>
-  <li><a href="HANDOVER.md">docs/HANDOVER.md</a> — сборка, откат, типовые сбои</li>
-  <li><a href="ACCEPTANCE.md">docs/ACCEPTANCE.md</a> — критерии приёмки с доказательствами</li>
-  <li><a href="../CHANGELOG.md">CHANGELOG.md</a> — история изменений</li>
+  <li><a href="../README.md">README.md</a> - quick start and contents</li>
+  <li><a href="ARCHITECTURE.md">docs/ARCHITECTURE.md</a> - layers, decisions, session flow</li>
+  <li><a href="LN8000.md">docs/LN8000.md</a> - register map and LN8000 charge pump modes</li>
+  <li><a href="REGISTERS.md">docs/REGISTERS.md</a> - SMB register map and detection patterns</li>
+  <li><a href="PERFORMANCE.md">docs/PERFORMANCE.md</a> - baseline performance</li>
+  <li><a href="HANDOVER.md">docs/HANDOVER.md</a> - build, rollback, common failures</li>
+  <li><a href="ACCEPTANCE.md">docs/ACCEPTANCE.md</a> - acceptance criteria with evidence</li>
+  <li><a href="../CHANGELOG.md">CHANGELOG.md</a> - change history</li>
 </ul>
 
-<p class="note">Все эксперименты обратимы: драйвер не меняет прошивку и не пишет в постоянную память, а его выгрузка возвращает штатное поведение Windows.</p>
+<p class="note">All experiments are reversible: the driver does not modify the firmware and does not write to persistent memory, and unloading it restores the stock Windows behavior.</p>
 
 </body>
 </html>

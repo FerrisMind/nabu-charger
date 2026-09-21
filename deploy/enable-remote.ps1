@@ -1,26 +1,26 @@
 ﻿#Requires -Version 5.1
 <#
-    enable-remote.ps1 — ОДНА команда на планшете, после которой работу делает агент.
+    enable-remote.ps1 - ONE command on the tablet, after which the agent does the work.
 
-    Запуск на планшете (PowerShell от имени администратора):
+    Run on the tablet (PowerShell as administrator):
         .\enable-remote.ps1
 
-    Что делает:
-      1) включает службу удалённого управления WinRM и запускает её;
-      2) открывает для неё порт в брандмауэре (только локальная сеть);
-      3) создаёт отдельного локального администратора nabuagent со случайным
-         паролем — он нужен только для этой работы и удаляется одной командой;
-      4) печатает три строки, которые надо передать агенту.
+    What it does:
+      1) enables the WinRM remote management service and starts it;
+      2) opens a firewall port for it (local network only);
+      3) creates a separate local administrator nabuagent with a random
+         password - it is needed only for this job and is removed with one command;
+      4) prints the three lines that must be handed to the agent.
 
-    ЧТО ВАЖНО ЗНАТЬ ПЕРЕД ЗАПУСКОМ
-      * WinRM по умолчанию шифрует передачу слабо: это приемлемо в доверенной
-        домашней сети и НЕ приемлемо в открытой (кафе, гостиница).
-      * Создаётся настоящий администратор планшета. Его можно и нужно удалить
-        после работы: скрипт печатает готовую команду удаления.
-      * Ничего не перепрошивается, разделы и загрузчик не трогаются.
+    WHAT TO KNOW BEFORE RUNNING IT
+      * By default WinRM encrypts the transfer weakly: that is acceptable on a trusted
+        home network and NOT acceptable on an open one (cafe, hotel).
+      * A real tablet administrator is created. It can and should be removed
+        after the work: the script prints a ready-to-use removal command.
+      * Nothing is reflashed, partitions and the bootloader are not touched.
 
-    Если это не подходит — есть путь без удалённого доступа: run-acceptance.ps1
-    и bring-up.ps1 собирают отчёт, который вы пришлёте файлом или текстом.
+    If this does not suit you, there is a path without remote access: run-acceptance.ps1
+    and bring-up.ps1 collect a report that you send as a file or as text.
 #>
 [CmdletBinding()]
 param(
@@ -34,15 +34,15 @@ $ErrorActionPreference = 'Stop'
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = New-Object Security.Principal.WindowsPrincipal($identity)
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    throw 'нужны права администратора: перезапустите PowerShell от имени администратора'
+    throw 'administrator rights required: restart PowerShell as administrator'
 }
 
-Write-Host '=== включаю удалённое управление ===' -ForegroundColor Cyan
+Write-Host '=== enabling remote management ===' -ForegroundColor Cyan
 
-# 1. Служба WinRM. Включаем аккуратно: сначала смотрим состояние.
+# 1. The WinRM service. Enable it carefully: first look at the status.
 $service = Get-Service WinRM -ErrorAction SilentlyContinue
 if (-not $service) {
-    throw 'служба WinRM не найдена — на этой сборке Windows удалённое управление недоступно'
+    throw 'WinRM service not found - remote management is unavailable on this Windows build'
 }
 if ($service.Status -ne 'Running') {
     Set-Service WinRM -StartupType Automatic
@@ -50,11 +50,11 @@ if ($service.Status -ne 'Running') {
 }
 Write-Host ("  WinRM: " + (Get-Service WinRM).Status)
 
-# 2. Приёмник запросов и правило брандмауэра.
+# 2. The request listener and the firewall rule.
 try {
     $null = Get-ChildItem WSMan:\localhost\Listener -ErrorAction SilentlyContinue
     Enable-PSRemoting -Force -SkipNetworkProfileCheck | Out-Null
-    Write-Host '  PSRemoting включён'
+    Write-Host '  PSRemoting enabled'
 } catch {
     Write-Host ('  PSRemoting: ' + $_.Exception.Message) -ForegroundColor Yellow
 }
@@ -63,12 +63,12 @@ $ruleName = "nabu remote $Port"
 if (-not (Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue)) {
     New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -LocalPort $Port `
         -Protocol TCP -Action Allow -Profile Private, Domain | Out-Null
-    Write-Host ("  правило брандмауэра добавлено для порта $Port (только частные сети)")
+    Write-Host ("  firewall rule added for port $Port (private networks only)")
 } else {
-    Write-Host '  правило брандмауэра уже есть'
+    Write-Host '  firewall rule already exists'
 }
 
-# 3. Отдельный администратор для работы. Пароль случайный, живёт до удаления.
+# 3. A separate administrator for the job. The password is random and lives until removal.
 $password = $null
 if (-not $SkipAccount) {
     $alphabet = 'abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789'.ToCharArray()
@@ -79,24 +79,25 @@ if (-not $SkipAccount) {
     $existing = Get-LocalUser -Name $UserName -ErrorAction SilentlyContinue
     if ($existing) {
         Set-LocalUser -Name $UserName -Password $secure
-        Write-Host ("  пользователь " + $UserName + ' уже был — пароль обновлён')
+        Write-Host ("  user " + $UserName + ' already existed - password updated')
     } else {
-        New-LocalUser -Name $UserName -Password $secure -Description 'Временный доступ для отладки зарядки' `
+        New-LocalUser -Name $UserName -Password $secure -Description 'Temporary access for charging debugging' `
             -PasswordNeverExpires | Out-Null
-        Write-Host ("  пользователь " + $UserName + ' создан')
+        Write-Host ("  user " + $UserName + ' created')
     }
-    $admins = Get-LocalGroupMember -Group 'Администраторы' -ErrorAction SilentlyContinue
-    if (-not $admins) { $admins = Get-LocalGroupMember -Group 'Administrators' -ErrorAction SilentlyContinue }
+    # The built-in administrators group is named in the OS display language, so it is
+    # addressed by its well-known SID: on a localized Windows the name does not resolve.
+    $admins = Get-LocalGroupMember -SID 'S-1-5-32-544' -ErrorAction SilentlyContinue
     if (-not ($admins | Where-Object { $_.Name -like "*$UserName" })) {
-        Add-LocalGroupMember -Group 'Administrators' -Member $UserName
-        Write-Host '  добавлен в группу администраторов'
+        Add-LocalGroupMember -SID 'S-1-5-32-544' -Member $UserName
+        Write-Host '  added to the administrators group'
     }
 }
 
-# 4. Что передать агенту.
+# 4. What to hand to the agent.
 $addresses = Get-NetIPConfiguration -ErrorAction SilentlyContinue |
     Where-Object { $_.IPv4DefaultGateway -and $_.NetAdapter.Status -eq 'Up' }
-$address = 'не определён'
+$address = 'not determined'
 foreach ($item in $addresses) {
     if ($item.InterfaceAlias -match 'Virtual|VMware|Loopback|vEthernet') { continue }
     $candidate = $item.IPv4Address.IPAddress | Select-Object -First 1
@@ -105,21 +106,21 @@ foreach ($item in $addresses) {
 
 Write-Host ''
 Write-Host '==========================================================================' -ForegroundColor Green
-Write-Host ' ПЕРЕДАЙТЕ АГЕНТУ ЭТИ ТРИ СТРОКИ:' -ForegroundColor Green
+Write-Host ' HAND THESE THREE LINES TO THE AGENT:' -ForegroundColor Green
 Write-Host '==========================================================================' -ForegroundColor Green
-Write-Host ("  адрес планшета : " + $address)
-Write-Host ("  пользователь   : " + $UserName)
+Write-Host ("  tablet address : " + $address)
+Write-Host ("  user           : " + $UserName)
 if ($password) {
-    Write-Host ("  пароль         : " + $password)
+    Write-Host ("  password       : " + $password)
 } else {
-    Write-Host '  пароль         : не создавался (-SkipAccount)'
+    Write-Host '  password       : not created (-SkipAccount)'
 }
 Write-Host ''
-Write-Host ' УДАЛИТЬ ВРЕМЕННЫЙ ДОСТУП ПОСЛЕ РАБОТЫ (на планшете, от администратора):' -ForegroundColor Yellow
+Write-Host ' REMOVE THE TEMPORARY ACCESS AFTER THE WORK (on the tablet, as administrator):' -ForegroundColor Yellow
 Write-Host ("   Remove-LocalUser -Name $UserName")
 Write-Host ("   Remove-NetFirewallRule -DisplayName 'nabu remote $Port'")
 Write-Host '   Disable-PSRemoting -Force'
 Write-Host ''
-Write-Host ' Проверить, что планшет доступен с компьютера агента:' -ForegroundColor Yellow
+Write-Host ' To check that the tablet is reachable from the agent computer:' -ForegroundColor Yellow
 Write-Host ("   Test-WSMan -ComputerName " + $address + ' -Credential (Get-Credential)')
 Write-Host ''

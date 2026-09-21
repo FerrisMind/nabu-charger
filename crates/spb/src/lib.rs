@@ -1,11 +1,11 @@
-//! Публичный интерфейс SPB (Simple Peripheral Bus) и мелкая арифметика вокруг него.
+//! Public SPB (Simple Peripheral Bus) interface and the small arithmetic around it.
 //!
-//! Зачем отдельный крейт: эти типы объявлены в заголовке WDK `shared/spb.h`, но
-//! `wdk-sys` их не генерирует (фича `spb` пустая), поэтому их приходится
-//! объявлять вручную. Вынесенные сюда структуры, сборка списка передач и путь
-//! Resource Hub не зависят от WDF, а значит проверяются обычными тестами.
+//! Why a separate crate: these types are declared in the WDK header `shared/spb.h`,
+//! but `wdk-sys` does not generate them (the `spb` feature is empty), so they have to
+//! be declared by hand. The structures moved here, the transfer list building and the
+//! Resource Hub path do not depend on WDF, so they are covered by ordinary tests.
 //!
-//! # Откуда взяты типы
+//! # Where the types come from
 //!
 //! ```c
 //! // shared/spb.h (WDK 10.0.26100)
@@ -28,18 +28,18 @@
 //! };
 //! ```
 //!
-//! # Почему это правильный путь доступа к периферии
+//! # Why this is the right way to reach the peripheral
 //!
-//! Реверс `qcpmicEIC8150.sys` показал, что штатный клиент Qualcomm обращается к
-//! регистрам PMIC через **тот же** код управления `0x41808`:
+//! Reverse engineering of `qcpmicEIC8150.sys` showed that the stock Qualcomm client
+//! reaches the PMIC registers through the **same** control code `0x41808`:
 //!
 //! ```text
 //! 0x41808 = CTL_CODE(FILE_DEVICE_CONTROLLER, 0x602, METHOD_BUFFERED, FILE_ANY_ACCESS)
 //!         = IOCTL_SPB_EXECUTE_SEQUENCE
 //! ```
 //!
-//! (разбор — `docs/SPMI-PATH.md`). Значит приватного протокола доступа к
-//! регистрам нет: используется публичный список передач SPB.
+//! (analysis in `docs/SPMI-PATH.md`). So there is no private protocol for reaching
+//! the registers: the public SPB transfer list is used.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -57,99 +57,99 @@
 use core::ffi::c_void;
 use core::mem::offset_of;
 
-/// Тип устройства контроллера (`FILE_DEVICE_CONTROLLER` из `wdm.h`).
+/// Controller device type (`FILE_DEVICE_CONTROLLER` from `wdm.h`).
 pub const FILE_DEVICE_CONTROLLER: u32 = 0x0000_0004;
 
-/// Функция кода управления `IOCTL_SPB_EXECUTE_SEQUENCE`.
+/// Control code function `IOCTL_SPB_EXECUTE_SEQUENCE`.
 pub const SPB_FUNCTION_EXECUTE_SEQUENCE: u32 = 0x0602;
 
-/// Выполняет последовательность передач на устройстве шины.
+/// Executes a sequence of transfers on the bus device.
 ///
 /// `CTL_CODE(FILE_DEVICE_CONTROLLER, 0x602, METHOD_BUFFERED, FILE_ANY_ACCESS)`.
 pub const IOCTL_SPB_EXECUTE_SEQUENCE: u32 = 0x0004_1808;
 
-/// Направление передачи: обмен не нужен.
+/// Transfer direction: no exchange needed.
 pub const SPB_DIRECTION_NONE: u32 = 0;
-/// Направление передачи: чтение с устройства.
+/// Transfer direction: read from the device.
 pub const SPB_DIRECTION_FROM_DEVICE: u32 = 1;
-/// Направление передачи: запись в устройство.
+/// Transfer direction: write to the device.
 pub const SPB_DIRECTION_TO_DEVICE: u32 = 2;
 
-/// Формат буфера: простая буферная область.
+/// Buffer format: simple buffer area.
 pub const SPB_FORMAT_SIMPLE: u32 = 1;
 
-/// Элемент списка буферов.
+/// Buffer list entry.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct SpbTransferBufferListEntry {
-    /// Указатель на данные.
+    /// Pointer to the data.
     pub buffer: *mut c_void,
-    /// Длина данных в байтах.
+    /// Data length in bytes.
     pub buffer_cb: u32,
 }
 
-/// Буфер передачи (используется вариант `Simple`).
+/// Transfer buffer (the `Simple` variant is used).
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct SpbTransferBuffer {
-    /// Формат буфера.
+    /// Buffer format.
     pub format: u32,
-    /// Простая буферная область.
+    /// Simple buffer area.
     pub simple: SpbTransferBufferListEntry,
 }
 
-/// Одна передача в последовательности.
+/// One transfer in the sequence.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct SpbTransferListEntry {
-    /// Направление передачи.
+    /// Transfer direction.
     pub direction: u32,
-    /// Задержка перед передачей, мкс.
+    /// Delay before the transfer, µs.
     pub delay_in_us: u32,
-    /// Буфер передачи.
+    /// Transfer buffer.
     pub buffer: SpbTransferBuffer,
 }
 
-/// Список передач: заголовок плюс элементы.
+/// Transfer list: header plus entries.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct SpbTransferList {
-    /// Размер структуры (`sizeof(SPB_TRANSFER_LIST)`).
+    /// Structure size (`sizeof(SPB_TRANSFER_LIST)`).
     pub size: u32,
-    /// Зарезервировано, должно быть нулём.
+    /// Reserved, must be zero.
     pub reserved: u32,
-    /// Число передач.
+    /// Number of transfers.
     pub transfer_count: u32,
-    /// Первый элемент; остальные лежат в памяти сразу за ним.
+    /// First entry; the rest lie in memory right after it.
     pub transfers: [SpbTransferListEntry; 1],
 }
 
-/// Ошибки сборки последовательности.
+/// Sequence building errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SequenceError {
-    /// Области памяти не хватает либо она не выровнена под список.
+    /// The memory area is too small or not aligned for the list.
     AreaTooSmall,
-    /// Передач больше, чем помещается в поле счётчика.
+    /// More transfers than fit in the counter field.
     TooManyTransfers,
 }
 
 impl SpbTransferList {
-    /// Размер заголовка списка (без элементов): 48 байт по `spb.h`.
+    /// Header size of the list (without entries): 48 bytes per `spb.h`.
     #[must_use]
     pub const fn header_size() -> usize {
         core::mem::size_of::<Self>()
     }
 
-    /// Размер одного элемента: 32 байта по `spb.h`.
+    /// Size of one entry: 32 bytes per `spb.h`.
     #[must_use]
     pub const fn entry_size() -> usize {
         core::mem::size_of::<SpbTransferListEntry>()
     }
 
-    /// Полный размер области для `count` передач.
+    /// Total area size for `count` transfers.
     ///
-    /// Заголовок [`SpbTransferList`] уже содержит место под первую передачу
-    /// (`Transfers[1]`), поэтому на каждую следующую добавляется один элемент:
+    /// The [`SpbTransferList`] header already holds room for the first transfer
+    /// (`Transfers[1]`), so one entry is added for each following one:
     /// `sizeof(SPB_TRANSFER_LIST) + (count - 1) * sizeof(SPB_TRANSFER_LIST_ENTRY)`.
     #[must_use]
     pub const fn area_size(count: usize) -> usize {
@@ -158,7 +158,7 @@ impl SpbTransferList {
     }
 }
 
-/// Инициализирует запись списка передач «простой буфер».
+/// Initializes a "simple buffer" transfer list entry.
 #[must_use]
 pub fn entry_init(direction: u32, buffer: *mut c_void, buffer_cb: u32) -> SpbTransferListEntry {
     SpbTransferListEntry {
@@ -171,16 +171,16 @@ pub fn entry_init(direction: u32, buffer: *mut c_void, buffer_cb: u32) -> SpbTra
     }
 }
 
-/// Собирает список передач в предоставленной области памяти.
+/// Builds a transfer list in the provided memory area.
 ///
-/// Смещения берутся из самой структуры (`offset_of!`), поэтому записанные байты
-/// гарантированно совпадают с раскладкой, которую видит драйвер шины.
+/// The offsets come from the structure itself (`offset_of!`), so the bytes written
+/// are guaranteed to match the layout the bus driver sees.
 ///
 /// # Errors
 ///
-/// * [`SequenceError::AreaTooSmall`] — область меньше [`SpbTransferList::area_size`]
-///   или не выровнена под список.
-/// * [`SequenceError::TooManyTransfers`] — передач больше `u32::MAX`.
+/// * [`SequenceError::AreaTooSmall`] - the area is smaller than [`SpbTransferList::area_size`]
+///   or not aligned for the list.
+/// * [`SequenceError::TooManyTransfers`] - more transfers than `u32::MAX`.
 pub fn describe(
     area: &mut [u8],
     transfers: &[SpbTransferListEntry],
@@ -199,8 +199,8 @@ pub fn describe(
     write_u32(area, offset_of!(SpbTransferList, transfer_count), count);
 
     let entry_size = SpbTransferList::entry_size();
-    // Первая передача лежит внутри заголовка (`Transfers[1]`), остальные —
-    // вплотную за ним, начиная со смещения самого массива передач.
+    // The first transfer lies inside the header (`Transfers[1]`), the rest directly
+    // after it, starting at the offset of the transfer array itself.
     let entries_base = offset_of!(SpbTransferList, transfers);
     for (index, transfer) in transfers.iter().enumerate() {
         let base = entries_base.saturating_add(index.saturating_mul(entry_size));
@@ -236,11 +236,11 @@ pub fn describe(
     Ok(needed)
 }
 
-/// Последовательность «запись байта»: адрес, затем значение.
+/// "write one byte" sequence: address, then value.
 ///
 /// # Errors
 ///
-/// [`SequenceError::AreaTooSmall`] — область меньше двух передач.
+/// [`SequenceError::AreaTooSmall`] - the area is smaller than two transfers.
 pub fn write_one(
     area: &mut [u8],
     address: &mut [u8; 1],
@@ -261,11 +261,11 @@ pub fn write_one(
     describe(area, &transfers)
 }
 
-/// Последовательность «чтение байта»: адрес, затем чтение.
+/// "read one byte" sequence: address, then read.
 ///
 /// # Errors
 ///
-/// [`SequenceError::AreaTooSmall`] — область меньше двух передач.
+/// [`SequenceError::AreaTooSmall`] - the area is smaller than two transfers.
 pub fn read_one(
     area: &mut [u8],
     address: &mut [u8; 1],
@@ -300,17 +300,17 @@ fn write_pointer(area: &mut [u8], offset: usize, value: *mut c_void) {
     }
 }
 
-/// Префикс пути подключения Resource Hub (`reshub.h`).
+/// Resource Hub connection path prefix (`reshub.h`).
 pub const HUB_PATH_PREFIX: &[u8] = b"\\Device\\RESOURCE_HUB\\";
 
-/// Число символов в пути подключения.
+/// Number of characters in the connection path.
 pub const HUB_PATH_CHARS: usize = 40;
 
-/// Строит путь устройства для идентификатора подключения.
+/// Builds the device path for a connection id.
 ///
-/// Правило из `shared/reshub.h`: `RESOURCE_HUB_CREATE_PATH_FROM_ID` →
-/// `RESOURCE_HUB_ID_TO_FILE_NAME`, формат `%0*I64x` ширины 16, то есть префикс
-/// и ровно 16 шестнадцатеричных цифр в нижнем регистре.
+/// Rule from `shared/reshub.h`: `RESOURCE_HUB_CREATE_PATH_FROM_ID` →
+/// `RESOURCE_HUB_ID_TO_FILE_NAME`, format `%0*I64x` of width 16, that is the prefix
+/// and exactly 16 lowercase hexadecimal digits.
 #[must_use]
 pub fn resource_hub_path(id: u64) -> HubPath {
     let mut path = HubPath {
@@ -335,7 +335,7 @@ pub fn resource_hub_path(id: u64) -> HubPath {
     path
 }
 
-/// Путь Resource Hub в виде массива UTF-16.
+/// Resource Hub path as a UTF-16 array.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HubPath {
     chars: [u16; HUB_PATH_CHARS],
@@ -350,38 +350,38 @@ impl HubPath {
         }
     }
 
-    /// Число значимых символов.
+    /// Number of significant characters.
     #[must_use]
     pub const fn len(&self) -> usize {
         self.len
     }
 
-    /// Признак пустого пути (для корректного идентификатора не бывает).
+    /// Empty path flag (never happens for a valid id).
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
 
-    /// Символы UTF-16 без завершающего нуля.
+    /// UTF-16 characters without a terminating zero.
     #[must_use]
     pub fn chars(&self) -> &[u16] {
         self.chars.get(..self.len).unwrap_or(&[])
     }
 
-    /// Указатель для поля `UNICODE_STRING.Buffer`.
+    /// Pointer for the `UNICODE_STRING.Buffer` field.
     #[must_use]
     pub fn as_ptr(&self) -> *const u16 {
         self.chars.as_ptr()
     }
 
-    /// Длина в байтах для `UNICODE_STRING.Length`.
+    /// Length in bytes for `UNICODE_STRING.Length`.
     #[must_use]
     pub fn byte_len(&self) -> u16 {
         let doubled = self.len.saturating_mul(2);
         u16::try_from(doubled).unwrap_or(u16::MAX)
     }
 
-    /// Представление в ASCII (для журнала и тестов).
+    /// ASCII representation (for the journal and tests).
     #[must_use]
     pub fn as_ascii(&self) -> [u8; HUB_PATH_CHARS] {
         let mut out = [0_u8; HUB_PATH_CHARS];
@@ -398,8 +398,8 @@ impl HubPath {
 mod tests {
     use super::*;
 
-    /// Хранилище, выровненное под список передач: драйвер шины требует, чтобы
-    /// `SPB_TRANSFER_LIST` лежал по выровненному адресу.
+    /// Storage aligned for the transfer list: the bus driver requires
+    /// `SPB_TRANSFER_LIST` to lie at an aligned address.
     #[repr(align(8))]
     struct Aligned<const N: usize>([u8; N]);
 
@@ -440,16 +440,16 @@ mod tests {
 
     #[test]
     fn structure_layout_matches_spb_header() {
-        // Значения из shared/spb.h для 64-битной сборки: 48 и 32 байта.
+        // Values from shared/spb.h for the 64-bit build: 48 and 32 bytes.
         assert_eq!(SpbTransferList::header_size(), 48);
         assert_eq!(SpbTransferList::entry_size(), 32);
         assert_eq!(core::mem::size_of::<SpbTransferBuffer>(), 24);
         assert_eq!(core::mem::align_of::<SpbTransferList>(), 8);
-        // Число передач лежит не в начале заголовка, а по смещению 8.
+        // The transfer count is not at the start of the header but at offset 8.
         assert_eq!(offset_of!(SpbTransferList, transfer_count), 8);
         assert_eq!(offset_of!(SpbTransferList, transfers), 16);
-        // Внутри записи: буфер начинается на 8, а внутри буфера — формат,
-        // простой буфер на 8, указатель и длина простого буфера 0 и 8.
+        // Inside the entry: the buffer starts at 8, and inside the buffer the format,
+        // the simple buffer at 8, the simple buffer pointer and length at 0 and 8.
         assert_eq!(offset_of!(SpbTransferListEntry, buffer), 8);
         assert_eq!(offset_of!(SpbTransferBuffer, format), 0);
         assert_eq!(offset_of!(SpbTransferBuffer, simple), 8);
@@ -475,7 +475,7 @@ mod tests {
         let area = storage.area();
         let mut address = [0x1E_u8];
         let mut data = [0_u8];
-        let written = read_one(area, &mut address, &mut data).expect("сборка прошла");
+        let written = read_one(area, &mut address, &mut data).expect("building succeeded");
         assert_eq!(written, SpbTransferList::area_size(2));
         assert_eq!(
             u32_at(&area, offset_of!(SpbTransferList, size)) as usize,
@@ -525,7 +525,7 @@ mod tests {
         let area = storage.area();
         let mut address = [0x1E_u8];
         let mut value = [0x40_u8];
-        let written = write_one(area, &mut address, &mut value).expect("сборка прошла");
+        let written = write_one(area, &mut address, &mut value).expect("building succeeded");
         assert_eq!(written, SpbTransferList::area_size(2));
         let entry_size = SpbTransferList::entry_size();
         let entries = offset_of!(SpbTransferList, transfers);
@@ -556,7 +556,7 @@ mod tests {
         let mut storage = [0_u8; 160];
         let mut address = [0_u8];
         let mut data = [0_u8];
-        let area = storage.get_mut(1..).expect("срез");
+        let area = storage.get_mut(1..).expect("slice");
         if area.as_ptr().align_offset(8) != 0 {
             assert_eq!(
                 read_one(area, &mut address, &mut data),
@@ -572,10 +572,10 @@ mod tests {
         assert_eq!(
             &ascii[..HUB_PATH_PREFIX.len()],
             HUB_PATH_PREFIX,
-            "префикс должен совпадать с reshub.h"
+            "the prefix must match reshub.h"
         );
         let text = core::str::from_utf8(&ascii[..path.len()]).expect("ascii");
-        assert!(text.ends_with("0000000000001234"), "получено: {text}");
+        assert!(text.ends_with("0000000000001234"), "got: {text}");
         assert_eq!(path.len(), HUB_PATH_PREFIX.len() + 16);
         assert_eq!(
             usize::from(path.byte_len()),
@@ -585,8 +585,8 @@ mod tests {
 
     #[test]
     fn area_size_counts_first_entry_in_header() {
-        // Заголовок вмещает первую передачу, поэтому две передачи требуют ровно
-        // на один элемент больше заголовка.
+        // The header holds the first transfer, so two transfers need exactly
+        // one entry more than the header.
         assert_eq!(
             SpbTransferList::area_size(1),
             SpbTransferList::header_size()
@@ -602,6 +602,6 @@ mod tests {
         let path = resource_hub_path(0x0000_001c_0000_0000);
         let ascii = path.as_ascii();
         let text = core::str::from_utf8(&ascii[..path.len()]).expect("ascii");
-        assert!(text.ends_with("0000001c00000000"), "получено: {text}");
+        assert!(text.ends_with("0000001c00000000"), "got: {text}");
     }
 }

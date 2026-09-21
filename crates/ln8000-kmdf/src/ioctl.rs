@@ -1,31 +1,31 @@
-//! Контракт драйвера LN8000 с пользовательским режимом.
+//! Contract between the LN8000 driver and user mode.
 //!
-//! Все запросы — `METHOD_BUFFERED`, `FILE_ANY_ACCESS`, тип устройства
-//! `FILE_DEVICE_UNKNOWN` (0x22). Коды построены стандартным макросом
+//! All requests are `METHOD_BUFFERED`, `FILE_ANY_ACCESS`, device type
+//! `FILE_DEVICE_UNKNOWN` (0x22). The codes are built with the standard macro
 //! `CTL_CODE(Type, Function, Method, Access) = (Type << 16) | (Access << 14) | (Function << 2) | Method`.
 
-/// Тип устройства драйвера LN8000.
+/// LN8000 driver device type.
 pub const FILE_DEVICE_LN8000: u32 = 0x22;
 
-/// Собирает код управления по правилам `CTL_CODE`.
+/// Builds a control code by the `CTL_CODE` rules.
 #[must_use]
 pub const fn ctl_code(function: u32, method: u32, access: u32) -> u32 {
     (FILE_DEVICE_LN8000 << 16) | (access << 14) | (function << 2) | method
 }
 
-/// Состояние драйвера: режим, отказы, последний отсчёт, счётчики сеансов.
+/// Driver status: mode, failures, last sample, session counters.
 pub const IOCTL_LN8000_GET_STATUS: u32 = ctl_code(0x810, 0, 0);
-/// Прочитать регистр LN8000 напрямую (диагностика).
+/// Read an LN8000 register directly (diagnostics).
 pub const IOCTL_LN8000_READ_REG: u32 = ctl_code(0x811, 0, 0);
-/// Записать регистр LN8000 напрямую (диагностика).
+/// Write an LN8000 register directly (diagnostics).
 pub const IOCTL_LN8000_WRITE_REG: u32 = ctl_code(0x812, 0, 0);
-/// Задать лимиты: входной ток и напряжение заряда.
+/// Set the limits: input current and charge voltage.
 pub const IOCTL_LN8000_SET_LIMITS: u32 = ctl_code(0x813, 0, 0);
-/// Переключить режим: standby / bypass / switching.
+/// Switch the mode: standby / bypass / switching.
 pub const IOCTL_LN8000_SET_MODE: u32 = ctl_code(0x814, 0, 0);
-/// Получить сведения о сеансах заряда (текущем и последнем завершённом).
+/// Get charge session info (current and last completed).
 pub const IOCTL_LN8000_GET_SESSIONS: u32 = ctl_code(0x815, 0, 0);
-/// Выгрузить последние отсчёты телеметрии.
+/// Retrieve the latest telemetry samples.
 pub const IOCTL_LN8000_GET_SAMPLES: u32 = ctl_code(0x816, 0, 0);
 
 /// Explicit charge start/stop.
@@ -36,11 +36,11 @@ pub const IOCTL_LN8000_GET_SAMPLES: u32 = ctl_code(0x816, 0, 0);
 /// never fails silently: the caller sees the raw `SYS_STS`.
 pub const IOCTL_LN8000_SET_CHARGE: u32 = ctl_code(0x817, 0, 0);
 
-/// `error_code` для отказа включить 1:1 вне окна обхода.
+/// `error_code` for refusing to enable 1:1 outside the bypass window.
 ///
-/// Отдельный код (не `-4`): это не отказ чипа, а запрет политики — 1:1 подаёт
-/// вход напрямую на батарею, поэтому при `Vin >= 8 В` (или ниже 4,2 В) режим не
-/// включается ни через `SET_MODE`, ни автоматикой.
+/// A separate code (not `-4`): this is not a chip failure but a policy refusal -
+/// 1:1 feeds the input straight to the battery, so at `Vin >= 8 V` (or below
+/// 4.2 V) the mode is not enabled either through `SET_MODE` or automatically.
 pub const ERR_BYPASS_VIN_OUT_OF_WINDOW: i32 = -20;
 
 /// Run HVDCP / QC negotiate (SUPERUSER preferred; Usbin RH secondary).
@@ -50,105 +50,105 @@ pub const ERR_BYPASS_VIN_OUT_OF_WINDOW: i32 = -20;
 /// Returns `error_code = -10` only when **both** SUPERUSER and Usbin RH fail.
 pub const IOCTL_LN8000_RUN_HVDCP: u32 = ctl_code(0x818, 0, 0);
 
-/// Идентификатор структуры состояния.
+/// Status structure identifier.
 pub const LN8000_STATUS_MAGIC: u32 = 0x4C4E_3830; // "LN80"
 
-/// Версия контракта.
+/// Contract version.
 pub const LN8000_STATUS_VERSION: u16 = 1;
 
-/// Состояние драйвера для [`IOCTL_LN8000_GET_STATUS`].
+/// Driver status for [`IOCTL_LN8000_GET_STATUS`].
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Ln8000Status {
-    /// Магия [`LN8000_STATUS_MAGIC`].
+    /// Magic [`LN8000_STATUS_MAGIC`].
     pub magic: u32,
-    /// Версия контракта.
+    /// Contract version.
     pub version: u16,
-    /// Режим работы (0 — неизвестно, 1 — standby, 2 — bypass, 3 — switching).
+    /// Operating mode (0 - unknown, 1 - standby, 2 - bypass, 3 - switching).
     pub op_mode: u8,
-    /// Код состояния сессии драйвера (0 — закрыта, 1 — опознан, 2 — настроен,
-    /// 3 — switching, 4 — отказ).
+    /// Driver session state code (0 - closed, 1 - identified, 2 - configured,
+    /// 3 - switching, 4 - failure).
     pub state: u8,
-    /// Сырое значение `SYS_STS`.
+    /// Raw `SYS_STS` value.
     pub sys_sts: u8,
-    /// Сырое значение `FAULT1_STS`.
+    /// Raw `FAULT1_STS` value.
     pub fault1_sts: u8,
-    /// Сырое значение `FAULT2_STS`.
+    /// Raw `FAULT2_STS` value.
     pub fault2_sts: u8,
-    /// Сырое значение `SAFETY_STS`.
+    /// Raw `SAFETY_STS` value.
     pub safety_sts: u8,
-    /// Есть ли критичный отказ.
+    /// Whether there is a critical failure.
     pub critical_fault: u8,
-    /// Зарезервировано.
+    /// Reserved.
     pub reserved: [u8; 2],
-    /// Последний измеренный входной ток, мкА.
+    /// Last measured input current, µA.
     pub iin_ua: u32,
-    /// Последнее измеренное напряжение батареи, мкВ.
+    /// Last measured battery voltage, µV.
     pub vbat_uv: u32,
-    /// Последнее измеренное напряжение входа, мкВ.
+    /// Last measured input voltage, µV.
     pub vbus_uv: u32,
-    /// Последняя температура кристалла, десятые °C.
+    /// Last die temperature, tenths of °C.
     pub die_temp_dc: i32,
-    /// Всего сеансов заряда.
+    /// Total charge sessions.
     pub sessions: u64,
-    /// Всего отсчётов телеметрии.
+    /// Total telemetry samples.
     pub samples: u64,
-    /// Сколько записей в устройство выполнено.
+    /// Number of writes to the device performed.
     pub writes: u32,
-    /// Сколько чтений выполнено.
+    /// Number of reads performed.
     pub reads: u32,
-    /// Код последней ошибки (0 — нет).
+    /// Last error code (0 - none).
     pub last_error: i32,
 }
 
-/// Запрос [`IOCTL_LN8000_READ_REG`] и [`IOCTL_LN8000_WRITE_REG`].
+/// Request for [`IOCTL_LN8000_READ_REG`] and [`IOCTL_LN8000_WRITE_REG`].
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Ln8000RegRequest {
-    /// Адрес регистра.
+    /// Register address.
     pub addr: u8,
-    /// Значение: вход для записи, выход для чтения.
+    /// Value: input for a write, output for a read.
     pub value: u8,
-    /// Зарезервировано.
+    /// Reserved.
     pub reserved: [u8; 2],
-    /// Код ошибки.
+    /// Error code.
     pub error_code: i32,
 }
 
-/// Запрос [`IOCTL_LN8000_SET_LIMITS`].
+/// Request for [`IOCTL_LN8000_SET_LIMITS`].
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Ln8000LimitsRequest {
-    /// Лимит входного тока, мкА (0 — не менять).
+    /// Input current limit, µA (0 - do not change).
     pub iin_ua: u32,
-    /// Целевое напряжение заряда, мкВ (0 — не менять).
+    /// Charge voltage target, µV (0 - do not change).
     pub vbat_uv: u32,
-    /// Фактически применённый ток, мкА.
+    /// Actually applied current, µA.
     pub applied_iin_ua: u32,
-    /// Код ошибки.
+    /// Error code.
     pub error_code: i32,
 }
 
-/// Запрос [`IOCTL_LN8000_SET_MODE`].
+/// Request for [`IOCTL_LN8000_SET_MODE`].
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Ln8000ModeRequest {
-    /// Желаемый режим (1 — standby, 2 — bypass, 3 — switching).
+    /// Requested mode (1 - standby, 2 - bypass, 3 - switching).
     ///
-    /// `2` включается только в окне обхода (`Vin` 4,2…8 В): при повышенном
-    /// напряжении возвращается `error_code = -20`
-    /// ([`ERR_BYPASS_VIN_OUT_OF_WINDOW`]), потому что 1:1 подаёт вход прямо на
-    /// батарею.
+    /// `2` is enabled only inside the bypass window (`Vin` 4.2...8 V): at a
+    /// raised voltage `error_code = -20` is returned
+    /// ([`ERR_BYPASS_VIN_OUT_OF_WINDOW`]), because 1:1 feeds the input straight
+    /// to the battery.
     pub mode: u8,
-    /// Фактический режим после переключения.
+    /// Actual mode after the switch.
     pub applied_mode: u8,
-    /// Зарезервировано.
+    /// Reserved.
     pub reserved: [u8; 2],
-    /// Код ошибки.
+    /// Error code.
     pub error_code: i32,
 }
 
-/// Запрос явного старта/стопа заряда для [`IOCTL_LN8000_SET_CHARGE`].
+/// Explicit charge start/stop request for [`IOCTL_LN8000_SET_CHARGE`].
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Ln8000ChargeRequest {
@@ -164,67 +164,67 @@ pub struct Ln8000ChargeRequest {
     pub error_code: i32,
 }
 
-/// Сведения о сеансах для [`IOCTL_LN8000_GET_SESSIONS`].
+/// Session info for [`IOCTL_LN8000_GET_SESSIONS`].
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Ln8000Sessions {
-    /// Сколько сеансов начато всего.
+    /// Total sessions started.
     pub total: u64,
-    /// Длительность текущего сеанса, мс (0 — питания нет).
+    /// Current session duration, ms (0 - no input power).
     pub current_ms: u64,
-    /// Пиковый входной ток текущего сеанса, мкА.
+    /// Peak input current of the current session, µA.
     pub current_peak_iin_ua: u32,
-    /// Была ли за текущий сеанс ускоренная зарядка.
+    /// Whether fast charging occurred during the current session.
     pub current_fast: u8,
-    /// Зарезервировано.
+    /// Reserved.
     pub reserved: [u8; 3],
-    /// Длительность последнего завершённого сеанса, мс.
+    /// Duration of the last completed session, ms.
     pub last_ms: u64,
-    /// Пиковый ток последнего завершённого сеанса, мкА.
+    /// Peak current of the last completed session, µA.
     pub last_peak_iin_ua: u32,
-    /// Пиковая температура последнего сеанса, десятые °C.
+    /// Peak temperature of the last session, tenths of °C.
     pub last_peak_temp_dc: i32,
-    /// Была ли в последнем сеансе ускоренная зарядка.
+    /// Whether fast charging occurred in the last session.
     pub last_fast: u8,
-    /// Зарезервировано.
+    /// Reserved.
     pub reserved2: [u8; 3],
 }
 
-/// Один отсчёт телеметрии в буфере [`IOCTL_LN8000_GET_SAMPLES`].
+/// One telemetry sample in the [`IOCTL_LN8000_GET_SAMPLES`] buffer.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Ln8000Sample {
-    /// Метка времени, мс.
+    /// Timestamp, ms.
     pub ts_ms: u64,
-    /// Напряжение батареи, мкВ.
+    /// Battery voltage, µV.
     pub vbat_uv: u32,
-    /// Напряжение входа, мкВ.
+    /// Input voltage, µV.
     pub vbus_uv: u32,
-    /// Входной ток, мкА.
+    /// Input current, µA.
     pub iin_ua: u32,
-    /// Температура кристалла, десятые °C.
+    /// Die temperature, tenths of °C.
     pub die_temp_dc: i32,
-    /// Режим работы.
+    /// Operating mode.
     pub op_mode: u8,
-    /// Есть ли питание.
+    /// Whether input power is present.
     pub input_present: u8,
-    /// Зарезервировано.
+    /// Reserved.
     pub reserved: [u8; 2],
 }
 
-/// Запрос [`IOCTL_LN8000_GET_SAMPLES`].
+/// Request for [`IOCTL_LN8000_GET_SAMPLES`].
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Ln8000SamplesRequest {
-    /// Сколько отсчётов вернуть (по размеру буфера клиента).
+    /// How many samples to return (bounded by the client buffer size).
     pub count: u32,
-    /// Сколько отсчётов реально записано.
+    /// How many samples were actually written.
     pub available: u32,
-    /// Первый отсчёт в буфере (идут подряд).
+    /// First sample in the buffer (the rest follow contiguously).
     pub first: Ln8000Sample,
 }
 
-/// Запрос [`IOCTL_LN8000_RUN_HVDCP`].
+/// Request for [`IOCTL_LN8000_RUN_HVDCP`].
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Ln8000HvdcpRequest {

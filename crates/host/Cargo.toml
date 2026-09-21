@@ -1,6 +1,6 @@
 [package]
 name = "host"
-description = "Хост-слой драйвера зарядки nabu: транспорты (мок, TCP), журнал JSONL и tracing, симулятор устройства"
+description = "Host layer of the nabu charging driver: transports (mock, TCP), JSONL and tracing journal, device simulator"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -23,7 +23,7 @@ tempfile = "3.20.0"
 
 [features]
 default = []
-# Реальный транспорт по последовательному порту (требует системных библиотек).
+# Real serial-port transport (requires system libraries).
 serial = ["dep:serialport"]
 
 [dependencies.serialport]

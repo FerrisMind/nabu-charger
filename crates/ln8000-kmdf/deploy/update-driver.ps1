@@ -1,11 +1,11 @@
-﻿# update-driver.ps1 — обновление драйвера LN8000 поверх предыдущей версии
+﻿# update-driver.ps1 - update the LN8000 driver over a previous version
 #
-# Запуск от администратора на планшете из папки с новым пакетом:
+# Run as administrator on the tablet from the folder with the new package:
 #     .\update-driver.ps1
 #
-# Обновление безопасно: сначала сохраняется версия установленного пакета,
-# затем ставится новый. Если после установки устройство не поднялось, скрипт
-# сообщает об этом и показывает, как откатиться (uninstall + install старого).
+# The update is safe: first the installed package version is saved, then the new
+# one is installed. If the device does not come up after the install, the script
+# reports it and shows how to roll back (uninstall + install of the old one).
 
 [CmdletBinding()]
 param(
@@ -15,18 +15,18 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $inf = Join-Path $PackageDir 'ln8000_kmdf.inf'
-if (-not (Test-Path -LiteralPath $inf)) { throw "не найден $inf" }
+if (-not (Test-Path -LiteralPath $inf)) { throw "not found: $inf" }
 
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = New-Object Security.Principal.WindowsPrincipal($identity)
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-  throw 'нужны права администратора'
+  throw 'administrator rights are required'
 }
 
 $version = (Get-Item -LiteralPath (Join-Path $PackageDir 'ln8000_kmdf.sys')).VersionInfo.FileVersion
-Write-Host ("=== обновление до версии " + $version) -ForegroundColor Cyan
+Write-Host ("=== updating to version " + $version) -ForegroundColor Cyan
 
-# 1. Сохраняем текущий установленный пакет — это и есть точка отката.
+# 1. Save the currently installed package - this is the rollback point.
 New-Item -ItemType Directory -Path $BackupDir -Force | Out-Null
 $published = & pnputil /enum-drivers | Out-String
 $blocks = $published -split "`r?`n`r?`n"
@@ -34,30 +34,30 @@ foreach ($block in $blocks) {
   if ($block -match 'ln8000_kmdf\.inf' -and $block -match 'oem\d+\.inf') {
     $oem = $Matches[0]
     & pnputil /export-driver $oem $BackupDir 2>&1 | ForEach-Object { "  $_" }
-    Write-Host ("  сохранён $oem в $BackupDir") -ForegroundColor Green
+    Write-Host ("  saved $oem to $BackupDir") -ForegroundColor Green
   }
 }
 
-# 2. Ставим новый пакет.
-Write-Host '=== установка нового пакета ===' -ForegroundColor Cyan
+# 2. Install the new package.
+Write-Host '=== installing the new package ===' -ForegroundColor Cyan
 & pnputil /add-driver $inf /install
-if ($LASTEXITCODE -ne 0) { throw "pnputil вернул код $LASTEXITCODE" }
+if ($LASTEXITCODE -ne 0) { throw "pnputil returned code $LASTEXITCODE" }
 
-# 3. Перезапускаем службу, чтобы драйвер перечитал конфигурацию.
+# 3. Restart the service so the driver re-reads its configuration.
 & sc.exe stop  ln8000_kmdf | Out-Null
 & sc.exe start ln8000_kmdf | ForEach-Object { "  $_" }
 
-# 4. Проверяем, что устройство живо.
-Write-Host '=== проверка ===' -ForegroundColor Cyan
+# 4. Check that the device is alive.
+Write-Host '=== check ===' -ForegroundColor Cyan
 $device = Get-PnpDevice -PresentOnly | Where-Object { $_.InstanceId -like '*ACPI\QCOM057E*' } | Select-Object -First 1
 if ($device) {
-  Write-Host ("  состояние: " + $device.Status)
+  Write-Host ("  status: " + $device.Status)
   if ($device.Status -ne 'OK') {
-    Write-Host '  устройство не в состоянии OK.' -ForegroundColor Yellow
-    Write-Host "  откат: .\uninstall-driver.ps1, затем pnputil /add-driver $BackupDir\ln8000_kmdf.inf /install" -ForegroundColor Yellow
+    Write-Host '  the device is not in the OK state.' -ForegroundColor Yellow
+    Write-Host "  rollback: .\uninstall-driver.ps1, then pnputil /add-driver $BackupDir\ln8000_kmdf.inf /install" -ForegroundColor Yellow
   } else {
-    Write-Host '  обновление прошло успешно' -ForegroundColor Green
+    Write-Host '  the update succeeded' -ForegroundColor Green
   }
 } else {
-  Write-Host '  устройство PEIC не найдено — проверьте загрузку UEFI' -ForegroundColor Yellow
+  Write-Host '  PEIC device not found - check the UEFI boot' -ForegroundColor Yellow
 }

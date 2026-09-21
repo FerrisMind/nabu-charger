@@ -1,6 +1,6 @@
-//! Запись журнала: JSON Lines для разбора инцидентов и мост в `tracing`.
+//! Journal recording: JSON Lines for incident analysis and a bridge into `tracing`.
 //!
-//! Формат одной строки:
+//! The format of one line:
 //!
 //! ```json
 //! {"seq":42,"ts_ms":1500,"request_id":7,"level":"info","kind":"detect",
@@ -14,7 +14,7 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::Mutex;
 
-/// Журнал в файл JSON Lines.
+/// Journal writing to a JSON Lines file.
 #[derive(Debug)]
 pub struct JsonlJournal {
     writer: Mutex<BufWriter<File>>,
@@ -22,11 +22,11 @@ pub struct JsonlJournal {
 }
 
 impl JsonlJournal {
-    /// Создаёт файл журнала (каталоги создаются автоматически).
+    /// Creates the journal file (directories are created automatically).
     ///
     /// # Errors
     ///
-    /// [`std::io::Error`], если каталог или файл недоступны для записи.
+    /// [`std::io::Error`] if the directory or file is not writable.
     pub fn create(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
@@ -41,22 +41,22 @@ impl JsonlJournal {
         })
     }
 
-    /// Путь к файлу журнала.
+    /// Path to the journal file.
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    /// Сбрасывает буфер на диск.
+    /// Flushes the buffer to disk.
     ///
     /// # Errors
     ///
-    /// [`std::io::Error`], если запись не удалась.
+    /// [`std::io::Error`] if the write failed.
     pub fn flush(&self) -> std::io::Result<()> {
         let mut guard = self
             .writer
             .lock()
-            .map_err(|_| std::io::Error::other("журнал заблокирован"))?;
+            .map_err(|_| std::io::Error::other("journal is locked"))?;
         guard.flush()
     }
 
@@ -65,11 +65,11 @@ impl JsonlJournal {
         match self.writer.lock() {
             Ok(mut guard) => {
                 if guard.write_all(line.as_bytes()).is_err() || guard.write_all(b"\n").is_err() {
-                    tracing::error!(target: "nabu::journal", "не удалось записать запись журнала");
+                    tracing::error!(target: "nabu::journal", "failed to write a journal record");
                 }
             }
             Err(_) => {
-                tracing::error!(target: "nabu::journal", "журнал заблокирован");
+                tracing::error!(target: "nabu::journal", "journal is locked");
             }
         }
     }
@@ -81,7 +81,7 @@ impl Journal for JsonlJournal {
     }
 }
 
-/// Мост журнала ядра в события `tracing` (структурированные поля).
+/// Bridge from the core journal into `tracing` events (structured fields).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TracingJournal;
 
@@ -92,25 +92,25 @@ impl Journal for TracingJournal {
         let request_id = event.request_id;
         match event.level {
             Level::Trace => {
-                tracing::trace!(target: "nabu::charger", ts_ms, request_id, kind, "запись");
+                tracing::trace!(target: "nabu::charger", ts_ms, request_id, kind, "record");
             }
             Level::Debug => {
-                tracing::debug!(target: "nabu::charger", ts_ms, request_id, kind, "запись");
+                tracing::debug!(target: "nabu::charger", ts_ms, request_id, kind, "record");
             }
             Level::Info => {
-                tracing::info!(target: "nabu::charger", ts_ms, request_id, kind, "запись");
+                tracing::info!(target: "nabu::charger", ts_ms, request_id, kind, "record");
             }
             Level::Warn => {
-                tracing::warn!(target: "nabu::charger", ts_ms, request_id, kind, "запись");
+                tracing::warn!(target: "nabu::charger", ts_ms, request_id, kind, "record");
             }
             Level::Error => {
-                tracing::error!(target: "nabu::charger", ts_ms, request_id, kind, "запись");
+                tracing::error!(target: "nabu::charger", ts_ms, request_id, kind, "record");
             }
         }
     }
 }
 
-/// Журнал, отправляющий запись двум приёмникам сразу.
+/// Journal that sends a record to two sinks at once.
 #[derive(Debug)]
 pub struct Fanout<A, B> {
     first: A,
@@ -118,7 +118,7 @@ pub struct Fanout<A, B> {
 }
 
 impl<A, B> Fanout<A, B> {
-    /// Объединяет два журнала.
+    /// Combines two journals.
     pub const fn new(first: A, second: B) -> Self {
         Self { first, second }
     }
@@ -131,7 +131,7 @@ impl<A: Journal, B: Journal> Journal for Fanout<A, B> {
     }
 }
 
-/// Превращает запись ядра в JSON-объект.
+/// Turns a core record into a JSON object.
 #[must_use]
 pub fn render(event: &Event) -> Value {
     let mut map = Map::new();
@@ -203,7 +203,7 @@ pub fn render(event: &Event) -> Value {
             map.insert("op".to_owned(), json!(op));
             map.insert("error".to_owned(), json!(error));
         }
-        // Enum помечен `non_exhaustive`: новые варианты не должны ломать журнал.
+        // The enum is marked `non_exhaustive`: new variants must not break the journal.
         _ => {}
     }
     Value::Object(map)

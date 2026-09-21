@@ -1,12 +1,12 @@
-# Драйвер режима ядра собирается ТОЛЬКО под ARM64: целевое устройство —
-# планшет Xiaomi Pad 5 (nabu, Snapdragon 860) под Windows on ARM64.
-# Хост-машина здесь amd64, поэтому без этого файла cargo по умолчанию собрал бы
-# x86_64 и драйвер не загрузился бы на планшете.
+# The kernel-mode driver is built ONLY for ARM64: the target device is a
+# Xiaomi Pad 5 tablet (nabu, Snapdragon 860) under Windows on ARM64.
+# The host machine here is amd64, so without this file cargo would build for
+# x86_64 by default and the driver would not load on the tablet.
 [build]
 target = "aarch64-pc-windows-msvc"
-# Ядро линкуется со статическим CRT: это требование WDK, и `wdk-build`
-# отказывается собирать драйвер без него (`Error: StaticCrtNotEnabled`).
-# `panic=abort` — обязательный режим для кода ядра.
-# `/Brepro` делает метку времени PE-заголовка детерминированной: без неё каждый
-# прогон даёт другой хеш, и о воспроизводимости говорить нельзя.
+# The kernel links against the static CRT: this is a WDK requirement, and
+# `wdk-build` refuses to build the driver without it (`Error: StaticCrtNotEnabled`).
+# `panic=abort` is the mandatory mode for kernel code.
+# `/Brepro` makes the PE header timestamp deterministic: without it every run
+# gives a different hash, and reproducibility is out of the question.
 rustflags = ["-C", "target-feature=+crt-static", "-C", "panic=abort", "-C", "link-arg=/Brepro"]

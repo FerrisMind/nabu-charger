@@ -1,11 +1,11 @@
-# Драйвер charge pump LN8000 собирается ТОЛЬКО под ARM64: целевое устройство —
-# планшет Xiaomi Pad 5 (nabu, Snapdragon 860) под Windows on ARM64.
-# Хост-машина здесь amd64, поэтому без этого файла cargo собрал бы x86_64 и
-# драйвер не загрузился бы на планшете.
+# The LN8000 charge pump driver builds ONLY for ARM64: the target device is the
+# Xiaomi Pad 5 tablet (nabu, Snapdragon 860) running Windows on ARM64.
+# The host machine here is amd64, so without this file cargo would build x86_64
+# and the driver would not load on the tablet.
 [build]
 target = "aarch64-pc-windows-msvc"
-# Ядро линкуется со статическим CRT (требование WDK, wdk-build без него падает
-# с `Error: StaticCrtNotEnabled`); `panic=abort` — обязательный режим для ядра.
-# `/Brepro` делает метку времени PE-заголовка детерминированной: без неё каждый
-# прогон даёт другой хеш, и о воспроизводимости говорить нельзя.
+# The kernel links against the static CRT (a WDK requirement: without it wdk-build
+# fails with `Error: StaticCrtNotEnabled`); `panic=abort` is mandatory for the kernel.
+# `/Brepro` makes the PE header timestamp deterministic: without it every run
+# yields a different hash, and reproducibility cannot be claimed.
 rustflags = ["-C", "target-feature=+crt-static", "-C", "panic=abort", "-C", "link-arg=/Brepro"]

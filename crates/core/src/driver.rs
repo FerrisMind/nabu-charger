@@ -1,10 +1,10 @@
-//! Драйвер зарядника: состояния, детекция адаптера, политика тока, восстановление.
+//! Charger driver: states, adapter detection, current policy, recovery.
 //!
-//! Драйвер намеренно не блокирующий: он не спит и не измеряет время сам.
-//! Внешний цикл вызывает [`Charger::detect_step`] до получения
-//! [`Detection::Ready`], продвигая [`Clock`]. Такой дизайн даёт детерминированные
-//! тесты таймаутов и позволяет использовать один и тот же код и в режиме ядра
-//! (пассивный цикл `PassiveLevel` с таймером WDF), и в хост-утилите.
+//! The driver is deliberately non-blocking: it never sleeps and never measures time
+//! itself. The outer loop calls [`Charger::detect_step`] until it gets
+//! [`Detection::Ready`], advancing [`Clock`]. This design gives deterministic timeout
+//! tests and lets the same code run both in kernel mode (passive `PassiveLevel` loop
+//! with a WDF timer) and in the host CLI.
 
 use crate::apsd::AdapterType;
 use crate::clock::Clock;
@@ -15,23 +15,23 @@ use crate::policy::{self, ChargePolicy, Qc35Support};
 use crate::regs;
 use crate::transport::ChargerTransport;
 
-/// Состояние сессии драйвера.
+/// Driver session state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
-    /// Сессия не открыта.
+    /// Session is not open.
     Closed,
-    /// Связь проверена, детекция ещё не запускалась.
+    /// Link verified, detection has not started yet.
     Idle,
-    /// Идёт ожидание завершения APSD.
+    /// Waiting for APSD to complete.
     Detecting,
-    /// Тип адаптера определён, политика применена.
+    /// Adapter type identified, policy applied.
     Ready,
-    /// Сессия в неисправном состоянии после исчерпания попыток.
+    /// Session is faulted after attempts were exhausted.
     Faulted,
 }
 
 impl State {
-    /// Стабильное имя состояния для журнала.
+    /// Stable state name for the journal.
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
@@ -50,24 +50,24 @@ impl core::fmt::Display for State {
     }
 }
 
-/// Настройки драйвера.
+/// Driver settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChargerConfig {
-    /// Сколько миллисекунд ждать завершения APSD до отказа.
+    /// How many milliseconds to wait for APSD to complete before failing.
     pub detect_timeout_ms: u64,
-    /// Сколько раз разрешено перезапускать детекцию при неустойчивом адаптере.
+    /// How many times detection may be rerun on an unstable adapter.
     pub max_detect_reruns: u8,
-    /// Сколько раз разрешено переоткрывать канал связи при сбое транспорта.
+    /// How many times the link may be reopened on a transport failure.
     pub max_transport_retries: u8,
-    /// Безопасный лимит тока, выставляемый при закрытии сессии.
+    /// Safe current limit applied when the session closes.
     pub safe_icl_ua: u32,
-    /// Верхняя граница лимита тока, которую разрешено выставлять.
+    /// Upper bound on the current limit that may be applied.
     pub max_icl_ua: u32,
-    /// Проверять каждую запись чтением.
+    /// Verify every write by reading it back.
     pub verify_writes: bool,
-    /// Состояние поддержки Quick Charge 3.5.
+    /// Quick Charge 3.5 support state.
     pub qc35: Qc35Support,
-    /// Сетка кодирования лимита тока.
+    /// Encoding grid for the current limit.
     pub icl: IclEncoding,
 }
 
@@ -87,7 +87,7 @@ impl Default for ChargerConfig {
 }
 
 impl ChargerConfig {
-    /// Профиль под Xiaomi Pad 5 (`nabu`): QC3.5 поддержан, аутентификация — по факту.
+    /// Profile for Xiaomi Pad 5 (`nabu`): QC3.5 supported, no authentication in fact.
     #[must_use]
     pub fn for_nabu() -> Self {
         Self {
@@ -98,7 +98,7 @@ impl ChargerConfig {
         }
     }
 
-    /// Профиль для стенда и тестов: детекция быстро, проверки включены.
+    /// Profile for the bench and tests: fast detection, checks enabled.
     #[must_use]
     pub fn for_testing() -> Self {
         Self {
@@ -110,64 +110,64 @@ impl ChargerConfig {
     }
 }
 
-/// Результат одного шага детекции.
+/// Result of one detection step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Detection {
-    /// Детекция ещё идёт; вызывающая сторона должна продвинуть время и повторить.
+    /// Detection is still running; the caller must advance time and try again.
     Pending {
-        /// Сколько миллисекунд уже идёт детекция.
+        /// How many milliseconds detection has been running.
         elapsed_ms: u64,
-        /// Сколько шагов сделано.
+        /// How many steps have been made.
         attempts: u8,
     },
-    /// Тип адаптера определён.
+    /// Adapter type identified.
     Ready(AdapterType),
 }
 
-/// Результат опроса состояния после детекции.
+/// Result of polling the state after detection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Monitor {
-    /// Ничего не изменилось.
+    /// Nothing changed.
     Unchanged(AdapterType),
-    /// Адаптер заменён или переопределён: политику нужно применить заново.
+    /// Adapter replaced or re-identified: the policy must be applied again.
     Changed(AdapterType),
-    /// Питание пропало.
+    /// Power was lost.
     Detached,
 }
 
-/// Что именно применил драйвер.
+/// What the driver actually applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChargePlan {
-    /// Тип адаптера.
+    /// Adapter type.
     pub adapter: AdapterType,
-    /// Выбранная политика.
+    /// Selected policy.
     pub policy: ChargePolicy,
-    /// Код, записанный в регистр лимита тока.
+    /// Code written to the current limit register.
     pub icl_raw: u8,
-    /// Фактически выставленный ток (после квантования по сетке).
+    /// Actually applied current (after quantization to the grid).
     pub applied_icl_ua: u32,
 }
 
-/// Счётчики работы драйвера.
+/// Driver counters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Stats {
-    /// Успешных чтений регистров.
+    /// Successful register reads.
     pub reads: u64,
-    /// Успешных записей регистров.
+    /// Successful register writes.
     pub writes: u64,
-    /// Повторов после сбоев транспорта.
+    /// Retries after transport failures.
     pub retries: u64,
-    /// Сбросов канала связи.
+    /// Link resets.
     pub resets: u64,
-    /// Зафиксированных ошибок.
+    /// Recorded errors.
     pub errors: u64,
-    /// Завершённых детекций.
+    /// Completed detections.
     pub detections: u64,
 }
 
-/// Драйвер зарядника поверх абстрактного транспорта.
+/// Charger driver on top of an abstract transport.
 ///
-/// # Пример
+/// # Examples
 ///
 /// ```no_run
 /// use core::testkit::ScriptedMockTransport;
@@ -183,7 +183,7 @@ pub struct Stats {
 ///     match charger.detect_step()? {
 ///         core::Detection::Ready(adapter) => {
 ///             let plan = charger.apply(adapter)?;
-///             println!("{} → {} мкА", adapter, plan.applied_icl_ua);
+///             println!("{} → {} µA", adapter, plan.applied_icl_ua);
 ///             break;
 ///         }
 ///         core::Detection::Pending { .. } => clock.advance_ms(50),
@@ -210,13 +210,13 @@ pub struct Charger<'a, T: ChargerTransport, C: Clock, J: Journal> {
 }
 
 impl<'a, T: ChargerTransport, C: Clock, J: Journal> Charger<'a, T, C, J> {
-    /// Открывает сессию: сбрасывает канал и проверяет связь чтением `APSD_STATUS`.
+    /// Opens a session: resets the link and verifies it by reading `APSD_STATUS`.
     ///
     /// # Errors
     ///
-    /// * [`ChargerError::Transport`] — периферия недоступна.
-    /// * [`ChargerError::DeviceFault`] — прочитанное значение выглядит как отказ
-    ///   (все биты выставлены), что означает нерабочий канал, а не подключённый блок.
+    /// * [`ChargerError::Transport`] - the peripheral is unavailable.
+    /// * [`ChargerError::DeviceFault`] - the value read looks like a fault
+    ///   (all bits set), which means a dead link rather than an attached power brick.
     pub fn open(
         transport: T,
         clock: &'a C,
@@ -283,50 +283,50 @@ impl<'a, T: ChargerTransport, C: Clock, J: Journal> Charger<'a, T, C, J> {
         }
     }
 
-    /// Текущее состояние сессии.
+    /// Current session state.
     #[must_use]
     pub const fn state(&self) -> State {
         self.state
     }
 
-    /// Счётчики работы.
+    /// Counters.
     #[must_use]
     pub const fn stats(&self) -> Stats {
         self.stats
     }
 
-    /// Распознанный тип адаптера, если детекция уже прошла.
+    /// Identified adapter type, if detection has already completed.
     #[must_use]
     pub const fn adapter(&self) -> Option<AdapterType> {
         self.adapter
     }
 
-    /// Имя транспорта для отчётов.
+    /// Transport name for reports.
     #[must_use]
     pub fn transport_name(&self) -> &'static str {
         self.transport.name()
     }
 
-    /// Настройки, с которыми открыта сессия.
+    /// Settings the session was opened with.
     #[must_use]
     pub const fn config(&self) -> &ChargerConfig {
         &self.config
     }
 
-    /// Один шаг детекции адаптера.
+    /// One adapter detection step.
     ///
-    /// Метод не блокируется: пока APSD не завершён, возвращается
-    /// [`Detection::Pending`], и вызывающая сторона должна продвинуть время и
-    /// вызвать метод снова. При исчерпании бюджета перезапусков возвращается
-    /// ошибка, а состояние становится [`State::Faulted`].
+    /// The method does not block: while APSD has not completed it returns
+    /// [`Detection::Pending`], and the caller must advance time and call the method
+    /// again. Once the rerun budget is exhausted it returns an error and the state
+    /// becomes [`State::Faulted`].
     ///
     /// # Errors
     ///
-    /// * [`ChargerError::NotOpen`] — сессия закрыта.
-    /// * [`ChargerError::DetectionTimeout`] — APSD не завершился за отведённое время.
-    /// * [`ChargerError::AdapterCheckTimeout`] — адаптер нестабилен, повторы исчерпаны.
-    /// * [`ChargerError::UnknownAdapterPattern`] — аппаратура вернула неизвестный образец.
-    /// * [`ChargerError::Transport`] — сбой канала после исчерпания повторов.
+    /// * [`ChargerError::NotOpen`] - the session is closed.
+    /// * [`ChargerError::DetectionTimeout`] - APSD did not complete in the allotted time.
+    /// * [`ChargerError::AdapterCheckTimeout`] - the adapter is unstable, reruns exhausted.
+    /// * [`ChargerError::UnknownAdapterPattern`] - the hardware returned an unknown pattern.
+    /// * [`ChargerError::Transport`] - link failure after retries were exhausted.
     pub fn detect_step(&mut self) -> Result<Detection, ChargerError> {
         if self.state == State::Closed {
             return Err(ChargerError::NotOpen);
@@ -405,19 +405,19 @@ impl<'a, T: ChargerTransport, C: Clock, J: Journal> Charger<'a, T, C, J> {
         }
     }
 
-    /// Считает и применяет политику входного тока для распознанного адаптера.
+    /// Computes and applies the input current policy for the identified adapter.
     ///
-    /// Записываются: код лимита в `USBIN_CURRENT_LIMIT_CFG`, биты разрешения в
-    /// `CMD_ICL_OVERRIDE` и, для Quick Charge, напряжение в
-    /// `HVDCP_PULSE_COUNT_MAX`. При `verify_writes` каждая запись проверяется
-    /// чтением.
+    /// Written are: the limit code to `USBIN_CURRENT_LIMIT_CFG`, the enable bits to
+    /// `CMD_ICL_OVERRIDE` and, for Quick Charge, the voltage to
+    /// `HVDCP_PULSE_COUNT_MAX`. With `verify_writes` every write is verified by
+    /// reading it back.
     ///
     /// # Errors
     ///
-    /// * [`ChargerError::NotOpen`] — сессия закрыта.
-    /// * [`ChargerError::CurrentOutOfRange`] — ток не представим на сетке.
-    /// * [`ChargerError::VerifyFailed`] — прочитанное значение не совпало с записанным.
-    /// * [`ChargerError::Transport`] — сбой канала после исчерпания повторов.
+    /// * [`ChargerError::NotOpen`] - the session is closed.
+    /// * [`ChargerError::CurrentOutOfRange`] - the current is not representable on the grid.
+    /// * [`ChargerError::VerifyFailed`] - the value read did not match the value written.
+    /// * [`ChargerError::Transport`] - link failure after retries were exhausted.
     pub fn apply(&mut self, adapter: AdapterType) -> Result<ChargePlan, ChargerError> {
         if self.state == State::Closed {
             return Err(ChargerError::NotOpen);
@@ -479,12 +479,12 @@ impl<'a, T: ChargerTransport, C: Clock, J: Journal> Charger<'a, T, C, J> {
         })
     }
 
-    /// Опрашивает состояние: не сменился ли адаптер и не пропало ли питание.
+    /// Polls the state: whether the adapter changed and whether power was lost.
     ///
     /// # Errors
     ///
-    /// * [`ChargerError::NotOpen`] — сессия закрыта.
-    /// * [`ChargerError::Transport`] — сбой канала после исчерпания повторов.
+    /// * [`ChargerError::NotOpen`] - the session is closed.
+    /// * [`ChargerError::Transport`] - link failure after retries were exhausted.
     pub fn monitor(&mut self) -> Result<Monitor, ChargerError> {
         if self.state == State::Closed {
             return Err(ChargerError::NotOpen);
@@ -530,12 +530,12 @@ impl<'a, T: ChargerTransport, C: Clock, J: Journal> Charger<'a, T, C, J> {
         }
     }
 
-    /// Повторная инициализация после сбоя: переоткрывает канал и сбрасывает состояние детекции.
+    /// Reinitializes after a failure: reopens the link and resets detection state.
     ///
     /// # Errors
     ///
-    /// * [`ChargerError::NotOpen`] — сессия закрыта (сначала нужен [`Charger::open`]).
-    /// * [`ChargerError::Transport`] — канал не удалось восстановить.
+    /// * [`ChargerError::NotOpen`] - the session is closed (call [`Charger::open`] first).
+    /// * [`ChargerError::Transport`] - the link could not be recovered.
     pub fn reinit(&mut self) -> Result<(), ChargerError> {
         if self.state == State::Closed {
             return Err(ChargerError::NotOpen);
@@ -545,7 +545,7 @@ impl<'a, T: ChargerTransport, C: Clock, J: Journal> Charger<'a, T, C, J> {
         self.stats.resets = self.stats.resets.saturating_add(1);
         self.log(request, Level::Info, EventKind::Reset { ok });
         if !ok {
-            let err = TransportError::disconnected("канал не восстановлен");
+            let err = TransportError::disconnected("link not recovered");
             return Err(self.fail(request, "reinit.reset", ChargerError::Transport(err)));
         }
         self.detect_started_ms = None;
@@ -557,10 +557,10 @@ impl<'a, T: ChargerTransport, C: Clock, J: Journal> Charger<'a, T, C, J> {
         Ok(())
     }
 
-    /// Закрывает сессию, возвращая безопасный лимит тока.
+    /// Closes the session, restoring the safe current limit.
     ///
-    /// Вызывается вручную или автоматически из [`Drop`]. Питание при этом не
-    /// отключается: это не задача драйвера.
+    /// Called manually or automatically from [`Drop`]. Power is not switched off
+    /// here: that is not the driver's job.
     pub fn close(&mut self) {
         if self.state == State::Closed {
             return;
@@ -577,7 +577,7 @@ impl<'a, T: ChargerTransport, C: Clock, J: Journal> Charger<'a, T, C, J> {
         self.log(request, Level::Info, EventKind::Close { ok });
     }
 
-    // --- внутреннее ---
+    // --- internals ---
 
     fn next_request(&mut self) -> u64 {
         self.request_id = self.request_id.saturating_add(1);
@@ -587,7 +587,7 @@ impl<'a, T: ChargerTransport, C: Clock, J: Journal> Charger<'a, T, C, J> {
     fn probe(&mut self) -> Result<(), ChargerError> {
         let request = self.next_request();
         match self.read_reg(regs::APSD_STATUS, request) {
-            // 0xFF означает непрочитанный канал, а не «все сбои сразу».
+            // 0xFF means an unread link, not "all faults at once".
             Ok(0xFF) => Err(ChargerError::DeviceFault { status: 0xFF }),
             Ok(_) => Ok(()),
             Err(err) => Err(err),
@@ -608,7 +608,7 @@ impl<'a, T: ChargerTransport, C: Clock, J: Journal> Charger<'a, T, C, J> {
                 reason,
             },
         );
-        // Перезапуск автомата детекции: без него нестабильный адаптер так и останется неопознанным.
+        // Restart the detection state machine: without it an unstable adapter stays unidentified.
         match self.update_reg(regs::CMD_APSD, regs::APSD_RERUN, regs::APSD_RERUN, request) {
             Ok(()) => Ok(()),
             Err(err) => Err(self.fail(request, "detect.rerun", err)),
@@ -788,10 +788,10 @@ impl<'a, T: ChargerTransport, C: Clock, J: Journal> Charger<'a, T, C, J> {
 }
 
 impl<T: ChargerTransport, C: Clock, J: Journal> Drop for Charger<'_, T, C, J> {
-    /// Закрывает сессию и возвращает безопасный лимит тока.
+    /// Closes the session and restores the safe current limit.
     ///
-    /// Ошибки намеренно поглощаются: паника в `Drop` запрещена, а состояние
-    /// после выгрузки драйвера не должно зависеть от доступности железа.
+    /// Errors are deliberately swallowed: panicking in `Drop` is forbidden, and the
+    /// state after the driver is unloaded must not depend on hardware availability.
     fn drop(&mut self) {
         self.close();
     }
@@ -824,7 +824,7 @@ mod tests {
             &journal,
             ChargerConfig::for_testing(),
         )
-        .expect("сессия должна открыться");
+        .expect("the session must open");
         assert_eq!(charger.state(), State::Idle);
         assert_eq!(charger.transport_name(), "mock");
         assert_eq!(journal.count_of("open"), 1);
@@ -846,7 +846,7 @@ mod tests {
             ..ChargerConfig::for_testing()
         };
         let result = Charger::open(transport, &clock, &journal, config);
-        assert!(result.is_err(), "мёртвый канал не должен открыться");
+        assert!(result.is_err(), "a dead link must not open");
         match result {
             Err(err) => assert_eq!(err.code(), "transport"),
             Ok(_) => unreachable!(),
@@ -860,15 +860,15 @@ mod tests {
         let transport = mock(AdapterType::Hvdcp3);
         transport.set_detection_ready_after(3);
         let mut charger = Charger::open(transport, &clock, &journal, ChargerConfig::for_testing())
-            .expect("сессия должна открыться");
+            .expect("the session must open");
 
-        let first = charger.detect_step().expect("шаг должен выполниться");
+        let first = charger.detect_step().expect("the step must run");
         assert!(matches!(first, Detection::Pending { .. }));
 
-        let second = charger.detect_step().expect("шаг должен выполниться");
+        let second = charger.detect_step().expect("the step must run");
         assert!(matches!(second, Detection::Pending { .. }));
 
-        let third = charger.detect_step().expect("шаг должен выполниться");
+        let third = charger.detect_step().expect("the step must run");
         assert_eq!(third, Detection::Ready(AdapterType::Hvdcp3));
         assert_eq!(charger.state(), State::Ready);
         assert_eq!(charger.adapter(), Some(AdapterType::Hvdcp3));
@@ -886,17 +886,17 @@ mod tests {
             ..ChargerConfig::for_testing()
         };
         let mut charger =
-            Charger::open(transport, &clock, &journal, config).expect("сессия должна открыться");
+            Charger::open(transport, &clock, &journal, config).expect("the session must open");
         assert!(matches!(
-            charger.detect_step().expect("первый шаг"),
+            charger.detect_step().expect("first step"),
             Detection::Pending { .. }
         ));
 
         clock.advance_ms(500);
-        let err = charger.detect_step().expect_err("должен быть таймаут");
+        let err = charger.detect_step().expect_err("a timeout is expected");
         assert!(
             matches!(err, ChargerError::DetectionTimeout { .. }),
-            "получена ошибка: {err:?}"
+            "got error: {err:?}"
         );
         assert_eq!(charger.state(), State::Faulted);
         assert!(journal.count_of("error") >= 1);
@@ -916,19 +916,16 @@ mod tests {
             ..ChargerConfig::for_testing()
         };
         let mut charger =
-            Charger::open(transport, &clock, &journal, config).expect("сессия должна открыться");
+            Charger::open(transport, &clock, &journal, config).expect("the session must open");
 
         assert!(matches!(
-            charger.detect_step().expect("первый шаг"),
+            charger.detect_step().expect("first step"),
             Detection::Pending { .. }
         ));
-        assert!(
-            journal.count_of("retry") == 1,
-            "должен быть перезапуск детекции"
-        );
-        assert!(charger.stats().writes >= 1, "перезапуск пишет в CMD_APSD");
+        assert!(journal.count_of("retry") == 1, "detection must be rerun");
+        assert!(charger.stats().writes >= 1, "the rerun writes to CMD_APSD");
 
-        let err = charger.detect_step().expect_err("повторы исчерпаны");
+        let err = charger.detect_step().expect_err("reruns exhausted");
         assert!(matches!(err, ChargerError::AdapterCheckTimeout { .. }));
     }
 
@@ -942,11 +939,11 @@ mod tests {
             &journal,
             ChargerConfig::for_testing(),
         )
-        .expect("сессия должна открыться");
-        let err = charger.detect_step().expect_err("образец не опознан");
+        .expect("the session must open");
+        let err = charger.detect_step().expect_err("pattern not recognized");
         match err {
             ChargerError::UnknownAdapterPattern { raw } => assert_eq!(raw, 0x3F),
-            other => panic!("неожиданная ошибка: {other}"),
+            other => panic!("unexpected error: {other}"),
         }
     }
 
@@ -960,12 +957,12 @@ mod tests {
             &journal,
             ChargerConfig::for_testing(),
         )
-        .expect("сессия должна открыться");
-        charger.detect_step().expect("детекция");
-        let plan = charger.apply(AdapterType::Hvdcp3).expect("политика");
+        .expect("the session must open");
+        charger.detect_step().expect("detection");
+        let plan = charger.apply(AdapterType::Hvdcp3).expect("policy");
 
         assert_eq!(plan.applied_icl_ua, 3_000_000);
-        assert_eq!(plan.icl_raw, 0x1D, "3 А на сетке 100 мА → код 29");
+        assert_eq!(plan.icl_raw, 0x1D, "3 A on the 100 mA grid → code 29");
         assert!(plan.policy.pump_eligible);
         assert_eq!(charger.state(), State::Ready);
         assert_eq!(journal.count_of("policy"), 1);
@@ -981,10 +978,10 @@ mod tests {
             &journal,
             ChargerConfig::for_testing(),
         )
-        .expect("сессия должна открыться");
-        let plan = charger.apply(AdapterType::Sdp).expect("политика для SDP");
+        .expect("the session must open");
+        let plan = charger.apply(AdapterType::Sdp).expect("policy for SDP");
         assert_eq!(plan.applied_icl_ua, 500_000);
-        assert_eq!(plan.icl_raw, 4, "500 мА на сетке 100 мА → код 4");
+        assert_eq!(plan.icl_raw, 4, "500 mA on the 100 mA grid → code 4");
         assert!(!plan.policy.pump_eligible);
     }
 
@@ -999,18 +996,18 @@ mod tests {
             times: 1,
         });
         let mut charger = Charger::open(transport, &clock, &journal, ChargerConfig::for_testing())
-            .expect("сессия должна открыться");
-        charger.detect_step().expect("детекция");
+            .expect("the session must open");
+        charger.detect_step().expect("detection");
         let err = charger
             .apply(AdapterType::Hvdcp3)
-            .expect_err("проверка записи должна провалиться");
+            .expect_err("write verification must fail");
         match err {
             ChargerError::VerifyFailed { addr, wrote, read } => {
                 assert_eq!(addr, regs::USBIN_CURRENT_LIMIT_CFG);
                 assert_eq!(wrote, 0x1D);
                 assert_eq!(read, 0x00);
             }
-            other => panic!("неожиданная ошибка: {other}"),
+            other => panic!("unexpected error: {other}"),
         }
     }
 
@@ -1025,11 +1022,11 @@ mod tests {
             times: 1,
         });
         let mut charger = Charger::open(transport, &clock, &journal, ChargerConfig::for_testing())
-            .expect("повтор должен спасти сессию");
+            .expect("the retry must save the session");
         assert_eq!(charger.stats().retries, 1);
-        assert_eq!(charger.stats().resets, 1, "сброс при восстановлении канала");
+        assert_eq!(charger.stats().resets, 1, "reset while recovering the link");
         assert_eq!(
-            charger.detect_step().expect("детекция"),
+            charger.detect_step().expect("detection"),
             Detection::Ready(AdapterType::Hvdcp3)
         );
     }
@@ -1039,8 +1036,8 @@ mod tests {
         let clock = ManualClock::new();
         let journal = VecJournal::new();
         let mut transport = mock(AdapterType::Hvdcp3);
-        // Сбои адресованы регистру результата: открытие (читает только APSD_STATUS) проходит,
-        // а детекция после него упирается в отказ канала.
+        // The faults target the result register: open (which reads only APSD_STATUS)
+        // succeeds, while the detection after it hits a dead link.
         transport.push_fault(Fault::ReadError {
             addr: regs::APSD_RESULT_STATUS,
             kind: TransportErrorKind::Disconnected,
@@ -1051,23 +1048,21 @@ mod tests {
             ..ChargerConfig::for_testing()
         };
         let mut charger = Charger::open(transport, &clock, &journal, config)
-            .expect("открытие проходит до исчерпания повторов");
+            .expect("open succeeds before the retries are exhausted");
 
         let result = charger.detect_step();
-        assert!(result.is_err(), "детекция должна отказать: {result:?}");
+        assert!(result.is_err(), "detection must fail: {result:?}");
         if let Err(err) = result {
             assert_eq!(err.code(), "transport");
             assert_eq!(charger.state(), State::Faulted);
         }
 
-        charger
-            .reinit()
-            .expect("повторная инициализация должна пройти");
+        charger.reinit().expect("reinitialization must succeed");
         assert_eq!(charger.state(), State::Idle);
         assert_eq!(
             charger
                 .detect_step()
-                .expect("детекция после переинициализации"),
+                .expect("detection after reinitialization"),
             Detection::Ready(AdapterType::Hvdcp3)
         );
     }
@@ -1082,13 +1077,13 @@ mod tests {
             &journal,
             ChargerConfig::for_testing(),
         )
-        .expect("сессия должна открыться");
-        charger.detect_step().expect("детекция");
-        charger.apply(AdapterType::Hvdcp3).expect("политика");
+        .expect("the session must open");
+        charger.detect_step().expect("detection");
+        charger.apply(AdapterType::Hvdcp3).expect("policy");
         charger.close();
         assert_eq!(charger.state(), State::Closed);
         assert_eq!(journal.count_of("close"), 1);
-        let err = charger.detect_step().expect_err("сессия закрыта");
+        let err = charger.detect_step().expect_err("the session is closed");
         assert!(matches!(err, ChargerError::NotOpen));
     }
 
@@ -1103,9 +1098,9 @@ mod tests {
                 &journal,
                 ChargerConfig::for_testing(),
             )
-            .expect("сессия должна открыться");
+            .expect("the session must open");
         }
-        assert_eq!(journal.count_of("close"), 1, "Drop обязан закрыть сессию");
+        assert_eq!(journal.count_of("close"), 1, "Drop must close the session");
     }
 
     #[test]
@@ -1118,8 +1113,8 @@ mod tests {
             &journal,
             ChargerConfig::for_testing(),
         )
-        .expect("сессия должна открыться");
-        assert_eq!(charger.monitor().expect("опрос"), Monitor::Detached);
+        .expect("the session must open");
+        assert_eq!(charger.monitor().expect("poll"), Monitor::Detached);
     }
 
     #[test]
@@ -1132,13 +1127,13 @@ mod tests {
             &journal,
             ChargerConfig::for_testing(),
         )
-        .expect("сессия должна открыться");
+        .expect("the session must open");
         assert_eq!(
-            charger.detect_step().expect("детекция"),
+            charger.detect_step().expect("detection"),
             Detection::Ready(AdapterType::Dcp)
         );
         assert_eq!(
-            charger.monitor().expect("опрос"),
+            charger.monitor().expect("poll"),
             Monitor::Unchanged(AdapterType::Dcp)
         );
     }
@@ -1153,22 +1148,26 @@ mod tests {
             &journal,
             ChargerConfig::for_testing(),
         )
-        .expect("сессия должна открыться");
+        .expect("the session must open");
         clock.advance_ms(1500);
-        charger.detect_step().expect("детекция");
-        charger.apply(AdapterType::Hvdcp3).expect("политика");
+        charger.detect_step().expect("detection");
+        charger.apply(AdapterType::Hvdcp3).expect("policy");
 
         assert!(journal.len() > 5);
         let mut seen_request = false;
         journal.for_each(|index, event| {
-            assert_eq!(event.seq, index as u64 + 1, "сквозная нумерация записей");
+            assert_eq!(
+                event.seq,
+                index as u64 + 1,
+                "records are numbered consecutively"
+            );
             if event.request_id > 0 {
                 seen_request = true;
             }
         });
-        assert!(seen_request, "записи должны нести идентификатор запроса");
-        let detect = journal.first_of("detect").expect("запись о детекции");
-        assert_eq!(detect.ts_ms, 1500, "метка времени из часов ядра");
+        assert!(seen_request, "records must carry a request id");
+        let detect = journal.first_of("detect").expect("detection record");
+        assert_eq!(detect.ts_ms, 1500, "timestamp comes from the core clock");
         assert!(detect.request_id > 0);
     }
 }

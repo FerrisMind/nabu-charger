@@ -111,8 +111,8 @@ impl Hold {
     pub const fn update_evidence(self, evidence: Option<bool>, now_ms: u64, hold_ms: u64) -> Self {
         match evidence {
             Some(raw) => self.update(raw, now_ms, hold_ms),
-            // Такт без улик не двигает ни флаг, ни метку времени, ни серию
-            // взвода: «не знаю» — это не «нет блока».
+            // A tick without evidence moves neither the flag, the timestamp nor
+            // the arming run: "do not know" is not "no adapter".
             None => self,
         }
     }
@@ -164,20 +164,20 @@ pub const VBUS_ELEVATED_UV: u32 = 6_000_000;
 /// charging floor is adapter evidence on its own. Unplugged input reads the
 /// 39 mA ADC floor, far below [`IIN_CHARGING_UA`], so the old guard still holds.
 ///
-/// `vac_unplug` — `FAULT1` бит 4 (`LN8000_MASK_VAC_UNPLUG_STS`, вендорский
-/// `ln8000_charger.h:62`). Вендор отвечает **этим битом** на вопрос «есть ли
-/// VBUS» (`POWER_SUPPLY_PROP_TI_VBUS_PRESENT` → `!vac_unplug`,
-/// `ln8000_charger.c:948`), то есть признак отключения приходит от железа, а не
-/// выводится из АЦП. Живой замер 19.09 при отключённом кабеле: `FAULT1 = 0x30`
-/// (бит 4 выставлен), `Vin = 8,80 В` при банке `4,40 В`, ток 39 мА.
+/// `vac_unplug`: `FAULT1` bit 4 (`LN8000_MASK_VAC_UNPLUG_STS`, vendor
+/// `ln8000_charger.h:62`). The vendor answers **with this bit** the question "is
+/// VBUS" (`POWER_SUPPLY_PROP_TI_VBUS_PRESENT` → `!vac_unplug`,
+/// `ln8000_charger.c:948`), so unplug comes from the hardware, not from the ADC.
+/// Live measurement 19.09 with the cable unplugged: `FAULT1 = 0x30` (bit 4 set),
+/// `Vin = 8.80 V` with the cell at `4.40 V`, current 39 mA.
 ///
-/// Порядок проверок принципиален. Ток идёт первым: он перебивает и защёлку
-/// `VAC_UNPLUG`, и «удвоенную» шину — если в банку течёт 2 А, блок есть, чем бы
-/// ни выглядел `Vin`. Дальше отсекается отражение банки через шину
-/// преобразователя: без кабеля узел `VIN` не нагружен, и АЦП читает ровно
-/// `2 · VBAT`. Это отражение масштабируется вместе с банкой, поэтому проверка
-/// обязана стоять **до** ветки `Vin ≥ 6 В`, которая иначе принимает его
-/// безусловно.
+/// The order of the checks matters. Current comes first: it overrides both the
+/// `VAC_UNPLUG` latch and the "doubled" bus - if 2 A flows into the pack, the
+/// adapter is there, whatever `Vin` looks like. Next the cell reflection through
+/// the converter bus is cut off: without a cable the `VIN` node is unloaded, and
+/// the ADC reads exactly `2 · VBAT`. That reflection scales with the cell, so the
+/// check must come **before** the `Vin ≥ 6 V` branch, which would otherwise
+/// accept it unconditionally.
 #[must_use]
 pub const fn online_raw(vbus_uv: u32, vbat_uv: u32, iin_ua: u32, vac_unplug: bool) -> bool {
     if vbus_uv >= VBUS_CHARGING_MIN_UV && iin_ua >= IIN_CHARGING_UA {
@@ -284,7 +284,7 @@ mod tests {
             500,
             CHARGING_HOLD_MS,
         );
-        assert!(st.held, "один такт на полу АЦП не снимает CHARGING");
+        assert!(st.held, "one tick at the ADC floor does not clear CHARGING");
     }
 
     #[test]
@@ -301,7 +301,7 @@ mod tests {
                 CHARGING_HOLD_MS,
             );
         }
-        assert!(st.held, "до 20 с удержание держится");
+        assert!(st.held, "the hold survives up to 20 s");
         // 25 s of sustained low current: cleared.
         while now < armed_at + 25_000 {
             now += TICK_MS;
@@ -311,7 +311,7 @@ mod tests {
                 CHARGING_HOLD_MS,
             );
         }
-        assert!(!st.held, "25 с низкого тока снимают CHARGING");
+        assert!(!st.held, "25 s of low current clear CHARGING");
     }
 
     #[test]
@@ -321,7 +321,7 @@ mod tests {
         // One tick below the Vin threshold: online stays held, so battery.rs
         // (DISCHARGING = !online_held) never publishes DISCHARGING.
         let st = st.update(false, 500, ONLINE_HOLD_MS);
-        assert!(st.held, "один такт offline не должен давать DISCHARGING");
+        assert!(st.held, "one offline tick must not give DISCHARGING");
     }
 
     #[test]
@@ -333,12 +333,12 @@ mod tests {
             now += TICK_MS;
             st = st.update(false, now, ONLINE_HOLD_MS);
         }
-        assert!(st.held, "до 8 с удержание держится");
+        assert!(st.held, "the hold survives up to 8 s");
         while now < armed_at + 9_000 {
             now += TICK_MS;
             st = st.update(false, now, ONLINE_HOLD_MS);
         }
-        assert!(!st.held, "9 с offline снимают online_held");
+        assert!(!st.held, "9 s offline clear online_held");
     }
 
     #[test]
@@ -359,13 +359,13 @@ mod tests {
     fn single_true_sample_never_arms() {
         // A lone tick of "evidence" between false samples is not a run.
         let st = Hold::new().update(true, 0, ONLINE_HOLD_MS);
-        assert!(!st.held, "одиночный true не взводит удержание");
+        assert!(!st.held, "a single true does not arm the hold");
         let st = st.update(false, TICK_MS, ONLINE_HOLD_MS);
         let st = st.update(true, 2 * TICK_MS, ONLINE_HOLD_MS);
-        assert!(!st.held, "дребезг true/false не взводит удержание");
+        assert!(!st.held, "true/false chatter does not arm the hold");
         // Two consecutive true samples do arm it.
         let st = st.update(true, 3 * TICK_MS, ONLINE_HOLD_MS);
-        assert!(st.held, "два подряд true взводят удержание");
+        assert!(st.held, "two true samples in a row arm the hold");
     }
 
     #[test]
@@ -383,15 +383,15 @@ mod tests {
             raw = !raw;
             st = st.update(raw, now, ONLINE_HOLD_MS);
         }
-        assert!(st.held, "дребезг внутри окна не снимает удержание досрочно");
+        assert!(
+            st.held,
+            "chatter inside the window does not clear the hold early"
+        );
         while now <= armed_at + ONLINE_HOLD_MS {
             now += TICK_MS;
             st = st.update(false, now, ONLINE_HOLD_MS);
         }
-        assert!(
-            !st.held,
-            "после последнего устойчивого запуска удержание обязано кончиться"
-        );
+        assert!(!st.held, "after the last sustained run the hold must end");
     }
 
     #[test]
@@ -424,25 +424,25 @@ mod tests {
 
     #[test]
     fn unplugged_elevated_rail_is_not_online() {
-        // Живой замер 19.09 при отключённом кабеле: узел VIN не нагружен, и АЦП
-        // читает ровно 2 · VBAT. Раньше эта ветка возвращала `true` безусловно,
-        // и трей показывал «подключён», пока пак разряжался.
+        // Live measurement 19.09 with the cable unplugged: the VIN node is unloaded
+        // and the ADC reads exactly 2 · VBAT. This branch used to return `true`
+        // unconditionally, and the tray showed "connected" while the pack discharged.
         assert!(!online_raw(8_800_000, 4_400_000, IIN_FLOOR_UA, false));
-        // Отражение масштабируется вместе с банкой: на разряженной банке оно
-        // попадает в 4,2–8,0 В, ниже порога «поднятой шины» 6 В.
+        // The reflection scales with the cell: on a discharged cell it lands in
+        // 4.2-8.0 V, below the 6 V "raised bus" threshold.
         assert!(!online_raw(7_600_000, 3_800_000, IIN_FLOOR_UA, false));
         assert!(!online_raw(5_000_000, 2_500_000, IIN_FLOOR_UA, false));
-        // Ток перебивает отражение: 2 А в банку при 9 В — это блок, а не шина.
+        // Current overrides the reflection: 2 A into the pack at 9 V is an adapter, not a bus.
         assert!(online_raw(8_800_000, 4_400_000, 2_000_000, false));
     }
 
     #[test]
     fn hardware_unplug_flag_is_a_veto_until_current_flows() {
-        // `FAULT1` бит 4 выставлен железом — блок отключён. АЦП при этом ещё
-        // может показывать остаточную шину.
+        // `FAULT1` bit 4 is set by the hardware - the adapter is unplugged. The ADC
+        // may still show residual bus voltage.
         assert!(!online_raw(9_400_000, 4_400_000, IIN_FLOOR_UA, true));
-        // Улика сильнее защёлки: если в банку течёт ток, блок есть, и устаревший
-        // бит не имеет права гасить `POWER_ON_LINE`.
+        // Evidence beats the latch: if current flows into the pack the adapter is
+        // there, and a stale bit has no right to drop `POWER_ON_LINE`.
         assert!(online_raw(9_400_000, 4_400_000, 2_000_000, true));
     }
 
@@ -454,20 +454,20 @@ mod tests {
         assert!(online_raw(4_600_000, 4_300_000, 0, false));
     }
 
-    // --- Годность отсчётов входа (гибернация АЦП / отказ шины) -------------
+    // --- Input sample validity (ADC hibernation / bus failure) -------------
     //
-    // Живой перечень из дампа 19.09 (`AdcValid = 1`): чип читается успешно, но
-    // все каналы — нули, потому что АЦП уснул. Пока такой такт считался
-    // измерением, `online_raw` отвечал «блока нет» и удержание `POWER_ON_LINE`
-    // старело на каждом такте (8 с — и трей отдаёт AC→DC→AC, хотя кабель не
-    // двигался).
+    // Live list from the 19.09 dump (`AdcValid = 1`): the chip reads successfully
+    // but all channels are zeros, because the ADC went to sleep. While such a tick
+    // counted as a measurement, `online_raw` answered "no adapter" and the
+    // `POWER_ON_LINE` hold aged on every tick (8 s - and the tray gives
+    // AC→DC→AC, although the cable never moved).
 
-    /// Нечитаемый такт: все каналы нули, `FAULT1` бит 4 снят — вердикта нет.
+    /// Unreadable tick: all channels zero, `FAULT1` bit 4 clear - no verdict.
     const TICK_NO_READING_VBUS_PRESENT: Option<bool> =
         online_raw_with_evidence(0, 0, 0, false, false);
-    /// Нечитаемый такт, но железо само сказало «VAC отключён».
+    /// Unreadable tick, but the hardware itself said "VAC unplugged".
     const TICK_NO_READING_VBUS_GONE: Option<bool> = online_raw_with_evidence(0, 0, 0, true, false);
-    /// Читаемый такт настоящего 2:1 (живой замер: 9,088 В, 1,887 А).
+    /// Readable tick of real 2:1 (live measurement: 9.088 V, 1.887 A).
     const TICK_READING_ELEVATED: Option<bool> =
         online_raw_with_evidence(9_088_000, 4_400_000, 1_887_000, false, true);
 
@@ -475,21 +475,21 @@ mod tests {
     fn unreadable_tick_carries_no_verdict_when_the_hardware_says_vbus_is_present() {
         assert_eq!(
             TICK_NO_READING_VBUS_PRESENT, None,
-            "нули без вердикта железа — «нет отсчёта», а не «нет блока»"
+            "zeros without a hardware verdict are \"no sample\", not \"no adapter\""
         );
-        // Тот же такт, прочитанный как измерение, — это ровно прежний вердикт
-        // «блока нет»; именно его нельзя было пускать в удержание.
+        // The same tick, taken as a measurement, is exactly the old verdict
+        // "no adapter"; that is the one that must not feed the hold.
         assert!(!online_raw(0, 0, 0, false));
-        // Зато вердикт железа принимается и без АЦП.
+        // The hardware verdict, however, is accepted even without the ADC.
         assert_eq!(TICK_NO_READING_VBUS_GONE, Some(false));
-        // Читаемый такт идёт полной цепочкой `online_raw`.
+        // A readable tick goes through the full `online_raw` chain.
         assert_eq!(TICK_READING_ELEVATED, Some(true));
     }
 
     #[test]
     fn unreadable_run_while_hardware_says_vbus_present_never_clears_online() {
-        // 60 с нечитаемых тактов — впятеро длиннее `ONLINE_HOLD_MS`: если бы
-        // нули старили удержание, `POWER_ON_LINE` погас бы на 12-й секунде.
+        // 60 s of unreadable ticks is five times `ONLINE_HOLD_MS`: if zeros aged
+        // the hold, `POWER_ON_LINE` would go out at second 12.
         let armed_at = 250_u64;
         let mut st = arm(true, ONLINE_HOLD_MS);
         let mut now = armed_at;
@@ -499,11 +499,11 @@ mod tests {
         }
         assert!(
             st.held,
-            "60 с нечитаемых тактов при снятом бите VAC_UNPLUG не снимают POWER_ON_LINE"
+            "60 s of unreadable ticks with VAC_UNPLUG clear do not clear POWER_ON_LINE"
         );
-        assert_eq!(st.last_true_ms, armed_at, "метка улики не должна двигаться");
-        // Нагрузка теста: та же последовательность нулей, принятых за измерение
-        // (прежнее поведение), удержание снимает.
+        assert_eq!(st.last_true_ms, armed_at, "the evidence mark must not move");
+        // Test load: the same sequence of zeros taken as a measurement (the old
+        // behaviour) clears the hold.
         let mut as_before = arm(true, ONLINE_HOLD_MS);
         let mut now = armed_at;
         while now < armed_at + 9_000 {
@@ -512,14 +512,14 @@ mod tests {
         }
         assert!(
             !as_before.held,
-            "нули, принятые за 0 В, снимают удержание — это прежний дефект"
+            "zeros taken as 0 V clear the hold - that is the old defect"
         );
     }
 
     #[test]
     fn unreadable_run_cannot_arm_or_rearm_a_cleared_hold() {
-        // «Не знаю» не улика и в обратную сторону: серия нечитаемых тактов не
-        // взводит удержание, даже когда железо молчит о отключении.
+        // "Do not know" is not evidence the other way either: a run of unreadable
+        // ticks does not arm the hold even when the hardware says nothing about unplug.
         let mut st = Hold::new();
         let mut now = 0_u64;
         while now < 30_000 {
@@ -528,29 +528,35 @@ mod tests {
         }
         assert!(
             !st.held,
-            "нечитаемые такты сами по себе не взводят POWER_ON_LINE"
+            "unreadable ticks on their own do not arm POWER_ON_LINE"
         );
-        // Живая улика возвращает признак: первый такт — начало серии, второй
-        // взводит (HOLD_ARM_RUN).
+        // Live evidence brings the flag back: the first tick starts the run, the
+        // second arms it (HOLD_ARM_RUN).
         let first = st.update_evidence(TICK_READING_ELEVATED, now, ONLINE_HOLD_MS);
-        assert!(!first.held, "одиночная улика не взводит удержание");
+        assert!(
+            !first.held,
+            "a lone piece of evidence does not arm the hold"
+        );
         now += TICK_MS;
         let armed = first.update_evidence(TICK_READING_ELEVATED, now, ONLINE_HOLD_MS);
-        assert!(armed.held, "устойчивая улика возвращает POWER_ON_LINE");
-        // ...и держится положенные 8 с, даже если АЦП снова уснул.
+        assert!(armed.held, "sustained evidence brings POWER_ON_LINE back");
+        // ...and it holds for its full 8 s even if the ADC went back to sleep.
         let armed_at = now;
         let mut held = armed;
         while now < armed_at + 7_750 {
             now += TICK_MS;
             held = held.update_evidence(TICK_NO_READING_VBUS_PRESENT, now, ONLINE_HOLD_MS);
         }
-        assert!(held.held, "успевшая взвестись улика держит окно до конца");
+        assert!(
+            held.held,
+            "evidence that armed in time keeps the window to the end"
+        );
     }
 
     #[test]
     fn genuine_unplug_clears_online_through_both_paths() {
-        // Отключение, о котором сказало железо, кончает удержание и когда АЦП
-        // спит (нули + бит 4), и когда шина ещё читается (фантом 2·VBAT).
+        // An unplug the hardware reported ends the hold both when the ADC sleeps
+        // (zeros + bit 4) and when the bus is still readable (a 2·VBAT phantom).
         let armed_at = 250_u64;
         let mut st = arm(true, ONLINE_HOLD_MS);
         let mut now = armed_at;
@@ -558,18 +564,18 @@ mod tests {
             now += TICK_MS;
             st = st.update_evidence(TICK_NO_READING_VBUS_GONE, now, ONLINE_HOLD_MS);
         }
-        assert!(st.held, "до 8 с отключение держит окно, как и раньше");
+        assert!(st.held, "up to 8 s the unplug keeps the window, as before");
         while now < armed_at + 9_000 {
             now += TICK_MS;
             st = st.update_evidence(TICK_NO_READING_VBUS_GONE, now, ONLINE_HOLD_MS);
         }
         assert!(
             !st.held,
-            "бит VAC_UNPLUG снимает POWER_ON_LINE даже без отсчётов"
+            "the VAC_UNPLUG bit clears POWER_ON_LINE even without samples"
         );
 
-        // Читаемое отключение: фантомная шина и ток на полу АЦП — тот же вердикт
-        // обеими ветвями, новая не меняет поведение `online_raw`.
+        // Readable unplug: the phantom bus and the current at the ADC floor give
+        // the same verdict from both branches, so the new one does not alter `online_raw`.
         let readable = online_raw_with_evidence(8_800_000, 4_400_000, IIN_FLOOR_UA, true, true);
         assert_eq!(readable, Some(false));
         assert!(!online_raw(8_800_000, 4_400_000, IIN_FLOOR_UA, true));
@@ -583,6 +589,6 @@ mod tests {
                 ONLINE_HOLD_MS,
             );
         }
-        assert!(!readable_run.held, "читаемое отключение снимает удержание");
+        assert!(!readable_run.held, "a readable unplug clears the hold");
     }
 }

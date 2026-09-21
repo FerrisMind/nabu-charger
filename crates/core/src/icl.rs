@@ -1,32 +1,32 @@
-//! Кодирование лимита входного тока в значение регистра.
+//! Encoding of the input current limit into a register value.
 //!
-//! В SMB лимит задаётся не в микроамперax, а номером ступени: значение
-//! приводится к сетке `min + n * step`. Константы взяты из эталонного драйвера
-//! Android (`DCIN_ICL_MIN_UA`, `DCIN_ICL_STEP_UA`, `USBIN_100MA`, `USBIN_500MA`).
+//! In SMB the limit is set not in microamperes but as a step number: the value is
+//! mapped onto the grid `min + n * step`. The constants are taken from the reference
+//! Android driver (`DCIN_ICL_MIN_UA`, `DCIN_ICL_STEP_UA`, `USBIN_100MA`, `USBIN_500MA`).
 //!
-//! Точная разрядность поля зависит от ревизии кристалла, поэтому сетка вынесена
-//! в структуру [`IclEncoding`] и может быть переопределена вызывающей стороной.
-//! Ядро всегда проверяет запись чтением (см. `ChargerConfig::verify_writes`).
+//! The exact field width depends on the chip revision, so the grid is moved into the
+//! [`IclEncoding`] structure and can be overridden by the caller.
+//! The core always verifies a write by reading it back (see `ChargerConfig::verify_writes`).
 
 use crate::error::ChargerError;
 
-/// Минимальный лимит входного тока по сетке SMB.
+/// Minimum input current limit on the SMB grid.
 pub const ICL_MIN_UA: u32 = 100_000;
 
-/// Шаг сетки лимита входного тока.
+/// Input current limit grid step.
 pub const ICL_STEP_UA: u32 = 100_000;
 
-/// Верхняя граница поля лимита в регистре (32 ступени).
+/// Upper bound of the limit field in the register (32 steps).
 pub const ICL_RAW_MAX: u8 = 0x1F;
 
-/// Сетка кодирования лимита входного тока.
+/// Encoding grid for the input current limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IclEncoding {
-    /// Нижняя ступень сетки в микроамперax.
+    /// Lowest grid step in microamperes.
     pub min_ua: u32,
-    /// Шаг сетки в микроамперax.
+    /// Grid step in microamperes.
     pub step_ua: u32,
-    /// Максимальное значение кода.
+    /// Maximum code value.
     pub raw_max: u8,
 }
 
@@ -41,22 +41,22 @@ impl Default for IclEncoding {
 }
 
 impl IclEncoding {
-    /// Максимальный ток, представимый этой сеткой.
+    /// Maximum current representable by this grid.
     #[must_use]
     pub const fn max_ua(&self) -> u32 {
         self.min_ua
             .saturating_add(self.step_ua.saturating_mul(self.raw_max as u32))
     }
 
-    /// Переводит ток в код регистра.
+    /// Converts a current into a register code.
     ///
-    /// Ток округляется **вниз** до ближайшей ступени: занизить ток безопасно,
-    /// завысить — значит перегрузить порт адаптера.
+    /// The current is rounded **down** to the nearest step: lowering the current is
+    /// safe, raising it means overloading the adapter port.
     ///
     /// # Errors
     ///
-    /// [`ChargerError::CurrentOutOfRange`], если ток ниже сетки или выше её
-    /// максимума, либо если шаг сетки нулевой.
+    /// [`ChargerError::CurrentOutOfRange`] if the current is below the grid or above
+    /// its maximum, or if the grid step is zero.
     pub fn encode(&self, icl_ua: u32) -> Result<u8, ChargerError> {
         let out_of_range = ChargerError::CurrentOutOfRange {
             requested_ua: icl_ua,
@@ -71,18 +71,18 @@ impl IclEncoding {
         if steps > u32::from(self.raw_max) {
             return Err(out_of_range);
         }
-        // steps уже сверен с raw_max (<= 255), поэтому преобразование не теряет данные.
+        // steps has already been checked against raw_max (<= 255), so the cast loses no data.
         u8::try_from(steps).map_err(|_| out_of_range)
     }
 
-    /// Переводит код регистра обратно в микроамперы.
+    /// Converts a register code back into microamperes.
     #[must_use]
     pub fn decode(&self, raw: u8) -> u32 {
         self.min_ua
             .saturating_add(self.step_ua.saturating_mul(u32::from(raw)))
     }
 
-    /// Приводит произвольный ток к сетке вниз, не выходя за нижнюю границу.
+    /// Rounds an arbitrary current down to the grid, without going below the lower bound.
     #[must_use]
     pub fn quantize_down(&self, icl_ua: u32) -> u32 {
         if self.step_ua == 0 || icl_ua <= self.min_ua {
@@ -109,7 +109,7 @@ mod tests {
         let grid = IclEncoding::default();
         for raw in 0..=ICL_RAW_MAX {
             let ua = grid.decode(raw);
-            assert_eq!(grid.encode(ua).expect("код должен кодироваться"), raw);
+            assert_eq!(grid.encode(ua).expect("the code must encode"), raw);
         }
     }
 
@@ -125,7 +125,7 @@ mod tests {
     #[test]
     fn rejects_current_below_the_grid() {
         let grid = IclEncoding::default();
-        let err = grid.encode(50_000).expect_err("ниже сетки");
+        let err = grid.encode(50_000).expect_err("below the grid");
         assert!(matches!(
             err,
             crate::ChargerError::CurrentOutOfRange {
@@ -140,7 +140,7 @@ mod tests {
         let grid = IclEncoding::default();
         let err = grid
             .encode(grid.max_ua().saturating_add(100_000))
-            .expect_err("выше сетки");
+            .expect_err("above the grid");
         assert!(matches!(err, crate::ChargerError::CurrentOutOfRange { .. }));
     }
 

@@ -1,73 +1,73 @@
-//! Телеметрия и журнал сеансов заряда.
+//! Telemetry and the journal of charge sessions.
 //!
-//! Модуль ведёт две вещи одновременно:
+//! The module keeps two things at once:
 //!
-//! * **кольцевой буфер отсчётов** — последние измерения (напряжения, ток,
-//!   температура, режим), годные для графика и для разбора инцидента;
-//! * **сеансы заряда** — интервалы, когда на входе есть питание; для каждого
-//!   хранятся длительность, пиковый ток, пиковая температура и признак того,
-//!   что устройство работало в режиме 2:1.
+//! * **a ring buffer of samples**: the latest measurements (voltages, current,
+//!   temperature, mode), good for a plot and for incident analysis;
+//! * **charge sessions**: the intervals when the input has power; each one keeps
+//!   its duration, peak current, peak temperature and a flag recording whether
+//!   the device ran in 2:1 mode.
 //!
-//! Ничего не аллоцируется: буферы фиксированного размера, поэтому модуль
-//! пригоден и для `no_std`-драйвера, и для хостовых тестов.
+//! Nothing is allocated: the buffers are fixed size, so the module suits both a
+//! `no_std` driver and host tests.
 
 use crate::encoding::OpMode;
 
-/// Размер кольцевого буфера отсчётов.
+/// Size of the sample ring buffer.
 pub const SAMPLE_RING: usize = 256;
-/// Сколько завершённых сеансов хранится в памяти.
+/// How many completed sessions are kept in memory.
 pub const SESSION_HISTORY: usize = 32;
 
-/// Один отсчёт телеметрии.
+/// One telemetry sample.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TelemetrySample {
-    /// Метка времени в миллисекундах монотонных часов.
+    /// Timestamp in milliseconds of a monotonic clock.
     pub ts_ms: u64,
-    /// Напряжение батареи, мкВ.
+    /// Battery voltage, µV.
     pub vbat_uv: u32,
-    /// Напряжение входа, мкВ.
+    /// Input voltage, µV.
     pub vbus_uv: u32,
-    /// Входной ток, мкА.
+    /// Input current, µA.
     pub iin_ua: u32,
-    /// Температура кристалла, десятые доли °C.
+    /// Die temperature, tenths of °C.
     pub die_temp_dc: i32,
-    /// Режим работы в момент отсчёта.
+    /// Operating mode at the moment of the sample.
     pub op_mode: OpMode,
-    /// Есть ли питание на входе.
+    /// Whether the input has power.
     pub input_present: bool,
-    /// Достоверно ли [`Self::vbat_uv`] (канал АЦП прочитан).
+    /// Whether [`Self::vbat_uv`] is valid (the ADC channel was read).
     ///
-    /// Отказ чтения даёт ноль, который неотличим от настоящего нуля: по такому
-    /// отсчёту нельзя ни резать ток, ни возвращать лимит к профильному.
+    /// A failed read yields zero, which is indistinguishable from a real zero:
+    /// such a sample can neither cut current nor restore the limit to the profile.
     pub vbat_valid: bool,
-    /// Достоверна ли [`Self::die_temp_dc`] (канал АЦП прочитан).
+    /// Whether [`Self::die_temp_dc`] is valid (the ADC channel was read).
     ///
-    /// Ноль градусов — это и «холодно», и «нет данных»: защита обязана различать
-    /// эти случаи, иначе возврат тока сработает по мусору, а `Stop` — по нулю.
+    /// Zero degrees is both "cold" and "no data": the guard must tell these
+    /// cases apart, or current restore fires on garbage and `Stop` on zero.
     pub die_temp_valid: bool,
 }
 
-/// Сеанс заряда: интервал, когда на входе было питание.
+/// Charge session: an interval during which the input had power.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChargeSession {
-    /// Начало сеанса, мс.
+    /// Session start, ms.
     pub started_ms: u64,
-    /// Конец сеанса, мс (`None`, пока сеанс идёт).
+    /// Session end, ms (`None` while the session is running).
     pub ended_ms: Option<u64>,
-    /// Сколько отсчётов попало в сеанс.
+    /// How many samples landed in the session.
     pub samples: u32,
-    /// Пиковый входной ток, мкА.
+    /// Peak input current, µA.
     pub peak_iin_ua: u32,
-    /// Пиковая температура кристалла, десятые °C.
+    /// Peak die temperature, tenths of °C.
     pub peak_die_temp_dc: i32,
-    /// Видели ли режим 2:1 (ускоренная зарядка).
+    /// Whether 2:1 mode was seen (fast charging).
     pub saw_switching: bool,
-    /// Видели ли режим bypass 1:1.
+    /// Whether 1:1 bypass mode was seen.
     pub saw_bypass: bool,
 }
 
 impl ChargeSession {
-    /// Пустой сеанс, начавшийся в `started_ms`.
+    /// Empty session that started at `started_ms`.
     #[must_use]
     pub const fn new(started_ms: u64) -> Self {
         Self {
@@ -81,7 +81,7 @@ impl ChargeSession {
         }
     }
 
-    /// Длительность сеанса в миллисекундах (для идущего — до `now_ms`).
+    /// Session duration in milliseconds (for a running one, up to `now_ms`).
     #[must_use]
     pub const fn duration_ms(&self, now_ms: u64) -> u64 {
         match self.ended_ms {
@@ -90,14 +90,14 @@ impl ChargeSession {
         }
     }
 
-    /// Был ли за сеанс хоть один момент ускоренной зарядки.
+    /// Whether there was at least one moment of fast charging in the session.
     #[must_use]
     pub const fn had_fast_mode(&self) -> bool {
         self.saw_switching
     }
 }
 
-/// Хранилище телеметрии: кольцо отсчётов плюс история сеансов.
+/// Telemetry storage: the sample ring plus the session history.
 #[derive(Debug)]
 pub struct Telemetry {
     samples: [Option<TelemetrySample>; SAMPLE_RING],
@@ -116,7 +116,7 @@ impl Default for Telemetry {
 }
 
 impl Telemetry {
-    /// Создаёт пустую телеметрию.
+    /// Creates empty telemetry.
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -130,10 +130,10 @@ impl Telemetry {
         }
     }
 
-    /// Принимает отсчёт и обновляет сеанс.
+    /// Accepts a sample and updates the session.
     ///
-    /// Сеанс начинается, когда появляется питание, и закрывается, когда оно
-    /// пропадает. Закрытый сеанс уходит в кольцо истории с ротацией.
+    /// A session opens when power appears and closes when it disappears. A closed
+    /// session goes into the history ring subject to rotation.
     pub fn push(&mut self, sample: TelemetrySample) {
         if let Some(slot) = self.samples.get_mut(self.sample_next) {
             *slot = Some(sample);
@@ -166,13 +166,13 @@ impl Telemetry {
         }
     }
 
-    /// Текущий (незакрытый) сеанс.
+    /// Current (open) session.
     #[must_use]
     pub const fn current(&self) -> Option<&ChargeSession> {
         self.current.as_ref()
     }
 
-    /// Последний завершённый сеанс.
+    /// Last completed session.
     #[must_use]
     pub fn last_completed(&self) -> Option<&ChargeSession> {
         let index = if self.session_next == 0 {
@@ -183,19 +183,19 @@ impl Telemetry {
         self.sessions.get(index).and_then(Option::as_ref)
     }
 
-    /// Всего начатых сеансов (включая текущий).
+    /// Total sessions started (including the current one).
     #[must_use]
     pub const fn session_total(&self) -> u64 {
         self.session_total
     }
 
-    /// Всего принятых отсчётов.
+    /// Total samples accepted.
     #[must_use]
     pub const fn sample_total(&self) -> u64 {
         self.sample_total
     }
 
-    /// Последний отсчёт.
+    /// Last sample.
     #[must_use]
     pub fn last_sample(&self) -> Option<&TelemetrySample> {
         let index = if self.sample_next == 0 {
@@ -206,7 +206,7 @@ impl Telemetry {
         self.samples.get(index).and_then(Option::as_ref)
     }
 
-    /// Вызывает замыкание для каждого сохранённого отсчёта в порядке поступления.
+    /// Calls the closure for every stored sample in arrival order.
     pub fn for_each_sample(&self, mut f: impl FnMut(&TelemetrySample)) {
         for index in 0..SAMPLE_RING {
             let position = (self.sample_next.saturating_add(index)) % SAMPLE_RING;
@@ -251,7 +251,7 @@ mod tests {
         let mut telemetry = Telemetry::new();
         telemetry.push(sample(1_000, true, 500_000, 300));
         telemetry.push(sample(2_000, true, 1_500_000, 420));
-        let current = telemetry.current().expect("сеанс идёт");
+        let current = telemetry.current().expect("session is running");
         assert_eq!(current.samples, 2);
         assert_eq!(current.peak_iin_ua, 1_500_000);
         assert_eq!(current.peak_die_temp_dc, 420);
@@ -259,7 +259,7 @@ mod tests {
 
         telemetry.push(sample(3_000, false, 0, 400));
         assert!(telemetry.current().is_none());
-        let closed = telemetry.last_completed().expect("сеанс закрыт");
+        let closed = telemetry.last_completed().expect("session closed");
         assert_eq!(closed.started_ms, 1_000);
         assert_eq!(closed.ended_ms, Some(3_000));
         assert_eq!(closed.duration_ms(9_999), 2_000);
@@ -298,7 +298,7 @@ mod tests {
         let mut plane = sample(1, true, 500_000, 300);
         plane.op_mode = OpMode::Bypass;
         telemetry.push(plane);
-        let session = telemetry.current().expect("сеанс");
+        let session = telemetry.current().expect("session");
         assert!(session.saw_bypass);
         assert!(!session.saw_switching);
         assert!(!session.had_fast_mode());

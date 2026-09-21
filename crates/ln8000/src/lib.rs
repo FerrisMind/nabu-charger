@@ -1,29 +1,29 @@
-//! Ядро драйвера charge pump LN8000 для Xiaomi Pad 5 (`nabu`).
+//! LN8000 charge pump driver core for the Xiaomi Pad 5 (`nabu`).
 //!
-//! LN8000 — вторая ступень зарядки: преобразователь 2:1, который позволяет
-//! брать от блока 9 В и отдавать в батарею удвоенный ток. В Android его
-//! обслуживает драйвер `ln8000_charger.c`; под Windows драйвера нет — этот
-//! крейт повторяет логику того драйвера в переносимом виде.
+//! The LN8000 is the second charging stage: a 2:1 converter that allows the
+//! adapter to supply 9 V and deliver double the current into the battery. On
+//! Android it is serviced by the `ln8000_charger.c` driver; under Windows there
+//! is no driver, so this crate repeats that driver's logic in portable form.
 //!
-//! # Что делает ядро
+//! # What the core does
 //!
-//! 1. Проверяет, что на шине именно LN8000 ([`Pump::open`]).
-//! 2. Настраивает пороги и защиты ([`Pump::configure`]) — как `ln8000_init_device()`.
-//! 3. Включает режим 2:1 и проверяет, что чип его принял ([`Pump::enable_switching`]).
-//! 4. Читает состояние и отказы ([`Pump::status`]), снимает показания АЦП
+//! 1. Checks that the device on the bus really is an LN8000 ([`Pump::open`]).
+//! 2. Configures thresholds and protections ([`Pump::configure`]) — as `ln8000_init_device()`.
+//! 3. Enables 2:1 mode and checks that the chip accepted it ([`Pump::enable_switching`]).
+//! 4. Reads status and faults ([`Pump::status`]), samples the ADC
 //!    ([`Pump::read_adc`]).
-//! 5. Умеет программный сброс ([`Pump::soft_reset`]) и перевод в standby
+//! 5. Can do a software reset ([`Pump::soft_reset`]) and switch to standby
 //!    ([`Pump::standby`], [`Pump::close`], [`Drop`]).
 //!
-//! # Границы ответственности
+//! # Responsibility boundaries
 //!
-//! * Крейт не знает про I²C-контроллер: транспорт — за трейтом [`RegisterBus`].
-//! * Крейт не спит: паузу после сброса и обслуживание сторожевого таймера
-//!   выполняет вызывающая сторона.
-//! * Крейт не управляет согласованием напряжения с блоком питания: это задача
-//!   Type-C/PD-части платформы, а не charge pump.
+//! * The crate knows nothing about the I²C controller: the transport is behind the
+//!   [`RegisterBus`] trait.
+//! * The crate does not sleep: the caller performs the post-reset delay and
+//!   the watchdog timer servicing.
+//! * The crate does not negotiate voltage with the adapter: that is the job of
 //!
-//! # Пример
+//! # Example
 //!
 //! ```
 //! use ln8000::testkit::MockPumpBus;
@@ -39,7 +39,7 @@
 //! assert_eq!(status.op_mode, OpMode::Switching);
 //!
 //! let vbat = pump.read_adc(AdcChannel::Vbat)?;
-//! println!("напряжение батареи: {vbat} мкВ");
+//! println!("battery voltage: {vbat} µV");
 //! # Ok(())
 //! # }
 //! ```
@@ -81,12 +81,12 @@ pub use guard::{
     evaluate, resolve_bypass,
 };
 pub use hvdcp_policy::{
-    ApsdElevate, Force9vWait, HVDCP_ERR_USBIN_UNAVAILABLE, HVDCP_PHASE_DONE, HVDCP_PHASE_FAILED,
+    ApsdElevate, FORCE9V_EXTEND_MS, FORCE9V_HARD_CAP_MS, FORCE9V_RISE_UV, FORCE9V_SETTLE_MS,
+    Force9vWait, HVDCP_ERR_USBIN_UNAVAILABLE, HVDCP_PHASE_DONE, HVDCP_PHASE_FAILED,
     HVDCP_PHASE_FIVE_V_BYPASS, HVDCP_PHASE_IDLE, HVDCP_SUPERUSER_RETRY_MAX,
     HVDCP_SUPERUSER_RETRY_MS, VIN_UNPLUG_MAX_UV, apsd_elevate_path, force9v_extended_deadline,
     force9v_step, input_present_from_vin, promote_qc_charger, should_renegotiate_on_input_edge,
-    should_schedule_superuser_retry, superuser_retry_due, FORCE9V_EXTEND_MS, FORCE9V_HARD_CAP_MS,
-    FORCE9V_RISE_UV, FORCE9V_SETTLE_MS,
+    should_schedule_superuser_retry, superuser_retry_due,
 };
 pub use qc35_auth::{
     ICL_RAW_QC35_2A, ICL_RAW_QC35_40W, QC35_18W_HI_UV, QC35_27W_HI_UV, QC35_27W_LO_UV,

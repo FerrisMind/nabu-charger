@@ -12,18 +12,18 @@ env:
 
 jobs:
   verify:
-    name: сборка, линтеры, тесты, документация
+    name: build, linters, tests, documentation
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Установить toolchain
+      - name: Install toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.97.0"
           components: rustfmt, clippy
 
-      - name: Кэш cargo
+      - name: Cargo cache
         uses: actions/cache@v4
         with:
           path: |
@@ -32,46 +32,46 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Форматирование
+      - name: Formatting
         run: cargo fmt --all --check
 
-      - name: Линтеры (включая педантичные правила, предупреждения как ошибки)
+      - name: Linters (including pedantic rules, warnings as errors)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Сборка релиза
+      - name: Release build
         run: cargo build --workspace --release
 
-      - name: Тесты
+      - name: Tests
         run: cargo test --workspace
 
-      - name: Документация (без внешних зависимостей)
+      - name: Documentation (without external dependencies)
         run: cargo doc --workspace --no-deps
         env:
           RUSTDOCFLAGS: "-D warnings"
 
-      - name: Проверка ядра без std
+      - name: No-std core check
         run: cargo build -p charger-core --no-default-features
 
   kernel-driver:
-    name: драйвер режима ядра (ARM64, WDK)
+    name: kernel-mode driver (ARM64, WDK)
     runs-on: windows-latest
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
-      - name: Установить toolchain и цель ARM64
+      - name: Install toolchain and the ARM64 target
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.97.0"
           targets: aarch64-pc-windows-msvc
 
-      - name: Установить cargo-wdk
+      - name: Install cargo-wdk
         run: cargo install cargo-wdk --locked
 
-      # Сборка ядровой части требует WDK и LLVM 17.x (на 23.x bindgen ломает разбор
-      # заголовков WDF). Шаг не валит сборку, пока базовая среда GitHub-раннера
-      # не приведена к нужной версии LLVM: см. docs/HANDOVER.md.
-      - name: Собрать драйвер под ARM64
+      # Building the kernel part needs the WDK and LLVM 17.x (on 23.x bindgen breaks
+      # parsing of the WDF headers). The step does not fail the build until the base
+      # GitHub runner image is pinned to the right LLVM version: see docs/HANDOVER.md.
+      - name: Build the driver for ARM64
         working-directory: crates/kmdf
         env:
           LIBCLANG_PATH: C:\Program Files\LLVM\bin

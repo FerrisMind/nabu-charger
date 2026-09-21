@@ -1,64 +1,64 @@
-//! Абстракция шины I²C, на которой сидит LN8000.
+//! Abstraction of the I²C bus the LN8000 sits on.
 //!
-//! Ядро драйвера не знает, как именно устроен транспорт. Реализации:
+//! The driver core does not know how the transport is built. Implementations:
 //!
-//! | Реализация | Где | Назначение |
+//! | Implementation | Where | Purpose |
 //! |---|---|---|
-//! | [`crate::testkit::MockPumpBus`] | этот крейт | тесты и демо без железа |
-//! | `SpbBus` | `crates/kmdf` | реальная шина: SpbCx/I²C поверх ACPI-ресурса `PEIC` |
+//! | [`crate::testkit::MockPumpBus`] | this crate | tests and demos without hardware |
+//! | `SpbBus` | `crates/kmdf` | real bus: SpbCx/I²C over the `PEIC` ACPI resource |
 
 use crate::error::BusError;
 use crate::regs::RegAddr;
 
-/// Доступ к регистрам LN8000.
+/// Access to the LN8000 registers.
 ///
-/// Адресация однобайтовая: чип принимает адрес регистра первым байтом
-/// транзакции.
+/// Addressing is single-byte: the chip takes the register address in the first
+/// byte of the transaction.
 pub trait RegisterBus {
-    /// Читает регистр.
+    /// Reads a register.
     ///
     /// # Errors
     ///
-    /// [`BusError`] при любом сбое шины.
+    /// [`BusError`] on any bus failure.
     fn read(&mut self, addr: RegAddr) -> Result<u8, BusError>;
 
-    /// Записывает регистр.
+    /// Writes a register.
     ///
     /// # Errors
     ///
-    /// [`BusError`] при любом сбое шины.
+    /// [`BusError`] on any bus failure.
     fn write(&mut self, addr: RegAddr, value: u8) -> Result<(), BusError>;
 
-    /// Сбрасывает состояние канала связи.
+    /// Resets the state of the communication channel.
     ///
     /// # Errors
     ///
-    /// [`BusError`], если канал не удалось восстановить.
+    /// [`BusError`] if the channel could not be recovered.
     fn reset(&mut self) -> Result<(), BusError>;
 
-    /// Короткое имя транспорта для журнала.
+    /// Short transport name for the journal.
     fn name(&self) -> &'static str;
 
-    /// Обновляет биты регистра, не трогая остальные (read-modify-write).
+    /// Updates register bits without touching the others (read-modify-write).
     ///
     /// # Errors
     ///
-    /// Пробрасывает ошибку чтения или записи.
+    /// Propagates the read or write error.
     fn update_bits(&mut self, addr: RegAddr, mask: u8, value: u8) -> Result<(), BusError> {
         let current = self.read(addr)?;
         let updated = (current & !mask) | (value & mask);
         self.write(addr, updated)
     }
 
-    /// Читает 10-битное значение из пары соседних регистров.
+    /// Reads a 10-bit value from a pair of adjacent registers.
     ///
-    /// Так устроены результаты АЦП LN8000: код занимает два байта (см.
-    /// `ln8000_bulk_read_reg(..., 2)` в эталонном драйвере). Транспорт вправе
-    /// переопределить метод и прочитать пару одной транзакцией.
+    /// This is how the LN8000 ADC results are laid out: the code occupies two bytes
+    /// (see `ln8000_bulk_read_reg(..., 2)` in the reference driver). A transport may
+    /// override the method and read the pair in a single transaction.
     ///
     /// # Errors
     ///
-    /// Пробрасывает ошибку чтения.
+    /// Propagates the read error.
     fn read_pair(&mut self, addr: RegAddr) -> Result<u16, BusError> {
         let low = self.read(addr)?;
         let high = self.read(addr.wrapping_add(1))?;

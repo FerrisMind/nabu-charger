@@ -1,16 +1,16 @@
-//! Монотонные часы процесса.
+//! Monotonic process clock.
 
 use charger_core::Clock;
 use std::time::Instant;
 
-/// Часы на основе [`Instant`]: монотонные, без перескоков системного времени.
+/// Clock based on [`Instant`]: monotonic, no system time jumps.
 #[derive(Debug, Clone, Copy)]
 pub struct SystemClock {
     start: Instant,
 }
 
 impl SystemClock {
-    /// Запускает отсчёт от текущего момента.
+    /// Starts counting from the current moment.
     #[must_use]
     pub fn start() -> Self {
         Self {
@@ -18,7 +18,7 @@ impl SystemClock {
         }
     }
 
-    /// Сколько времени прошло с момента запуска.
+    /// How much time has passed since the start.
     #[must_use]
     pub fn elapsed(&self) -> std::time::Duration {
         self.start.elapsed()
@@ -27,19 +27,19 @@ impl SystemClock {
 
 impl Clock for SystemClock {
     fn now_ms(&self) -> u64 {
-        // Время процесса не превысит u64::MAX миллисекунд за обозримый срок.
+        // Process time will not exceed u64::MAX milliseconds in any foreseeable period.
         u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 }
 
-/// Часы, которые можно сдвинуть руками: для детерминированных демонстраций.
+/// Clock that can be moved by hand: for deterministic demos.
 #[derive(Debug, Default)]
 pub struct AdjustableClock {
     offset_ms: std::sync::atomic::AtomicU64,
 }
 
 impl AdjustableClock {
-    /// Создаёт часы с нулевым смещением.
+    /// Creates a clock with zero offset.
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -47,7 +47,7 @@ impl AdjustableClock {
         }
     }
 
-    /// Добавляет смещение.
+    /// Adds an offset.
     pub fn advance_ms(&self, delta_ms: u64) {
         let _ = self
             .offset_ms

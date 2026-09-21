@@ -38,26 +38,27 @@ static mut REGISTRY_PATH: UNICODE_STRING = UNICODE_STRING {
 /// value was simply the initialiser, because VBAT is only sampled while
 /// telemetry runs and the OCV map was also feeding it a charging rail.
 static mut LAST_PCT: u32 = BATTERY_UNKNOWN_CAPACITY;
-/// Процент, о котором класс уже уведомлён ([`BATTERY_UNKNOWN_CAPACITY`] до первого).
+/// Percent the class has already been notified about ([`BATTERY_UNKNOWN_CAPACITY`]
+/// before the first one).
 ///
-/// Windows перечитывает батарею по нашему [`BatteryClassStatusNotify`], а не по
-/// собственному расписанию. Пока уведомление шло только на смену `power_state`,
-/// индикатор в разряде стоял на месте: живой замер 19.09 13:35–13:45 (блок
-/// отключён) — счётчик драйвера прошёл 162 → 158 (63 → 62 %), а
-/// `GetSystemPowerStatus` все восемь минут показывал 64, то есть значение,
-/// снятое на прошлом уведомлении; обновлялось оно лишь после перезагрузки в
-/// Android и обратно. Поэтому уведомляем и на смену процента.
+/// Windows re-reads the battery on our [`BatteryClassStatusNotify`], not on its own
+/// schedule. While the notification fired only on a `power_state` change, the tray
+/// indicator during discharge stood still: live measurement on 19.09 13:35-13:45
+/// (pack disconnected) - the driver counter went 162 -> 158 (63 -> 62 %), while
+/// `GetSystemPowerStatus` showed 64 for all eight minutes, that is the value taken
+/// at the previous notification; it refreshed only after rebooting into Android and
+/// back. So we notify on a percent change as well.
 static mut NOTIFIED_PCT: u32 = BATTERY_UNKNOWN_CAPACITY;
-/// Откуда взялся [`LAST_PCT`] (метка `SocSrc`).
+/// Where [`LAST_PCT`] came from (mark `SocSrc`).
 static mut SOC_SRC: u32 = SOC_SRC_NONE;
-/// Отказов чтения счётчика подряд (метка `SocFail`); успех обнуляет.
+/// Consecutive gauge read failures (mark `SocFail`); a success resets it.
 static mut GAUGE_FAILS: u32 = 0;
 
-/// Процент ещё ниоткуда не получен.
+/// Percent not obtained from anywhere yet.
 pub const SOC_SRC_NONE: u32 = 0;
-/// Процент прочитан из топливного счётчика PM8150B (`FG_MONOTONIC_SOC`).
+/// Percent read from the PM8150B fuel gauge (`FG_MONOTONIC_SOC`).
 pub const SOC_SRC_GAUGE: u32 = 1;
-/// Процент оценён по напряжению банки (линейная карта, только вне заряда).
+/// Percent estimated from the cell voltage (linear map, only outside charging).
 pub const SOC_SRC_VBAT: u32 = 2;
 /// Last VBAT sample (µV) used for SoC.
 static mut LAST_VBAT_UV: u32 = 0;
@@ -65,11 +66,11 @@ static mut LAST_VBAT_UV: u32 = 0;
 static mut LAST_VBUS_UV: u32 = 0;
 /// Last IIN sample (µA) — raw input of the charging hysteresis.
 static mut LAST_IIN_UA: u32 = 0;
-/// Гистерезис признака «адаптер онлайн»: один такт под порогом Vin не снимает
-/// `POWER_ON_LINE` (см. [`ONLINE_HOLD_MS`]).
+/// Hysteresis of the "adapter online" flag: a single tick below the Vin threshold
+/// does not clear `POWER_ON_LINE` (see [`ONLINE_HOLD_MS`]).
 static mut ONLINE_HOLD: Hold = Hold::new();
-/// Гистерезис признака «идёт заряд»: Iin падает до пола АЦП (39 мА) на каждом
-/// QC3-импульсе и переходе режима, поэтому удержание длиннее — [`CHARGING_HOLD_MS`].
+/// Hysteresis of the "charging" flag: Iin drops to the ADC floor (39 mA) on every
+/// QC3 pulse and mode transition, so the hold is longer - [`CHARGING_HOLD_MS`].
 static mut CHARGING_HOLD: Hold = Hold::new();
 /// Last published BattC power_state flags.
 static mut LAST_POWER_STATE: u32 = 0;
@@ -207,8 +208,8 @@ struct WmiLibContext {
 #[repr(i32)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
-// Имена повторяют значения WMI-диспозиции из заголовков WDK: префикс `Irp`
-// здесь несёт смысл (`SYSCTL_IRP_*`), поэтому общий префикс — не ошибка.
+// The names mirror the WMI disposition values from the WDK headers: the `Irp`
+// prefix carries meaning here (`SYSCTL_IRP_*`), so the common prefix is not a mistake.
 #[allow(clippy::enum_variant_names)]
 enum SysctlIrpDisposition {
     IrpProcessed = 0,
@@ -425,18 +426,18 @@ pub unsafe fn unload() {
 /// tick (not after a later poll) and keep counting down while discharging — the
 /// class driver re-reads the miniport on our notification, not on its own timer.
 ///
-/// `iin_peak_ua` — пик Iin за окно наблюдения (`DriverState::max_iin_ua`), а не
-/// мгновенный отсчёт: на такте QC3-импульса или перехода режима Iin лежит на полу
-/// АЦП (39 мА), и без пика признак заряда гас бы на каждом импульсе. `now_ms` —
-/// монотонное время того же такта.
+/// `iin_peak_ua` is the peak Iin over the observation window (`DriverState::max_iin_ua`),
+/// not an instantaneous sample: on a QC3 pulse or mode transition tick Iin sits at the
+/// ADC floor (39 mA), and without the peak the charging flag would drop on every
+/// pulse. `now_ms` is the monotonic time of the same tick.
 ///
-/// `input_readings_usable` — несёт ли такт вообще измерение входа. Ноль в этом
-/// телеметрическом отсчёте означает «нет отсчёта», а не «0 В»: отказ шины
-/// схлопывается в ноль на вызывающей стороне, а АЦП LN8000 уходит в
-/// автогибернацию через 4 с покоя и читается **успешно**, но с `0x00` во всех
-/// каналах (`encoding::vbat_reading_usable`). Такой такт не имеет права говорить
-/// «на входе 0 В, значит блока нет» и не старит удержание — кроме случая, когда
-/// железо само выставило `FAULT1` бит 4: тогда блок действительно отключён
+/// `input_readings_usable` says whether the tick carries any input measurement at
+/// all. A zero in this telemetry sample means "no sample", not "0 V": a bus failure
+/// collapses to zero on the caller side, and the LN8000 ADC goes into auto
+/// hibernation after 4 s of idle and then reads **successfully** but with `0x00` in
+/// every channel (`encoding::vbat_reading_usable`). Such a tick has no right to say
+/// "0 V at the input, so the pack is gone" and does not age the hold - except when
+/// the hardware itself set `FAULT1` bit 4: then the pack really is disconnected
 /// (`battery_policy::online_raw_with_evidence`).
 pub unsafe fn update_from_telemetry(
     vbat_uv: u32,
@@ -453,12 +454,12 @@ pub unsafe fn update_from_telemetry(
             LAST_VBAT_UV = vbat_uv;
         }
     }
-    // Счётчик достовернее любой оценки: пока он отвечает, напряжение банки в
-    // расчёт не идёт вовсе.
+    // The counter is more trustworthy than any estimate: while it answers, the
+    // cell voltage is not used in the calculation at all.
     //
-    // `None` — такт без отсчётов входа и без вердикта железа: удержание он не
-    // старит, поэтому и оценка по банке на нём не публикуется. «Не знаю» — не
-    // доказательство разряда, а `soc_percent(0)` на таком такте дал бы ноль.
+    // `None` is a tick with no input readings and no hardware verdict: it does not
+    // age the hold, so no cell-based estimate is published on it either. "No idea"
+    // is not proof of discharge, and `soc_percent(0)` on such a tick would give zero.
     let raw_online = battery_policy::online_raw_with_evidence(
         vbus_uv,
         vbat_uv,
@@ -472,9 +473,9 @@ pub unsafe fn update_from_telemetry(
             SOC_SRC = SOC_SRC_VBAT;
         }
     }
-    // Гистерезис считаем по «сырым» признакам такта, а в состояние пишем
-    // удержанное значение: сырое снятие Vin/Iin живёт один такт, а tray не
-    // должен перечитывать питание на каждый импульс QC3.
+    // The hysteresis is computed from the raw flags of the tick, while the held
+    // value is written to the state: a raw Vin/Iin removal lasts one tick, and the
+    // tray must not re-read the input on every QC3 pulse.
     let online_hold = unsafe { ONLINE_HOLD }.update_evidence(raw_online, now_ms, ONLINE_HOLD_MS);
     let charging_hold = unsafe { CHARGING_HOLD }.update(
         charging_raw(online_hold.held, iin_ua, iin_peak_ua),
@@ -490,11 +491,11 @@ pub unsafe fn update_from_telemetry(
     }
     let new_power = unsafe { LAST_POWER_STATE };
     let new_pct = unsafe { LAST_PCT };
-    // Смена процента — такой же повод перечитать батарею, как смена питания:
-    // в разряде `power_state` постоянен, и без этого условия индикатор замирал
-    // (см. [`NOTIFIED_PCT`]). Сравнение идёт с **уведомлённым** значением, а не
-    // с предыдущим [`LAST_PCT`]: если класс ещё не подключён, уведомление
-    // повторится на следующем такте, а не потеряется.
+    // A percent change is as good a reason to re-read the battery as a power
+    // change: during discharge `power_state` is constant, and without this condition
+    // the indicator froze (see [`NOTIFIED_PCT`]). The comparison is against the
+    // **notified** value, not the previous [`LAST_PCT`]: if the class is not attached
+    // yet, the notification repeats on the next tick instead of being lost.
     if new_power == prev_power && new_pct == unsafe { NOTIFIED_PCT } {
         return;
     }
@@ -507,21 +508,21 @@ pub unsafe fn update_from_telemetry(
     }
 }
 
-/// Публикует процент из топливного счётчика: `raw` — сырое `FG_MONOTONIC_SOC`.
+/// Publishes the percent from the fuel gauge: `raw` is the raw `FG_MONOTONIC_SOC`.
 ///
-/// Пересчёт взят у Android дословно (`fg_get_msoc`): `255` — это ровно 100 %,
-/// `0` — ровно 0, а промежуточные `1…254` растягиваются на `1…99`
-/// (`DIV_ROUND_CLOSEST((raw - 1) * 98, 253) + 1`). Линейное `raw * 100 / 255`
-/// расходится с ним уже на краях почти пустой банки: при `raw = 1` выходит 0 %
-/// вместо 1 %, из-за чего Windows показал бы «пусто» на банке, которая в
-/// Android ещё держит процент.
+/// The conversion is taken verbatim from Android (`fg_get_msoc`): `255` is exactly
+/// 100 %, `0` is exactly 0, and intermediate `1...254` are stretched onto `1...99`
+/// (`DIV_ROUND_CLOSEST((raw - 1) * 98, 253) + 1`). The linear `raw * 100 / 255`
+/// diverges from it already at the edges of a nearly empty cell: at `raw = 1` it
+/// gives 0 % instead of 1 %, which would make Windows show "empty" on a cell that
+/// Android still holds a percent on.
 pub unsafe fn set_gauge_raw(raw: u8) {
     let pct = if raw == 255 {
         100
     } else if raw == 0 {
         0
     } else {
-        // SAFETY: значения 1…254 дают максимум 99; 98 * 253 + 126 < u32::MAX.
+        // SAFETY: values 1...254 give at most 99; 98 * 253 + 126 < u32::MAX.
         (((u32::from(raw) - 1) * 98 + 126) / 253) + 1
     };
     unsafe {
@@ -531,12 +532,12 @@ pub unsafe fn set_gauge_raw(raw: u8) {
     }
 }
 
-/// Считает неудачные чтения счётчика подряд и возвращает новое число.
+/// Counts consecutive failed gauge reads and returns the new number.
 ///
-/// Живёт здесь, а не в состоянии драйвера: в такте телеметрии `pump` держит
-/// изменяемую ссылку на состояние, и второй раз её взять нельзя. Счётчик
-/// обнуляется первым же успешным чтением, поэтому ненулевое значение в метке
-/// `SocFail` означает именно серию отказов, а не их накопление за всё время.
+/// It lives here rather than in the driver state: during the telemetry tick `pump`
+/// holds a mutable reference to the state, and it cannot be taken a second time.
+/// The counter is reset by the first successful read, so a non-zero value in the
+/// `SocFail` mark means a run of failures, not their accumulation over all time.
 pub unsafe fn note_gauge_failure() -> u32 {
     unsafe {
         GAUGE_FAILS = GAUGE_FAILS.saturating_add(1);
@@ -544,7 +545,7 @@ pub unsafe fn note_gauge_failure() -> u32 {
     }
 }
 
-/// Источник опубликованного процента (метка `SocSrc`).
+/// Source of the published percent (mark `SocSrc`).
 pub fn last_soc_source() -> u32 {
     unsafe { SOC_SRC }
 }
@@ -574,9 +575,9 @@ pub fn last_power_state() -> u32 {
 fn build_status() -> BatteryStatus {
     let vbat = unsafe { LAST_VBAT_UV };
     let pct = unsafe { LAST_PCT };
-    // Удержанные признаки, а не мгновенные отсчёты: см. `update_from_telemetry`
-    // и `ln8000::battery_policy`. DISCHARGING считается от удержанного online —
-    // иначе один такт offline показывал бы «разряжается» на подключённом блоке.
+    // Held flags, not instantaneous samples: see `update_from_telemetry` and
+    // `ln8000::battery_policy`. DISCHARGING is computed from the held online -
+    // otherwise a single offline tick would show "discharging" on a connected pack.
     let online = unsafe { ONLINE_HOLD }.held;
     // `CHARGING` implies `POWER_ON_LINE`: the holds expire independently
     // (8 s vs 20 s), and a bare `0x4` mask — charging with no AC — is a

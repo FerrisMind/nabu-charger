@@ -1,9 +1,9 @@
-//! Хост-слой драйвера зарядки `nabu`: транспорт, часы, журнал, симулятор устройства.
+//! Host layer of the `nabu` charging driver: transport, clock, journal, device simulator.
 //!
-//! Ядро ([`core`]) не знает про операционную систему. Всё, что
-//! требует `std` — сокеты, файлы, `tracing`, потоки — живёт здесь.
+//! The core ([`core`]) knows nothing about the operating system. Everything that
+//! needs `std` (sockets, files, `tracing`, threads) lives here.
 //!
-//! # Быстрый старт
+//! # Quick start
 //!
 //! ```no_run
 //! use host::prelude::*;
@@ -14,21 +14,21 @@
 //! let journal = JsonlJournal::create("artifacts/journal.jsonl")?;
 //! let mut charger = Charger::open(transport, &clock, &journal, ChargerConfig::for_nabu())?;
 //! let outcome = run_until_ready(&mut charger, &clock, RunOptions::default(), |_| Ok(()))?;
-//! println!("адаптер: {} → {} мкА", outcome.adapter, outcome.plan.applied_icl_ua);
+//! println!("adapter: {} -> {} µA", outcome.adapter, outcome.plan.applied_icl_ua);
 //! # Ok(())
 //! # }
 //! ```
 //!
-//! # Состав
+//! # Layout
 //!
-//! | Модуль | Назначение |
+//! | Module | Purpose |
 //! |---|---|
-//! | [`clock`] | монотонные часы процесса |
-//! | [`mock`] | мок-транспорт с журналом транзакций (без железа) |
-//! | [`tcp`] | реальный транспорт по TCP к стенду или симулятору |
-//! | [`sim`] | симулятор устройства: регистры SMB и протокол транспорта |
-//! | [`journal`] | запись журнала в JSON Lines и мост в `tracing` |
-//! | [`runner`] | блокирующий цикл сессии для утилит и тестов |
+//! | [`clock`] | monotonic process clock |
+//! | [`mock`] | mock transport with a transaction log (no hardware) |
+//! | [`tcp`] | real TCP transport to a bench or simulator |
+//! | [`sim`] | device simulator: SMB registers and the transport protocol |
+//! | [`journal`] | journal recording to JSON Lines and a bridge into `tracing` |
+//! | [`runner`] | blocking session loop for tools and tests |
 
 pub mod clock;
 pub mod journal;
@@ -37,7 +37,7 @@ pub mod runner;
 pub mod sim;
 pub mod tcp;
 
-/// Часто используемые типы.
+/// Commonly used types.
 pub mod prelude {
     pub use crate::clock::SystemClock;
     pub use crate::journal::{Fanout, JsonlJournal, TracingJournal};

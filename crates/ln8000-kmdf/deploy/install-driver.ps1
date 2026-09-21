@@ -1,16 +1,16 @@
-﻿# install-driver.ps1 — установка драйвера charge pump LN8000 на планшет nabu
+﻿# install-driver.ps1 - install the LN8000 charge pump driver on the nabu tablet
 #
-# Запуск: PowerShell от имени администратора на планшете, из папки с пакетом:
+# Run: PowerShell as administrator on the tablet, from the folder with the package:
 #     .\install-driver.ps1
 #
-# Что делает:
-#   1) проверяет, что включена тестовая подпись драйверов (драйвер подписан
-#      тестовым сертификатом WDK);
-#   2) ставит пакет через pnputil;
-#   3) проверяет, что устройство ACPI\QCOM057E получило драйвер ln8000_kmdf;
-#   4) запускает службу и печатает состояние через диагностическую утилиту.
+# What it does:
+#   1) checks that test signing of drivers is enabled (the driver is signed with
+#      the WDK test certificate);
+#   2) installs the package through pnputil;
+#   3) checks that the ACPI\QCOM057E device got the ln8000_kmdf driver;
+#   4) starts the service and prints the state through the diagnostic tool.
 #
-# Откат: .\uninstall-driver.ps1
+# Rollback: .\uninstall-driver.ps1
 
 [CmdletBinding()]
 param(
@@ -26,7 +26,7 @@ function Assert-Admin {
   $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
   $principal = New-Object Security.Principal.WindowsPrincipal($identity)
   if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    throw 'нужны права администратора: перезапустите PowerShell от имени администратора'
+    throw 'administrator rights are required: restart PowerShell as administrator'
   }
 }
 
@@ -39,26 +39,26 @@ Assert-Admin
 
 $inf = Join-Path $PackageDir 'ln8000_kmdf.inf'
 if (-not (Test-Path -LiteralPath $inf)) {
-  throw "не найден $inf — положите рядом с скриптом пакет драйвера (inf, sys, cat)"
+  throw "not found: $inf - put the driver package (inf, sys, cat) next to the script"
 }
 
-Write-Host '=== 1. проверка подписи ===' -ForegroundColor Cyan
+Write-Host '=== 1. signature check ===' -ForegroundColor Cyan
 if (-not $SkipSignatureCheck) {
   if (Get-TestSigning) {
-    Write-Host '  тестовая подпись включена (testsigning Yes)' -ForegroundColor Green
+    Write-Host '  test signing is enabled (testsigning Yes)' -ForegroundColor Green
   } else {
-    Write-Host '  тестовая подпись ВЫКЛЮЧЕНА.' -ForegroundColor Yellow
-    Write-Host '  Драйвер подписан тестовым сертификатом WDK, поэтому включите режим:' -ForegroundColor Yellow
+    Write-Host '  test signing is DISABLED.' -ForegroundColor Yellow
+    Write-Host '  The driver is signed with the WDK test certificate, so enable the mode:' -ForegroundColor Yellow
     Write-Host '      bcdedit /set testsigning on' -ForegroundColor Yellow
-    Write-Host '  и перезагрузите планшет, затем повторите установку.' -ForegroundColor Yellow
-    throw 'тестовая подпись выключена'
+    Write-Host '  and reboot the tablet, then repeat the installation.' -ForegroundColor Yellow
+    throw 'test signing is disabled'
   }
 }
 
-Write-Host '=== 2. установка пакета ===' -ForegroundColor Cyan
+Write-Host '=== 2. installing the package ===' -ForegroundColor Cyan
 
-# Тестовый сертификат WDK должен быть в доверенных хранилищах, иначе pnputil
-# падает с 0x800B0109 (CERT_E_UNTRUSTEDROOT): одной тестовой подписи мало.
+# The WDK test certificate must be in the trusted stores, otherwise pnputil
+# fails with 0x800B0109 (CERT_E_UNTRUSTEDROOT): test signing alone is not enough.
 $cer = Join-Path $PackageDir 'WDRLocalTestCert.cer'
 if (Test-Path -LiteralPath $cer) {
   $thumb = (Get-PfxCertificate -FilePath $cer).Thumbprint
@@ -66,53 +66,53 @@ if (Test-Path -LiteralPath $cer) {
     $present = Get-ChildItem "Cert:\LocalMachine\$store" -ErrorAction SilentlyContinue |
       Where-Object { $_.Thumbprint -eq $thumb }
     if ($present) {
-      Write-Host "  сертификат уже в $store" -ForegroundColor DarkGray
+      Write-Host "  certificate already in $store" -ForegroundColor DarkGray
     } else {
       Import-Certificate -FilePath $cer -CertStoreLocation "Cert:\LocalMachine\$store" | Out-Null
-      Write-Host "  сертификат добавлен в $store" -ForegroundColor Green
+      Write-Host "  certificate added to $store" -ForegroundColor Green
     }
   }
 } else {
-  Write-Host '  WDRLocalTestCert.cer рядом нет — предполагаю, что сертификат уже установлен' -ForegroundColor DarkGray
+  Write-Host '  no WDRLocalTestCert.cer nearby - assuming the certificate is already installed' -ForegroundColor DarkGray
 }
 
 & pnputil /add-driver $inf /install
 $code = $LASTEXITCODE
-# 3010 — пакет установлен, нужна перезагрузка; 1641 — перезагрузка уже запущена.
-# Это успешные коды, а не ошибка.
-if ($code -notin @(0, 3010, 1641)) { throw "pnputil вернул код $code" }
+# 3010 - the package is installed, a reboot is needed; 1641 - a reboot is already pending.
+# These are success codes, not an error.
+if ($code -notin @(0, 3010, 1641)) { throw "pnputil returned code $code" }
 if ($code -ne 0) {
-  Write-Host "  пакет установлен, нужна перезагрузка (код $code)" -ForegroundColor Yellow
+  Write-Host "  package installed, a reboot is needed (code $code)" -ForegroundColor Yellow
 }
 
-Write-Host '=== 3. проверка привязки драйвера ===' -ForegroundColor Cyan
+Write-Host '=== 3. driver binding check ===' -ForegroundColor Cyan
 $device = Get-PnpDevice -PresentOnly | Where-Object { $_.InstanceId -like "*$hwid*" } | Select-Object -First 1
 if (-not $device) {
-  Write-Host "  устройство $hwid не найдено" -ForegroundColor Red
-  Write-Host '  проверьте, что загружен UEFI-образ с узлом PEIC (см. docs/DEPLOY-LN8000.md)' -ForegroundColor Yellow
+  Write-Host "  device $hwid not found" -ForegroundColor Red
+  Write-Host '  check that a UEFI image with the PEIC node is loaded (see docs/DEPLOY-LN8000.md)' -ForegroundColor Yellow
 } else {
   $driverService = (Get-PnpDeviceProperty -InstanceId $device.InstanceId -KeyName 'DEVPKEY_Device_Service' -ErrorAction SilentlyContinue).Data
-  Write-Host ("  устройство: " + $device.InstanceId)
-  Write-Host ("  состояние : " + $device.Status)
-  Write-Host ("  служба    : " + $driverService)
+  Write-Host ("  device  : " + $device.InstanceId)
+  Write-Host ("  status  : " + $device.Status)
+  Write-Host ("  service : " + $driverService)
   if ($driverService -ne $service) {
-    Write-Host "  ОЖИДАЛАСЬ служба $service — проверьте, что INF встал на этот _HID" -ForegroundColor Yellow
+    Write-Host "  expected service $service - check that the INF matched this _HID" -ForegroundColor Yellow
   }
 }
 
-Write-Host '=== 4. запуск службы ===' -ForegroundColor Cyan
+Write-Host '=== 4. starting the service ===' -ForegroundColor Cyan
 & sc.exe start $service 2>&1 | ForEach-Object { "  $_" }
 
-Write-Host '=== 5. состояние устройства ===' -ForegroundColor Cyan
+Write-Host '=== 5. device state ===' -ForegroundColor Cyan
 $diag = Join-Path $PackageDir 'nabu-ln8000.ps1'
 if (Test-Path -LiteralPath $diag) {
   & $diag status
 } else {
-  Write-Host '  диагностическая утилита nabu-ln8000.ps1 не найдена рядом со скриптом' -ForegroundColor Yellow
+  Write-Host '  diagnostic tool nabu-ln8000.ps1 not found next to the script' -ForegroundColor Yellow
 }
 
 Write-Host ''
-Write-Host 'Установка завершена. Дальше:' -ForegroundColor Green
-Write-Host '  .\nabu-ln8000.ps1 status      — режим и телеметрия'
-Write-Host '  .\nabu-ln8000.ps1 sessions    — сеансы заряда'
-Write-Host '  .\nabu-ln8000.ps1 journal out.jsonl — выгрузка журнала'
+Write-Host 'Installation complete. Next:' -ForegroundColor Green
+Write-Host '  .\nabu-ln8000.ps1 status      - mode and telemetry'
+Write-Host '  .\nabu-ln8000.ps1 sessions    - charge sessions'
+Write-Host '  .\nabu-ln8000.ps1 journal out.jsonl - export the journal'

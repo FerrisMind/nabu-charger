@@ -1,83 +1,83 @@
-# Архитектура
+# Architecture
 
-## Слои
+## Layers
 
 ```text
-┌──────────────────────────── пользовательский режим ────────────────────────────┐
-│  nabu-charger (CLI)  ·  тесты  ·  бенчмарки  ·  диагностические утилиты         │
+┌────────────────────────────────── user mode ───────────────────────────────────┐
+│  nabu-charger (CLI)  ·  tests  ·  benchmarks  ·  diagnostics tools              │
 └───────────────────────────────┬───────────────────────────────────────────────┘
                                 │ IOCTL (METHOD_BUFFERED)
-┌───────────────────────────────▼─────────────── ядро ОС ───────────────────────┐
-│  crates/kmdf — KMDF-драйвер                                                    │
-│    · EvtDeviceAdd: устройство, очередь запросов, транспорт SPMI                 │
+┌───────────────────────────────▼─────────────── OS kernel ─────────────────────┐
+│  crates/kmdf - KMDF driver                                                     │
+│    · EvtDeviceAdd: device, request queue, SPMI transport                        │
 │    · EvtIoDeviceControl: GET_STATUS / DETECT_START / SET_ICL / READ_REG …       │
-│    · таймер: неблокирующие шаги детекции                                       │
+│    · timer: non-blocking detection steps                                       │
 └───────────────────────────────┬───────────────────────────────────────────────┘
                                 │ ChargerTransport (trait)
-┌───────────────────────────────▼─────────────── ядро логики ───────────────────┐
-│  crates/core — charger-core (no_std, без unsafe)                               │
-│    · apsd      : разбор APSD → тип адаптера                                    │
-│    · policy    : тип → лимит тока, напряжение QC2, право на pump               │
-│    · icl       : ток ↔ код регистра (сетка 100 мА)                             │
-│    · driver    : состояния, таймауты, повторы, восстановление, Drop            │
-│    · journal   : записи о каждой операции                                      │
+┌───────────────────────────────▼─────────────── core logic ────────────────────┐
+│  crates/core - charger-core (no_std, no unsafe)                                │
+│    · apsd      : parsing APSD -> adapter type                                  │
+│    · policy    : type -> current limit, QC2 voltage, pump eligible             │
+│    · icl       : current <-> register code (100 mA grid)                       │
+│    · driver    : states, timeouts, retries, recovery, Drop                     │
+│    · journal   : a record for every operation                                  │
 └───────────────────────────────┬───────────────────────────────────────────────┘
-                                │ реализация транспорта
+                                │ transport implementation
         ┌───────────────────────┼───────────────────────┬───────────────────────┐
         ▼                       ▼                       ▼                       ▼
   SpmiTransport           MockTransport          TcpTransport          Simulator
-  \Device\RESOURCE_HUB    регистры в памяти      сеть к стенду/        TCP-сервер с
-  (реальное железо)       (тесты)                симулятору            регистрами SMB
+  \Device\RESOURCE_HUB    registers in memory    network to bench/    TCP server with
+  (real hardware)         (tests)                simulator            SMB registers
 ```
 
-## Почему ядро отделено от ОС
+## Why the core is separated from the OS
 
-Три причины, каждая проверена на практике:
+Three reasons, each verified in practice:
 
-1. **Тестируемость.** Вся логика, включая таймауты и восстановление после сбоев,
-   проверяется без железа: время приходит из трейта `Clock`, поэтому таймаут
-   воспроизводится мгновенно и детерминированно.
-2. **Отсутствие `unsafe`.** В ядре нет ни одного блока `unsafe` — весь
-   небезопасный код сосредоточен в транспорте (WDF, сокеты). Если ревизия ядра
-   найдёт ошибку, её можно исправить в драйвере без пересборки железа.
-3. **Переносимость проверок.** Ядро собирается и без `std`
-   (`cargo build -p charger-core --no-default-features`) — именно в таком виде
-   его использует драйвер режима ядра.
+1. **Testability.** All the logic, including timeouts and failure recovery, is
+   verified without hardware: time comes from the `Clock` trait, so a timeout is
+   reproduced instantly and deterministically.
+2. **No `unsafe`.** There is not a single `unsafe` block in the core - all the
+   unsafe code is concentrated in the transport (WDF, sockets). If a core revision
+   finds a bug, it can be fixed in the driver without rebuilding the hardware.
+3. **Portability of the checks.** The core also builds without `std`
+   (`cargo build -p charger-core --no-default-features`) - that is exactly the form
+   in which the kernel-mode driver uses it.
 
-## Ключевые решения
+## Key decisions
 
-| Решение | Почему так |
+| Decision | Rationale |
 |---|---|
-| Драйвер **не блокируется**: `detect_step()` возвращает `Pending` до готовности APSD | В режиме ядра нельзя спать в произвольном месте; тот же код работает и в CLI, где цикл крутит вызывающая сторона |
-| Ядро не измеряет время само (`Clock` извне) | Детерминированные тесты таймаутов: `ManualClock::advance_ms` вместо ожидания |
-| Все тексты в журнале — статические строки | Записи копируемы, без аллокаций, пригодны для `no_std` |
-| Ошибки — собственный enum с `core::error::Error` | Библиотечный код не паникует: нет `unwrap`, `expect`, `panic`; ошибка сообщает, можно ли продолжить работу (`is_recoverable`) |
-| `Drop` возвращает безопасный лимит тока | Выгрузка драйвера не должна оставлять порт в неизвестном состоянии; ошибки в `Drop` поглощаются и пишутся в журнал |
-| Коды и адреса регистров — константы из Android-драйвера | Поведение под Windows должно совпадать с поведением под Android, где зарядка работает |
+| The driver **does not block**: `detect_step()` returns `Pending` until the APSD is ready | In kernel mode one cannot sleep at an arbitrary place; the same code also works in the CLI, where the caller drives the loop |
+| The core does not measure time itself (`Clock` from outside) | Deterministic timeout tests: `ManualClock::advance_ms` instead of waiting |
+| All texts in the journal are static strings | Records are copyable, allocation-free, suitable for `no_std` |
+| Errors are a custom enum with `core::error::Error` | Library code does not panic: no `unwrap`, `expect`, `panic`; the error reports whether work can continue (`is_recoverable`) |
+| `Drop` restores a safe current limit | Unloading the driver must not leave the port in an unknown state; errors in `Drop` are swallowed and written to the journal |
+| Register codes and addresses are constants from the Android driver | Behaviour on Windows must match the behaviour on Android, where charging works |
 
-## Поток одной сессии
+## Flow of one session
 
 ```text
-open()            сброс канала → пробное чтение APSD_STATUS (проверка связи)
-detect_step()     APSD_STATUS → бит «детекция завершена»?
-                  ├─ нет: ждём; по таймауту — перезапуск APSD (CMD_APSD.APSD_RERUN)
-                  └─ да: APSD_RESULT_STATUS → образец → таблица → тип адаптера
-apply(type)       политика: лимит тока → USBIN_CURRENT_LIMIT_CFG (код по сетке 100 мА)
-                  + разрешение в CMD_ICL_OVERRIDE
-                  + для Quick Charge: напряжение в HVDCP_PULSE_COUNT_MAX
-                  + проверка каждой записи чтением
-monitor()         не сменился ли адаптер; при смене — заново apply()
-close()/Drop      безопасный лимит тока, запись в журнал
+open()            channel reset -> trial read of APSD_STATUS (link check)
+detect_step()     APSD_STATUS -> the "detection complete" bit?
+                  ├─ no: wait; on timeout - rerun APSD (CMD_APSD.APSD_RERUN)
+                  └─ yes: APSD_RESULT_STATUS -> pattern -> table -> adapter type
+apply(type)       policy: current limit -> USBIN_CURRENT_LIMIT_CFG (code on the 100 mA grid)
+                  + enable in CMD_ICL_OVERRIDE
+                  + for Quick Charge: voltage in HVDCP_PULSE_COUNT_MAX
+                  + verification of every write by a read
+monitor()         whether the adapter changed; on a change - apply() again
+close()/Drop      safe current limit, a record in the journal
 ```
 
-## Принятые допущения
+## Accepted assumptions
 
-* Сетка кодирования лимита тока (минимум 100 мА, шаг 100 мА, 32 ступени) взята из
-  констант Android-драйвера (`DCIN_ICL_MIN_UA`, `DCIN_ICL_STEP_UA`). Точная
-  разрядность поля зависит от ревизии кристалла, поэтому сетка вынесена в
-  `IclEncoding` и проверяется чтением после записи.
-* Типы адаптера и образцы регистра повторяют `smblib_apsd_results[]` из Android;
-  QC3.5 поднимается до `HVDCP3P5` только после аутентификации, иначе честно
-  сообщается `HVDCP3`.
-* Раскладка ответа шины SPMI для чтения регистра не подтверждена реверсом —
-  соответствующий путь возвращает типизированный отказ, а не догадку.
+* The current limit encoding grid (minimum 100 mA, step 100 mA, 32 steps) is taken
+  from the Android driver constants (`DCIN_ICL_MIN_UA`, `DCIN_ICL_STEP_UA`). The exact
+  field width depends on the chip revision, so the grid is factored out into
+  `IclEncoding` and verified by a read after the write.
+* The adapter types and register patterns follow `smblib_apsd_results[]` from Android;
+  QC3.5 is raised to `HVDCP3P5` only after authentication, otherwise `HVDCP3` is
+  reported honestly.
+* The layout of the SPMI bus response for a register read is not confirmed by
+  reverse engineering - the corresponding path returns a typed failure, not a guess.

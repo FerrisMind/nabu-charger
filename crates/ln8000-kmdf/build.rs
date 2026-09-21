@@ -1,4 +1,4 @@
-//! Сборочный скрипт драйвера LN8000: настраивает сборку WDK-библиотеки.
+//! LN8000 driver build script: configures the WDK library build.
 
 fn main() -> Result<(), wdk_build::ConfigError> {
     wdk_build::configure_wdk_binary_build()?;

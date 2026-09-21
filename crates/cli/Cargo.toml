@@ -1,6 +1,6 @@
 [package]
 name = "cli"
-description = "Утилита командной строки драйвера зарядки nabu: демонстрация, детекция, симулятор стенда"
+description = "Command-line tool for the nabu charging driver: demo, detection, bench simulator"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,7 +15,7 @@ name = "nabu-charger"
 path = "src/main.rs"
 
 [dependencies]
-# Имя зависимости не `core`: иначе clap-derive не находит `core::env` из std.
+# The dependency name is not `core`: otherwise clap-derive does not find `core::env` from std.
 charger_core = { package = "charger-core", path = "../core", version = "0.1.0" }
 host = { workspace = true }
 ln8000 = { workspace = true }

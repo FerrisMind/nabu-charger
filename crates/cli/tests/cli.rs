@@ -1,4 +1,4 @@
-//! Тесты командной строки: реальный запуск бинарника `nabu-charger`.
+//! Command-line tests: a real launch of the `nabu-charger` binary.
 
 #![allow(
     clippy::unwrap_used,
@@ -16,7 +16,7 @@ fn binary() -> PathBuf {
 
 #[test]
 fn demo_runs_and_writes_journal() {
-    let dir = tempfile::tempdir().expect("временный каталог");
+    let dir = tempfile::tempdir().expect("temporary directory");
     let journal = dir.path().join("demo.jsonl");
     let output = Command::new(binary())
         .arg("--log")
@@ -25,23 +25,26 @@ fn demo_runs_and_writes_journal() {
         .arg(&journal)
         .arg("demo")
         .output()
-        .expect("бинарник запускается");
+        .expect("the binary starts");
 
     assert!(
         output.status.success(),
-        "демо должно завершиться успешно: {}",
+        "the demo must complete successfully: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("HVDCP3P5"),
-        "в выводе есть родной блок: {stdout}"
+        "the output contains the stock charger: {stdout}"
     );
-    assert!(stdout.contains("3000000"), "в выводе есть лимит тока");
-    assert!(journal.exists(), "журнал создан");
+    assert!(
+        stdout.contains("3000000"),
+        "the output contains the current limit"
+    );
+    assert!(journal.exists(), "the journal was created");
 
-    let text = std::fs::read_to_string(&journal).expect("журнал читается");
-    assert!(text.lines().count() > 10, "журнал содержит записи");
+    let text = std::fs::read_to_string(&journal).expect("the journal is readable");
+    assert!(text.lines().count() > 10, "the journal contains records");
 }
 
 #[test]
@@ -51,17 +54,17 @@ fn verify_passes_self_check() {
         .arg("error")
         .arg("verify")
         .output()
-        .expect("бинарник запускается");
+        .expect("the binary starts");
     assert!(
         output.status.success(),
-        "самопроверка должна проходить: {}",
+        "the self-check must pass: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("самопроверка: пройдена"), "вывод: {stdout}");
+    assert!(stdout.contains("self-check: passed"), "output: {stdout}");
     assert!(
         stdout.contains("APSD_RESULT_STATUS"),
-        "паспорт содержит карту регистров"
+        "the spec contains the register map"
     );
 }
 
@@ -74,11 +77,11 @@ fn detect_reports_expected_current_for_mock_adapter() {
         .arg("--adapter")
         .arg("hvdcp2")
         .output()
-        .expect("бинарник запускается");
+        .expect("the binary starts");
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("HVDCP2"), "адаптер распознан: {stdout}");
-    assert!(stdout.contains("1500000"), "ток для QC2: {stdout}");
+    assert!(stdout.contains("HVDCP2"), "adapter detected: {stdout}");
+    assert!(stdout.contains("1500000"), "current for QC2: {stdout}");
 }
 
 #[test]
@@ -92,11 +95,11 @@ fn detect_fails_with_clear_error_on_dead_socket() {
         .arg("--addr")
         .arg("127.0.0.1:1")
         .output()
-        .expect("бинарник запускается");
+        .expect("the binary starts");
     assert!(
         !output.status.success(),
-        "подключение к закрытому порту даёт отказ"
+        "connecting to a closed port fails"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("ошибка:"), "понятное сообщение: {stderr}");
+    assert!(stderr.contains("error:"), "clear message: {stderr}");
 }

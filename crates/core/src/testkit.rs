@@ -1,8 +1,9 @@
-//! Эталонные инструменты для тестов и демонстраций: мок-транспорт и журнал в память.
+//! Reference tools for tests and demonstrations: a mock transport and an in-memory
+//! journal.
 //!
-//! Модуль включается фичей `testkit` (или автоматически в тестах) и не попадает в
-//! боевую сборку драйвера. Всё построено на фиксированных буферах: ни аллокаций,
-//! ни `unsafe`.
+//! The module is enabled by the `testkit` feature (or automatically in tests) and does
+//! not go into the production driver build. Everything is built on fixed buffers: no
+//! allocations, no `unsafe`.
 
 use crate::apsd::AdapterType;
 use crate::error::{TransportError, TransportErrorKind};
@@ -15,45 +16,45 @@ const MAX_REGS: usize = 64;
 const MAX_FAULTS: usize = 16;
 const MAX_LOG: usize = 128;
 
-/// Внесённый сбой: проверка ошибочных путей.
+/// Injected fault: exercising error paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fault {
-    /// Следующие `times` чтений указанного регистра падают с ошибкой.
+    /// The next `times` reads of the given register fail with an error.
     ReadError {
-        /// Адрес регистра.
+        /// Register address.
         addr: u16,
-        /// Категория ошибки.
+        /// Error category.
         kind: TransportErrorKind,
-        /// Сколько раз повторить.
+        /// How many times to repeat.
         times: u8,
     },
-    /// Следующие `times` записей указанного регистра падают с ошибкой.
+    /// The next `times` writes of the given register fail with an error.
     WriteError {
-        /// Адрес регистра.
+        /// Register address.
         addr: u16,
-        /// Категория ошибки.
+        /// Error category.
         kind: TransportErrorKind,
-        /// Сколько раз повторить.
+        /// How many times to repeat.
         times: u8,
     },
-    /// Канал пропадает на `times` операций чтения.
+    /// The link drops for `times` read operations.
     Disconnect {
-        /// Сколько операций подряд падают.
+        /// How many operations in a row fail.
         times: u8,
     },
-    /// После записи чтение возвращает другое значение (проверка `VerifyFailed`).
+    /// After a write, the read returns a different value (checks `VerifyFailed`).
     WrongReadBack {
-        /// Адрес регистра.
+        /// Register address.
         addr: u16,
-        /// Что вернуть при чтении.
+        /// What to return on read.
         value: u8,
-        /// Сколько раз повторить.
+        /// How many times to repeat.
         times: u8,
     },
 }
 
 impl Fault {
-    /// Сколько операций действует сбой.
+    /// How many operations the fault lasts for.
     #[must_use]
     pub const fn times(self) -> u8 {
         match self {
@@ -71,9 +72,9 @@ struct FaultSlot {
     remaining: u8,
 }
 
-/// Мок-транспорт с программируемыми регистрами и сбоями.
+/// Mock transport with programmable registers and faults.
 ///
-/// # Пример
+/// # Examples
 ///
 /// ```
 /// use core::testkit::{Fault, ScriptedMockTransport};
@@ -121,43 +122,43 @@ impl Default for ScriptedMockTransport {
 }
 
 impl ScriptedMockTransport {
-    /// Порт без питания: детекция не завершена.
+    /// Port with no power: detection does not complete.
     #[must_use]
     pub fn detached() -> Self {
         Self::default()
     }
 
-    /// Стандартный порт USB (500 мА).
+    /// Standard USB port (500 mA).
     #[must_use]
     pub fn sdp() -> Self {
         Self::for_adapter(AdapterType::Sdp)
     }
 
-    /// Порт зарядки (1.5 А).
+    /// Charging port (1.5 A).
     #[must_use]
     pub fn dcp() -> Self {
         Self::for_adapter(AdapterType::Dcp)
     }
 
-    /// Quick Charge 2.0 (1.5 А, 9 В).
+    /// Quick Charge 2.0 (1.5 A, 9 V).
     #[must_use]
     pub fn hvdcp2() -> Self {
         Self::for_adapter(AdapterType::Hvdcp2)
     }
 
-    /// Quick Charge 3.0 (3 А, 9 В).
+    /// Quick Charge 3.0 (3 A, 9 V).
     #[must_use]
     pub fn hvdcp3() -> Self {
         Self::for_adapter(AdapterType::Hvdcp3)
     }
 
-    /// Quick Charge 3.5 (родной блок планшета).
+    /// Quick Charge 3.5 (the tablet's own power brick).
     #[must_use]
     pub fn hvdcp3p5() -> Self {
         Self::for_adapter(AdapterType::Hvdcp3P5)
     }
 
-    /// Неизвестное сочетание битов в результате детекции.
+    /// Unknown combination of bits in the detection result.
     #[must_use]
     pub fn unknown_pattern() -> Self {
         let mut mock = Self::default();
@@ -166,7 +167,7 @@ impl ScriptedMockTransport {
         mock
     }
 
-    /// Мок, сообщающий указанный тип адаптера.
+    /// Mock that reports the given adapter type.
     #[must_use]
     pub fn for_adapter(adapter: AdapterType) -> Self {
         let mut mock = Self::default();
@@ -174,7 +175,7 @@ impl ScriptedMockTransport {
         mock
     }
 
-    /// Программирует регистры детекции под указанный адаптер.
+    /// Programs the detection registers for the given adapter.
     pub fn set_adapter(&mut self, adapter: AdapterType) {
         let mut status = regs::APSD_DTC_STATUS_DONE;
         if adapter.is_hvdcp() {
@@ -185,14 +186,14 @@ impl ScriptedMockTransport {
         self.status_reads.set(0);
     }
 
-    /// Задержка готовности: результат появится только после `reads` чтений `APSD_STATUS`.
+    /// Readiness delay: the result appears only after `reads` reads of `APSD_STATUS`.
     ///
-    /// Нужна для проверки ветки [`crate::Detection::Pending`] и таймаутов.
+    /// Needed to exercise the [`crate::Detection::Pending`] branch and timeouts.
     pub fn set_detection_ready_after(&self, reads: u8) {
         self.ready_after_reads.set(reads);
     }
 
-    /// Задаёт значение регистра.
+    /// Sets a register value.
     pub fn set_reg(&mut self, addr: u16, value: u8) {
         for index in 0..self.reg_count {
             if let Some(slot) = self.regs.get_mut(index) {
@@ -210,7 +211,7 @@ impl ScriptedMockTransport {
         }
     }
 
-    /// Текущее значение регистра модели.
+    /// Current value of the mock register.
     #[must_use]
     pub fn reg(&self, addr: u16) -> u8 {
         self.regs
@@ -220,7 +221,7 @@ impl ScriptedMockTransport {
             .map_or(0, |slot| slot.1)
     }
 
-    /// Вносит сбой.
+    /// Injects a fault.
     pub fn push_fault(&mut self, fault: Fault) {
         if self.fault_count < MAX_FAULTS {
             if let Some(slot) = self.faults.get_mut(self.fault_count) {
@@ -231,19 +232,19 @@ impl ScriptedMockTransport {
         }
     }
 
-    /// Журнал записей в порядке выполнения.
+    /// Journal of records in execution order.
     #[must_use]
     pub fn write_log(&self) -> &[(u16, u8)] {
         self.write_log.get(..self.write_count).unwrap_or(&[])
     }
 
-    /// Сколько раз транспорт сбрасывали.
+    /// How many times the transport was reset.
     #[must_use]
     pub fn reset_count(&self) -> u32 {
         self.reset_count.get()
     }
 
-    /// Находит действующий сбой нужного вида и расходует одну попытку.
+    /// Finds an active fault of the given kind and consumes one of its attempts.
     fn consume<F>(&mut self, predicate: F) -> Option<Fault>
     where
         F: Fn(&Fault) -> bool,
@@ -265,9 +266,9 @@ impl ScriptedMockTransport {
     fn take_read_fault(&mut self, addr: u16) -> Option<TransportError> {
         match self.consume(|f| matches!(f, Fault::ReadError { addr: a, .. } if *a == addr)) {
             Some(Fault::ReadError { kind, .. }) => {
-                Some(TransportError::new(kind, 0, "внесённый сбой чтения"))
+                Some(TransportError::new(kind, 0, "injected read fault"))
             }
-            Some(Fault::Disconnect { .. }) => Some(TransportError::disconnected("канал потерян")),
+            Some(Fault::Disconnect { .. }) => Some(TransportError::disconnected("link lost")),
             _ => None,
         }
     }
@@ -275,7 +276,7 @@ impl ScriptedMockTransport {
     fn take_write_fault(&mut self, addr: u16) -> Option<TransportError> {
         match self.consume(|f| matches!(f, Fault::WriteError { addr: a, .. } if *a == addr)) {
             Some(Fault::WriteError { kind, .. }) => {
-                Some(TransportError::new(kind, 0, "внесённый сбой записи"))
+                Some(TransportError::new(kind, 0, "injected write fault"))
             }
             _ => None,
         }
@@ -298,7 +299,7 @@ impl ChargerTransport for ScriptedMockTransport {
             let reads = self.status_reads.get().saturating_add(1);
             self.status_reads.set(reads);
             if reads <= self.ready_after_reads.get() {
-                // Детекция ещё не завершена: бит готовности снят.
+                // Detection has not completed yet: the ready bit is clear.
                 return Ok(self.reg(addr) & !regs::APSD_DTC_STATUS_DONE);
             }
         }
@@ -333,7 +334,7 @@ impl ChargerTransport for ScriptedMockTransport {
     }
 }
 
-/// Журнал в память: собирает события для проверок без аллокаций.
+/// In-memory journal: collects events for checks without allocations.
 #[derive(Debug)]
 pub struct VecJournal {
     events: RefCell<[Option<Event>; MAX_LOG]>,
@@ -347,7 +348,7 @@ impl Default for VecJournal {
 }
 
 impl VecJournal {
-    /// Создаёт пустой журнал.
+    /// Creates an empty journal.
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -356,25 +357,25 @@ impl VecJournal {
         }
     }
 
-    /// Сколько записей собрано.
+    /// How many records were collected.
     #[must_use]
     pub fn len(&self) -> usize {
         self.count.get()
     }
 
-    /// Пуст ли журнал.
+    /// Whether the journal is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Запись по индексу.
+    /// Record by index.
     #[must_use]
     pub fn at(&self, index: usize) -> Option<Event> {
         self.events.borrow().get(index).copied().flatten()
     }
 
-    /// Вызывает замыкание для каждой записи в порядке поступления.
+    /// Calls the closure for every record in arrival order.
     pub fn for_each(&self, mut f: impl FnMut(usize, &Event)) {
         let guard = self.events.borrow();
         for (index, slot) in guard.iter().take(self.len()).enumerate() {
@@ -384,7 +385,7 @@ impl VecJournal {
         }
     }
 
-    /// Первая запись указанного типа.
+    /// First record of the given kind.
     #[must_use]
     pub fn first_of(&self, kind: &str) -> Option<Event> {
         let found: Cell<Option<Event>> = Cell::new(None);
@@ -396,7 +397,7 @@ impl VecJournal {
         found.get()
     }
 
-    /// Сколько записей указанного типа.
+    /// How many records of the given kind.
     #[must_use]
     pub fn count_of(&self, kind: &str) -> usize {
         let count = Cell::new(0_usize);
@@ -408,7 +409,7 @@ impl VecJournal {
         count.get()
     }
 
-    /// Копия всех записей (только при наличии `std`).
+    /// Copy of all records (only with `std`).
     #[cfg(feature = "std")]
     #[must_use]
     pub fn all(&self) -> Vec<Event> {
