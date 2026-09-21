@@ -1,0 +1,112 @@
+; =====================================================================
+; ln8000-kmdf: LN8000 charge pump driver (Xiaomi Pad 5, nabu)
+;
+; Source:   ln8000_kmdf.inx -> ln8000_kmdf.inf
+; Device:   ACPI\QCOM057E (PEIC, I2C 0x51 on \_SB.I2C5)
+; Platform: Windows on ARM64 (aarch64-pc-windows-msvc)
+;
+; The PEIC node already exists in the tablet DSDT (_HID = QCOM057E,
+; _STA = 0x0F), so no ACPI changes are needed.
+;
+; ASCII ONLY. INF string values are read by setupapi as ANSI, so any
+; non-ASCII character (Cyrillic, em dash) turns into mojibake in Device
+; Manager. Russian explanations live in docs/, not in the INF.
+; =====================================================================
+
+[Version]
+Signature   = "$WINDOWS NT$"
+; Charge pump is NOT a battery device. Class=Battery made Windows treat
+; PEIC as a second battery that never implements BATTERY_* IOCTLs, so
+; Settings / Win32_Battery disappear (qcbattminiclass alone is not enough).
+; Match stock qcpmicEIC: System class.
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %ProviderString%
+PnpLockDown = 1
+; Must stay ABOVE tablet-bound oem142 (20.46.10.591). cargo-wdk stampinf
+; uses STAMPINF_VERSION when set (see deploy/build-arm64.ps1); without it
+; stampinf -v * stamps wall-clock and can fall below oem142 on AM rebuilds.
+DriverVer = 09/19/2026,20.47.10.660
+CatalogFile = ln8000_kmdf.cat
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskId1%,,,""
+
+[SourceDisksFiles]
+ln8000_kmdf.sys = 1,,
+
+; ================= device installation =================
+
+[Manufacturer]
+%StdMfg% = Ln8000,NTarm64.10.0...16299
+
+[Ln8000.NTarm64.10.0...16299]
+%Ln8000.DeviceDesc% = Ln8000_Device, ACPI\QCOM057E
+%Ln8000.DeviceDesc% = Ln8000_Device, ACPI\QCOM057E_PEIC
+
+[Ln8000_Device.NTarm64]
+CopyFiles = Drivers_Dir
+
+[Drivers_Dir]
+ln8000_kmdf.sys
+
+; ================= service installation =================
+
+[Ln8000_Device.NTarm64.Services]
+AddService = ln8000_kmdf, %SPSVCINST_ASSOCSERVICE%, Ln8000_Service_Inst
+
+[Ln8000_Service_Inst]
+DisplayName    = %Ln8000.SVCDESC%
+ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
+StartType      = 3               ; SERVICE_DEMAND_START
+ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %13%\ln8000_kmdf.sys
+
+; ================= parameters (profiles) =================
+; Defaults only; override in the registry without rebuilding the driver
+; (see docs/DEPLOY-LN8000.md, "profiles").
+
+[Ln8000_Device.NTarm64.HW]
+HKR, Parameters, IinLimitUa,      %REG_DWORD%, 2000000
+; FFC fv-max (qcom,fv-max-uv, dtbo-03) = 4.47 V; non-FFC (qcom,non-fcc-fv-max-uv)
+; = 4.45 V is the guard taper threshold. 4.42 V is only the QC3 loop limit.
+HKR, Parameters, VbatFloatUv,     %REG_DWORD%, 4470000
+HKR, Parameters, VacOvpUv,        %REG_DWORD%, 13000000
+; protection thresholds (tenths of degC) and currents (uA):
+; Пороги обязаны лежать выше температуры покоя кристалла этой платы: живой
+; замер 19.09 на .657 — 43,5-46,1 °C в простое (насос в standby) и 50,8 °C под
+; нагрузкой 2:1. Прежние 430/480/550 были ниже покоя, срез срабатывал
+; постоянно, а возврат (порог минус гистерезис 3,0 °C) был недостижим: предел
+; входного тока уходил на IinFloorUa и оставался там навсегда (живой
+; IIN_CTRL = 10, то есть 500 мА, при профиле 2,7 А).
+HKR, Parameters, TempReduceDc,    %REG_DWORD%, 550
+HKR, Parameters, TempBypassDc,    %REG_DWORD%, 600
+HKR, Parameters, TempStopDc,      %REG_DWORD%, 650
+HKR, Parameters, IinMaxUa,        %REG_DWORD%, 3500000
+HKR, Parameters, IinTargetUa,     %REG_DWORD%, 2000000
+HKR, Parameters, IinFloorUa,      %REG_DWORD%, 500000
+HKR, Parameters, VbatReduceUv,    %REG_DWORD%, 4450000
+HKR, Parameters, TelemetryMs,     %REG_DWORD%, 250
+HKR, Parameters, BusRetryCount,   %REG_DWORD%, 2
+HKR, Parameters, NtcAlarmCfg,     %REG_DWORD%, 226
+HKR, Parameters, WatchdogEnabled, %REG_DWORD%, 0
+; 0 = pump protections as in the tablet Device Tree, 1 = loops enabled.
+; Под Windows батарею ведёт не SMB5, а сам насос: при 0 (как в DTS) напряжение
+; ограничивает только аппаратный VBAT_OV ~ V_FLOAT*1.02, и чистая установка
+; молча теряла петли V_FLOAT/IIN. Поэтому умолчание — 1.
+HKR, Parameters, ProtectionProfile, %REG_DWORD%, 1
+
+; ================= strings =================
+
+[Strings]
+SPSVCINST_ASSOCSERVICE = 0x00000002
+REG_DWORD              = 0x00010001
+ProviderString         = "nabu-fastcharge"
+StdMfg                 = "(Standard system devices)"
+DiskId1                = "ln8000-kmdf installation disk #1"
+Ln8000.DeviceDesc      = "Charge pump LN8000 (PEIC) - Xiaomi Pad 5"
+Ln8000.SVCDESC         = "ln8000_kmdf - LN8000 charge pump driver"
+
