@@ -1562,8 +1562,16 @@ pub struct ChargeRegs {
     ///
     /// The vendor reads the sign the same way: `qcom/smb5-lib.c` (16.0 branch) treats
     /// the cell as charging at `ibat < -450 mA`, and `ti/cp_qc30.c` flips the sign of
-    /// the gauge current before use. On the live tablet the field is negative exactly
-    /// when the cell really is charging - "minus means charge".
+    /// the gauge current before use.
+    ///
+    /// **But the sign was measured on 22.09 not to discriminate the two directions on
+    /// this board**, so it must not be used as a direction witness: the field read
+    /// negative in *both* states - while the pump pushed ~3.5 A into a pack whose SOC
+    /// climbed 223 -> 234, and while the pack drained at 0.54 A with the cable out, the
+    /// cell falling 4.231 -> 4.221 V and the SOC falling 234 -> 233. The magnitude
+    /// matched the cell current in both cases; only the sign did not follow. The
+    /// direction used by the policy therefore comes from the SOC trend
+    /// (`battery_policy::SocTrend`), and this field stays a diagnostic.
     pub ibatt_ua: u32,
     /// Cell voltage from the PM8150B fuel gauge, µV. **Unsigned**: this pair has no
     /// sign, unlike the current.

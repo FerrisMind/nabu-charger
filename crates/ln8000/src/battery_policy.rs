@@ -27,6 +27,83 @@ pub const CHARGING_HOLD_MS: u64 = 20_000;
 /// and only the hold keeps `CHARGING` published.
 pub const IIN_CHARGING_UA: u32 = 80_000;
 
+/// How long a rise of the fuel counter's SOC keeps counting as charge evidence (ms).
+///
+/// The counter is the platform's own statement about the pack, and its *direction* is
+/// what the input node cannot supply: `FG_MONOTONIC_SOC` falls while the pack drains
+/// and rises while it fills, measured on 22.09 in both states. Its step is coarse
+/// (1/255 of the range, about 0.39 %), so a rise has to be remembered: at 1.5 A one step
+/// arrives every ~80 s, and this window is several steps wide.
+///
+/// A *fall* is not remembered at all - it clears the verdict on the spot, which is what
+/// keeps a weak brick honest (a pack draining behind a live input node is exactly the
+/// "discharging while the tray says charging" report from 19.09).
+pub const SOC_RISE_HOLD_MS: u64 = 300_000;
+
+/// The fuel counter's SOC and whether it is on the way up.
+///
+/// Deliberately **not** a comparison against a baseline taken `SOC_RISE_HOLD_MS` ago:
+/// that would drop the verdict for a whole step every time the window rolled over, and
+/// on a charging pack that is up to a minute and a half of "not charging" every five
+/// minutes. A rise is what the counter is asked for, and the verdict stands while rises
+/// keep arriving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SocTrend {
+    /// The previous raw SOC sample.
+    ///
+    /// `u8::MAX` means "nothing seen yet": it is above every legal sample (255 is exactly
+    /// 100 %), so the first sample cannot be mistaken for a rise.
+    prev_raw: u8,
+    /// Whether the last rise is recent enough to count.
+    pub rising: bool,
+    /// Monotonic time of the last rise, ms (zero - none yet).
+    pub last_rise_ms: u64,
+}
+
+impl SocTrend {
+    /// Nothing seen yet.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            prev_raw: u8::MAX,
+            rising: false,
+            last_rise_ms: 0,
+        }
+    }
+
+    /// Applies one raw SOC sample (`FG_MONOTONIC_SOC`, 0...255).
+    #[must_use]
+    pub const fn update(self, raw: u8, now_ms: u64) -> Self {
+        if raw > self.prev_raw {
+            return Self {
+                prev_raw: raw,
+                rising: true,
+                last_rise_ms: now_ms,
+            };
+        }
+        if raw < self.prev_raw {
+            // The pack is draining (or the counter re-estimated downwards): the verdict
+            // ends here rather than lingering for the rest of the window.
+            return Self {
+                prev_raw: raw,
+                rising: false,
+                last_rise_ms: self.last_rise_ms,
+            };
+        }
+        Self {
+            prev_raw: raw,
+            rising: self.rising && now_ms.saturating_sub(self.last_rise_ms) < SOC_RISE_HOLD_MS,
+            last_rise_ms: self.last_rise_ms,
+        }
+    }
+}
+
+impl Default for SocTrend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Held boolean plus the timestamp of the last raw `true`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Hold {
@@ -124,14 +201,29 @@ impl Default for Hold {
     }
 }
 
-/// Raw charging predicate before hysteresis: the adapter is held online and
-/// either the instantaneous `Iin` or the window peak is at/above [`IIN_CHARGING_UA`].
+/// Raw charging predicate before hysteresis: the adapter is held online and either the
+/// instantaneous `Iin` or the window peak is at/above [`IIN_CHARGING_UA`], or the fuel
+/// counter's SOC is on the way up ([`SocTrend`]).
 ///
-/// The peak matters because a single tick can read the ADC floor while the
-/// window as a whole is charging.
+/// The peak matters because a single tick can read the ADC floor while the window as a
+/// whole is charging. The SOC trend is the other witness, and it exists because the
+/// pump's `Iin` is blind whenever the current is carried by the platform's own buck: on
+/// a 5 V brick the live tablet charges at ~1.5 A with `Iin` on the 39 mA ADC floor
+/// (measured 22.09), and this predicate would otherwise never be true there.
+///
+/// The *direction* is why the SOC is the witness and not the counter's cell current: the
+/// current field carries a usable magnitude, but its sign was measured **not** to
+/// discriminate the two directions on this board (22.09: negative both while the pump
+/// pushed 3.5 A into a pack whose SOC climbed, and while the pack drained at 0.54 A with
+/// the cable out and the SOC falling). The SOC answered correctly in both states.
 #[must_use]
-pub const fn charging_raw(online_held: bool, iin_ua: u32, iin_peak_ua: u32) -> bool {
-    online_held && (iin_ua >= IIN_CHARGING_UA || iin_peak_ua >= IIN_CHARGING_UA)
+pub const fn charging_raw(
+    online_held: bool,
+    iin_ua: u32,
+    iin_peak_ua: u32,
+    soc_rising: bool,
+) -> bool {
+    online_held && (iin_ua >= IIN_CHARGING_UA || iin_peak_ua >= IIN_CHARGING_UA || soc_rising)
 }
 
 /// True adapter / USB rail floor (µV) when no current is flowing.
@@ -164,12 +256,32 @@ pub const VBUS_ELEVATED_UV: u32 = 6_000_000;
 /// charging floor is adapter evidence on its own. Unplugged input reads the
 /// 39 mA ADC floor, far below [`IIN_CHARGING_UA`], so the old guard still holds.
 ///
+/// The 4.6-6.0 V band is the one place where voltage alone cannot answer, because a
+/// 5 V brick with the pump out of transfer and a 5 V node with nothing behind it read
+/// the same there: measured on 22.09 at 20:34, a brick that really delivers current
+/// (the operator's meter showed it) read `Vin = 4 384 000-5 056 000`, a cell at
+/// `4 055 000`, `Iin` on the 39 120 uA floor and bit 4 clear in the windows between the
+/// driver's own pulses - every field identical to the floating node of 14:57. **Asking
+/// the band for current was tried on 22.09 and reverted**: with this brick the pump
+/// never reaches its mode (`LastEnableErr = -4`, `ModeNotReached`, twelve attempts), so
+/// no current ever flows, the band answered "no adapter" forever and the tray showed
+/// nothing while the tablet was charging. The band therefore stays voltage-only and the
+/// phantom route through it stays open; see `docs/FINDINGS.md` for why a single tick
+/// cannot separate the two cases and what a fix would have to measure instead.
+///
 /// `vac_unplug`: `FAULT1` bit 4 (`LN8000_MASK_VAC_UNPLUG_STS`, vendor
 /// `ln8000_charger.h:62`). The vendor answers **with this bit** the question "is
 /// VBUS" (`POWER_SUPPLY_PROP_TI_VBUS_PRESENT` → `!vac_unplug`,
 /// `ln8000_charger.c:948`), so unplug comes from the hardware, not from the ADC.
 /// Live measurement 19.09 with the cable unplugged: `FAULT1 = 0x30` (bit 4 set),
 /// `Vin = 8.80 V` with the cell at `4.40 V`, current 39 mA.
+///
+/// The bit is a live verdict on the node it reads, so it is only as good as that
+/// node: on 22.09 at 20:34 it was set in 290 ms windows every 15-40 s while the
+/// driver's own pulses were collapsing a working brick's output. That is why the
+/// unplug *release* in the KMDF tick requires the bit to hold for two ticks
+/// ([`unplug_release`]) while this function keeps answering on the single sample -
+/// the veto here is the old, measured behaviour.
 ///
 /// The order of the checks matters. Current comes first: it overrides both the
 /// `VAC_UNPLUG` latch and the "doubled" bus - if 2 A flows into the pack, the
@@ -192,10 +304,21 @@ pub const fn online_raw(vbus_uv: u32, vbat_uv: u32, iin_ua: u32, vac_unplug: boo
     if vbus_uv >= VBUS_ELEVATED_UV {
         return true;
     }
-    if vbus_uv < VBUS_ONLINE_UV {
+    // Below `VBUS_ELEVATED_UV` only two tests are left: the floor, and the headroom over
+    // the cell. There is deliberately **no** 4.6 V floor here any more. Measured on
+    // 22.09, a 5 V brick delivering ~1.5 A into the pack through the platform buck held
+    // the node at 4.40-4.54 V with the cell at 4.13-4.18 V, so the 4.6 V floor published
+    // "on battery" for the whole session while the operator's meter showed the current -
+    // and Windows applied the DC idle policy to a tablet sitting on a brick, which is the
+    // same failure the floor was introduced to prevent, reached from the other side. The
+    // comparator has already spoken above: a node below 4.6 V with bit 4 clear is a
+    // loaded adapter, and an unplugged node is not this case - with no cable the
+    // reflection is `2 · VBAT` (measured 8.46 V at a 4.23 V cell and 8.86 V at 4.43 V),
+    // which the doubling veto catches before this point.
+    if vbus_uv < VBUS_CHARGING_MIN_UV {
         return false;
     }
-    // 4.6–6.0 V: require Vin clearly above pack voltage so VBAT float ≠ AC.
+    // Vin must also be clearly above the pack so VBAT float is not read as AC.
     if vbat_uv > 0 && vbus_uv < vbat_uv.saturating_add(VBUS_ABOVE_VBAT_UV) {
         return false;
     }
@@ -237,6 +360,12 @@ pub const fn online_raw(vbus_uv: u32, vbat_uv: u32, iin_ua: u32, vac_unplug: boo
 /// `vac_unplug` is deliberately trusted only in the "not usable" case: while a
 /// real `Vin`/`Iin` measurement exists, [`online_raw`] keeps its current
 /// precedence (current first, then the bit) and its behaviour is untouched.
+///
+/// The fuel counter's SOC is deliberately **not** an input here. Its rise is a slow
+/// statement (one step per ~80 s at 1.5 A) about the cell, not about the node, so it
+/// belongs to the charging predicate, where it can be gated on an already-online adapter
+/// ([`charging_raw`]). Presence is decided by what answers on the tick it is read: the
+/// node's own readings and the hardware comparator.
 #[must_use]
 pub const fn online_raw_with_evidence(
     vbus_uv: u32,
@@ -250,6 +379,89 @@ pub const fn online_raw_with_evidence(
     }
     if vac_unplug {
         return Some(false);
+    }
+    None
+}
+
+/// How many consecutive ticks the hardware's "VBUS gone" verdict must hold before
+/// the online window is ended on the spot.
+///
+/// One tick is not enough, and that is a measurement rather than caution: on 22.09 at
+/// 20:34, with a working 5 V brick attached, `FAULT1` bit 4 came and went in **290 ms
+/// windows every 15-40 s** while the driver's own engagement pulses collapsed the
+/// adapter's output. Releasing on the first such tick dropped `POWER_ON_LINE` on every
+/// pulse, and with the pump unable to reach its mode (no current, so nothing re-armed
+/// the flag from the current branch) the tray stayed dark for the whole session. A real
+/// removal is different in exactly this respect: the bit asserted and then stayed set
+/// for hours (measured 14:57:30 -> 17:52, and two hours of quiescence before that).
+///
+/// **Three** rather than two because a 290 ms window is longer than the 250 ms
+/// telemetry tick: two samples can fall inside one window, so a run of two can be
+/// produced by a pulse alone. Three ticks span 750 ms, which no measured window
+/// reaches - and the price is 750 ms on a real removal, against the 7-8 s the window
+/// took before this path existed. A pulse longer than 750 ms is still handled: the
+/// release is no longer the end of it, because the fuel counter's next sample answers
+/// "the pack is taking charge" and re-arms the flag within [`HOLD_ARM_RUN`] ticks.
+pub const UNPLUG_RELEASE_RUN: u32 = 3;
+
+/// Whether this tick ends the online window at once, and the new run length.
+///
+/// Returns `(true, _)` when the hardware says VBUS is gone and no current is flowing
+/// into the pack for [`UNPLUG_RELEASE_RUN`] consecutive ticks: the window ends on this
+/// tick instead of after `ONLINE_HOLD_MS` (8 s), which is what a removal looks like from
+/// the tray. `run` is the caller's counter of consecutive qualifying ticks; a tick that
+/// does not qualify resets it to zero, so only a sustained verdict releases.
+///
+/// The current test is what keeps a stale bit from dropping a pack that is really
+/// charging, and the run length is what keeps the driver's own pulses from doing it.
+/// The current here is the pump's `Iin` and only it: the fuel counter is deliberately
+/// **not** part of this test, because its sample can be up to `GAUGE_POLL_MS` old and a
+/// history cannot outvote the live verdict of a removal. What keeps a long pulse from
+/// darkening the tray is the re-arming, not this predicate.
+#[must_use]
+pub const fn unplug_release(vac_unplug: bool, iin_ua: u32, run: u32) -> (bool, u32) {
+    if !vac_unplug || iin_ua >= IIN_CHARGING_UA {
+        return (false, 0);
+    }
+    let run = run.saturating_add(1);
+    (run >= UNPLUG_RELEASE_RUN, run)
+}
+
+/// What a tick should do about the ADC's power mode.
+///
+/// The LN8000 ADC hibernates on its own: init step 9 leaves `ADC_CTRL` in
+/// `AutoHibernate` with the `Sec4` delay, and about four seconds of pump idle are
+/// then enough for it to fall asleep (`docs/FINDINGS.md`, the hibernation
+/// section). A sleeping ADC is invisible: every channel reads successfully and
+/// returns `0x00`, so `Vin` is zero, `sample.input_present` is false and the
+/// driver's whole input path - charging, HVDCP, the online verdict - sees "no
+/// adapter". Nothing in the driver wakes it: `ADC_CTRL` is written only inside
+/// `Pump::configure()`, which runs at device start and on the shutdown-recovery
+/// paths, and those paths need a live input sample to be reached at all. So a
+/// brick that arrives while the ADC sleeps cannot be seen by anything except the
+/// hardware's own VBUS comparator (`FAULT1` bit 4), which keeps working.
+///
+/// That bit is what this predicate turns into an action:
+///
+/// * `Some(true)` - the hardware says VBUS is present (`vac_unplug` clear) but the
+///   samples are unusable, so the ADC is asleep and the tick must wake it
+///   (`ADC_CTRL` bits 5:7 = `Normal`). The next tick then carries real samples.
+/// * `Some(false)` - the hardware says VBUS is gone: there is nothing to measure,
+///   so the ADC may go back to `AutoHibernate` and save its idle current. This
+///   outranks the samples of the same tick: they are the last ones we get.
+/// * `None` - the samples are usable and VBUS is present: the ADC is awake and the
+///   mode is left alone.
+///
+/// Waking on the comparator is what makes an insertion visible at all from the
+/// sleeping state; letting it sleep again on the comparator is what keeps the
+/// awake ADC bounded to the time a source is actually attached.
+#[must_use]
+pub const fn adc_wake_needed(input_readings_usable: bool, vac_unplug: bool) -> Option<bool> {
+    if vac_unplug {
+        return Some(false);
+    }
+    if !input_readings_usable {
+        return Some(true);
     }
     None
 }
@@ -280,7 +492,7 @@ mod tests {
         assert!(st.held);
         // t = 500 ms: one QC3-pulse tick on the ADC floor must not clear CHARGING.
         let st = st.update(
-            charging_raw(true, IIN_FLOOR_UA, IIN_FLOOR_UA),
+            charging_raw(true, IIN_FLOOR_UA, IIN_FLOOR_UA, false),
             500,
             CHARGING_HOLD_MS,
         );
@@ -296,7 +508,7 @@ mod tests {
         while now < armed_at + 19_750 {
             now += TICK_MS;
             st = st.update(
-                charging_raw(true, IIN_FLOOR_UA, IIN_FLOOR_UA),
+                charging_raw(true, IIN_FLOOR_UA, IIN_FLOOR_UA, false),
                 now,
                 CHARGING_HOLD_MS,
             );
@@ -306,7 +518,7 @@ mod tests {
         while now < armed_at + 25_000 {
             now += TICK_MS;
             st = st.update(
-                charging_raw(true, IIN_FLOOR_UA, IIN_FLOOR_UA),
+                charging_raw(true, IIN_FLOOR_UA, IIN_FLOOR_UA, false),
                 now,
                 CHARGING_HOLD_MS,
             );
@@ -345,14 +557,95 @@ mod tests {
     fn window_peak_above_floor_keeps_charging() {
         // Instantaneous sample on the ADC floor, but the window peak is 2 A:
         // the raw predicate is still true, so nothing depends on the hold.
-        assert!(charging_raw(true, IIN_FLOOR_UA, 2_000_000));
+        assert!(charging_raw(true, IIN_FLOOR_UA, 2_000_000, false));
         let st = arm(true, CHARGING_HOLD_MS);
         assert!(st.held);
         // Both readings on the floor: the raw predicate is false and only the
         // hold keeps CHARGING published.
-        assert!(!charging_raw(true, IIN_FLOOR_UA, IIN_FLOOR_UA));
+        assert!(!charging_raw(true, IIN_FLOOR_UA, IIN_FLOOR_UA, false));
         // Offline: a peak current cannot make charging true.
-        assert!(!charging_raw(false, 2_000_000, 2_000_000));
+        assert!(!charging_raw(false, 2_000_000, 2_000_000, false));
+    }
+
+    #[test]
+    fn the_soc_trend_reports_the_direction_the_current_field_cannot() {
+        // Live 22.09: while charging (the pump in 2:1 at 8.9 V, ~3.5 A into the pack) the
+        // SOC climbed 220 -> 223 -> 233 -> 234 and the counter's current field read
+        // negative; with the cable out and the pack draining at 0.54 A (cell 4.231 ->
+        // 4.221 V, SOC 234 -> 233) the same field also read negative. The magnitude is
+        // usable, the sign is not - so the direction comes from the SOC itself.
+        let t = SocTrend::new();
+        assert!(!t.rising, "nothing seen yet is not a rise");
+        // The first sample is not a rise, whatever it is: the baseline is the previous
+        // sample, and there is none.
+        let t = t.update(220, 1_000);
+        assert!(!t.rising);
+        // A rise is remembered for the window.
+        let t = t.update(221, 2_000);
+        assert!(t.rising);
+        assert_eq!(t.last_rise_ms, 2_000);
+        // Repeating the same sample keeps the verdict while the rise is recent...
+        let t = t.update(221, 2_000 + SOC_RISE_HOLD_MS - 1);
+        assert!(t.rising);
+        // ...and drops it once the window is out, with no fall in between.
+        let t = t.update(221, 2_000 + SOC_RISE_HOLD_MS);
+        assert!(!t.rising, "an old rise is not evidence");
+        // A fall ends the verdict on the spot: this is what keeps a weak brick honest.
+        let t = SocTrend::new().update(234, 1_000);
+        let t = t.update(233, 2_000);
+        assert!(!t.rising);
+        // A rise after the fall starts a new verdict.
+        let t = t.update(234, 3_000);
+        assert!(t.rising);
+        assert_eq!(t.last_rise_ms, 3_000);
+        // `255` is exactly 100 %, so the sentinel above it cannot be a real sample and the
+        // first one can never be mistaken for a rise.
+        let t = SocTrend::new().update(255, 1_000);
+        assert!(!t.rising);
+    }
+
+    #[test]
+    fn a_loaded_five_volt_brick_is_online_again() {
+        // The operator's session on 22.09, field by field: Vin 4.416 V, Iin on the
+        // 39.12 mA ADC floor because the pump never reached its mode, FAULT1 bit 4 clear,
+        // the platform buck charging the pack at ~1.5 A and the meter showing it. The node
+        // chain answered "no adapter" for the whole session and the tray stayed dark.
+        const LIVE_VIN_UV: u32 = 4_416_000;
+        const LIVE_VBAT_UV: u32 = 4_145_000;
+        assert!(
+            online_raw(LIVE_VIN_UV, LIVE_VBAT_UV, IIN_FLOOR_UA, false),
+            "a node 271 mV above the cell with the comparator clear is a loaded adapter"
+        );
+        // The whole session in one row: the flag is published from this verdict.
+        assert_eq!(
+            online_raw_with_evidence(LIVE_VIN_UV, LIVE_VBAT_UV, IIN_FLOOR_UA, false, true),
+            Some(true)
+        );
+        // The floor that used to stand here: same row, verdict false, tray dark. The row
+        // has to stay below it for this test to be about the floor at all.
+        const { assert!(LIVE_VIN_UV < 4_600_000) };
+        // The pack itself is still rejected: a node at VBAT float is not an adapter, and
+        // neither is one below the 4.2 V floor.
+        assert!(!online_raw(LIVE_VBAT_UV, LIVE_VBAT_UV, IIN_FLOOR_UA, false));
+        assert!(!online_raw(4_250_000, 4_200_000, IIN_FLOOR_UA, false));
+        assert!(!online_raw(4_100_000, 4_100_000, IIN_FLOOR_UA, false));
+        // The unplugged node is the doubled reflection (measured 8.46 V at a 4.23 V cell
+        // and 8.86 V at 4.43 V), and the veto still catches it.
+        assert!(!online_raw(8_464_000, 4_232_000, IIN_FLOOR_UA, false));
+        assert!(!online_raw(8_864_000, 4_432_000, IIN_FLOOR_UA, false));
+        // The hardware's own "VBUS gone" outranks every voltage in the band.
+        assert!(!online_raw(LIVE_VIN_UV, LIVE_VBAT_UV, IIN_FLOOR_UA, true));
+        assert_eq!(
+            online_raw_with_evidence(0, 0, 0, true, false),
+            Some(false),
+            "an unreadable tick with the bit set is a removal"
+        );
+        // The charging flag on that same row comes from the SOC trend, because the pump's
+        // current is on the floor and the buck's current is invisible to it.
+        assert!(charging_raw(true, IIN_FLOOR_UA, IIN_FLOOR_UA, true));
+        assert!(!charging_raw(true, IIN_FLOOR_UA, IIN_FLOOR_UA, false));
+        // ...and only while the adapter is online: the trend cannot invent one.
+        assert!(!charging_raw(false, IIN_FLOOR_UA, IIN_FLOOR_UA, true));
     }
 
     #[test]
@@ -447,11 +740,35 @@ mod tests {
     }
 
     #[test]
-    fn idle_five_volt_adapter_is_online() {
-        // Floating 5 V brick, pack full, no current: still AC (VIN > VBAT+200 mV).
+    fn an_idle_five_volt_brick_is_online_even_with_no_current() {
+        // This test was briefly inverted on 22.09 ("the band needs current, because a
+        // floating node reads the same") and the inversion is what made a working brick
+        // invisible: at 20:34 a 5 V supply that really delivered current (the operator's
+        // meter showed it) read `Vin = 4 384 000-5 056 000` with the cell at `4 055 000`,
+        // `Iin` on the 39 120 uA floor and bit 4 clear between the driver's own pulses,
+        // while the pump never reached its mode (`ModeNotReached`) and therefore never
+        // drew current. With the band asking for current, the tray showed nothing at all
+        // for the whole session. Voltage-only is the measured-better answer here.
         assert!(online_raw(5_000_000, 4_300_000, 0, false));
-        // And exactly at the VBAT guard: 4.6 V against a 4.45 V pack is AC.
-        assert!(online_raw(4_600_000, 4_300_000, 0, false));
+        assert!(online_raw(5_000_000, 4_300_000, IIN_FLOOR_UA, false));
+        assert!(online_raw(4_600_000, 4_300_000, IIN_FLOOR_UA, false));
+        // Below the 4.6 V floor the band does not answer at all, current or not: that
+        // floor is what keeps a sagging rail out, and only current evidence (the first
+        // branch) can bring a source at 4.4 V back.
+        assert!(!online_raw(4_400_000, 4_300_000, IIN_FLOOR_UA, false));
+        assert!(online_raw(4_400_000, 4_300_000, 2_000_000, false));
+    }
+
+    #[test]
+    fn the_five_volt_band_still_rejects_the_doubled_bus() {
+        // The residual: a 5 V node with nothing behind it and a cell reading `Vin/2`
+        // (the pump's own converter rail) is still vetoed by the doubling test, which is
+        // the one guard in this band that the 22.09 measurement did not touch.
+        assert!(!online_raw(5_000_000, 2_500_000, IIN_FLOOR_UA, false));
+        assert!(!online_raw(5_056_000, 2_528_000, 0, false));
+        // The same node with a credible cell under it is a brick: `4 055 000` against
+        // `5 056 000` is not half, and that is the reading the tray must accept.
+        assert!(online_raw(5_056_000, 4_055_000, IIN_FLOOR_UA, false));
     }
 
     // --- Input sample validity (ADC hibernation / bus failure) -------------
@@ -484,6 +801,54 @@ mod tests {
         assert_eq!(TICK_NO_READING_VBUS_GONE, Some(false));
         // A readable tick goes through the full `online_raw` chain.
         assert_eq!(TICK_READING_ELEVATED, Some(true));
+    }
+
+    #[test]
+    fn a_removal_needs_three_ticks_but_the_drivers_own_pulses_never_reach_them() {
+        // The 22.09 20:34 pulse pattern: bit 4 set for 290 ms while the driver collapsed
+        // a working brick's output, then clear again. A 290 ms window is longer than the
+        // 250 ms telemetry tick, so one window can hold two samples: three consecutive
+        // ticks are the first run a single window cannot produce, and 750 ms is what a
+        // real removal costs here (against the 7-8 s the plain window took before this
+        // path existed).
+        let (release, run) = unplug_release(true, IIN_FLOOR_UA, 0);
+        assert!(!release, "the first tick of a verdict is not a removal");
+        assert_eq!(run, 1);
+        let (release, run) = unplug_release(false, IIN_FLOOR_UA, run);
+        assert!(!release);
+        assert_eq!(run, 0, "a clear bit resets the run");
+        let (release, run) = unplug_release(true, IIN_FLOOR_UA, 0);
+        assert!(!release, "one 290 ms window does not release");
+        let (release, run) = unplug_release(true, IIN_FLOOR_UA, run);
+        assert!(!release, "nor does a second window's worth of ticks");
+        assert_eq!(run, 2);
+        // A real removal: the bit asserts and stays asserted (measured 14:57:30 ->
+        // 17:52 with the node quiescent), so the third tick ends the window.
+        let (release, run) = unplug_release(true, IIN_FLOOR_UA, run);
+        assert!(release, "the third consecutive tick ends the online window");
+        assert_eq!(run, 3);
+        // Current into the pack always wins: a stale bit cannot drop a charging pack.
+        let (release, run) = unplug_release(true, 2_000_000, 5);
+        assert!(!release);
+        assert_eq!(run, 0, "a tick with current resets the run");
+    }
+
+    #[test]
+    fn the_hardware_comparator_wakes_a_sleeping_adc_and_puts_it_back_to_sleep() {
+        // Asleep with VBUS present (the brick arrived while the ADC was in
+        // `AutoHibernate`): the samples are unusable and bit 4 is clear, so the tick
+        // has to wake the chip - otherwise nothing on this platform can see the
+        // brick at all, because `input_present`, HVDCP and the engage decision all
+        // read `Vin`, and a sleeping ADC answers zero.
+        assert_eq!(adc_wake_needed(false, false), Some(true));
+        // Asleep with VBUS gone: there is nothing to measure, so it may sleep on.
+        assert_eq!(adc_wake_needed(false, true), Some(false));
+        // Awake with the source still there: nothing to do, the mode is left alone.
+        assert_eq!(adc_wake_needed(true, false), None);
+        // The comparator's "VBUS is gone" outranks the samples of that same tick:
+        // they are the last readings we will get, and the chip may go back to sleep
+        // at once - that is the idle current back, from the pull tick itself.
+        assert_eq!(adc_wake_needed(true, true), Some(false));
     }
 
     #[test]
@@ -590,5 +955,30 @@ mod tests {
             );
         }
         assert!(!readable_run.held, "a readable unplug clears the hold");
+    }
+
+    #[test]
+    fn hardware_unplug_with_no_current_ends_the_window_on_that_tick() {
+        // What the KMDF tick does when `FAULT1` bit 4 is set and `Iin` is below the
+        // charging floor: `update(false, now, 0)` rather than letting the 8 s window
+        // run. Measured on 22.09, the removal was visible in the telemetry in under a
+        // second and the OS heard about it 7-8 s later - the whole delay was the
+        // window, so the window is what this idiom removes.
+        let armed = arm(true, ONLINE_HOLD_MS);
+        assert!(armed.held);
+        let released = armed.update(false, 1_000, 0);
+        assert!(
+            !released.held,
+            "the unplug ends the window on the tick it is seen, not 8 s later"
+        );
+        // And the arming run restarts, so the next two true samples are required
+        // again before the flag returns.
+        assert!(!released.update(true, 1_250, ONLINE_HOLD_MS).held);
+        assert!(
+            released
+                .update(true, 1_250, ONLINE_HOLD_MS)
+                .update(true, 1_500, ONLINE_HOLD_MS)
+                .held
+        );
     }
 }

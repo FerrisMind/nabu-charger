@@ -8,7 +8,9 @@
 //! `IoWMIRegistrationControl(REGISTER)`.
 
 use core::ptr;
-use ln8000::battery_policy::{self, CHARGING_HOLD_MS, Hold, ONLINE_HOLD_MS, charging_raw};
+use ln8000::battery_policy::{
+    self, CHARGING_HOLD_MS, Hold, ONLINE_HOLD_MS, SocTrend, charging_raw,
+};
 use wdk::println;
 use wdk_sys::{
     call_unsafe_wdf_function_binding, IRP_MJ_DEVICE_CONTROL, IRP_MJ_SYSTEM_CONTROL, NTSTATUS,
@@ -72,6 +74,19 @@ static mut ONLINE_HOLD: Hold = Hold::new();
 /// Hysteresis of the "charging" flag: Iin drops to the ADC floor (39 mA) on every
 /// QC3 pulse and mode transition, so the hold is longer - [`CHARGING_HOLD_MS`].
 static mut CHARGING_HOLD: Hold = Hold::new();
+/// Consecutive ticks the hardware's "VBUS gone" verdict has held with no current.
+///
+/// Fed through [`battery_policy::unplug_release`] on every tick: it is what separates a
+/// real removal, where the bit asserts and stays asserted for hours, from the 290 ms
+/// windows the driver's own engagement pulses create on a working brick.
+static mut UNPLUG_RUN: u32 = 0;
+
+/// The fuel counter's SOC and whether it is on the way up - the direction witness for
+/// `CHARGING` (see [`ln8000::battery_policy::SocTrend`]).
+///
+/// It lives here, not in the driver state, because the sample arrives through
+/// [`set_gauge_raw`] on the same 30 s cadence as the percent.
+static mut SOC_TREND: SocTrend = SocTrend::new();
 /// Last published BattC power_state flags.
 static mut LAST_POWER_STATE: u32 = 0;
 /// Battery tag (non-zero = present).
@@ -438,7 +453,18 @@ pub unsafe fn unload() {
 /// every channel (`encoding::vbat_reading_usable`). Such a tick has no right to say
 /// "0 V at the input, so the pack is gone" and does not age the hold - except when
 /// the hardware itself set `FAULT1` bit 4: then the pack really is disconnected
-/// (`battery_policy::online_raw_with_evidence`).
+/// (`battery_policy::online_raw_with_evidence`), and with no current flowing the
+/// window ends on that tick rather than after `ONLINE_HOLD_MS`.
+///
+/// `soc_rising` is the fuel counter's direction for this tick
+/// ([`ln8000::battery_policy::SocTrend`], fed by [`set_gauge_raw`]): the pack's own SOC
+/// has risen recently. It is the only charging evidence that exists while the pump is
+/// idle, because LN8000 `Iin` measures the pump's own input and sits on the 39 mA floor
+/// when the platform buck carries the charge. Live 22.09: `Vin = 4.416 V`, `Iin` on the
+/// floor, the buck charging at ~1.5 A with the operator's meter showing it, and the tray
+/// published "on battery" for the whole session. The counter's cell current is *not* used
+/// for this: its sign was measured not to discriminate the two directions on this board
+/// (see the note on `ChargeRegs::ibatt_ua`).
 pub unsafe fn update_from_telemetry(
     vbat_uv: u32,
     vbus_uv: u32,
@@ -446,6 +472,7 @@ pub unsafe fn update_from_telemetry(
     iin_peak_ua: u32,
     vac_unplug: bool,
     input_readings_usable: bool,
+    soc_rising: bool,
     now_ms: u64,
 ) {
     let prev_power = unsafe { LAST_POWER_STATE };
@@ -476,9 +503,40 @@ pub unsafe fn update_from_telemetry(
     // The hysteresis is computed from the raw flags of the tick, while the held
     // value is written to the state: a raw Vin/Iin removal lasts one tick, and the
     // tray must not re-read the input on every QC3 pulse.
-    let online_hold = unsafe { ONLINE_HOLD }.update_evidence(raw_online, now_ms, ONLINE_HOLD_MS);
+    // A hardware unplug with no current into the pack ends the online window on the
+    // tick it is confirmed instead of after `ONLINE_HOLD_MS`. Measured on 22.09: the
+    // removal was visible in the telemetry in under a second and Windows was told about
+    // it 7-8 s later, every second of which was this hold; `FAULT1` bit 4 asserted on
+    // both real removals and never once in 8 685 samples of steady charging. Two
+    // guards keep it honest, and both are measurements rather than caution:
+    //
+    // * current into the pack wins outright, so a stale bit cannot drop the input while
+    //   the pack is really taking charge;
+    // * the verdict must hold for `UNPLUG_RELEASE_RUN` consecutive ticks - three, because
+    //   at 20:34 the same bit came and went in 290 ms windows every 15-40 s with a working
+    //   5 V brick attached (the driver's own engagement pulses collapse the adapter's
+    //   output) and a 290 ms window is longer than the 250 ms telemetry tick, so two
+    //   samples fit inside one window. Releasing on the first of those dropped
+    //   `POWER_ON_LINE` on every pulse, and with the pump unable to reach its mode there
+    //   was no current to re-arm it - the tray stayed dark for the whole session. The SOC
+    //   trend is deliberately not part of this test: a rise can be up to
+    //   `SOC_RISE_HOLD_MS` old, and a history cannot outvote the live verdict of a
+    //   removal. It is gated on `online_hold.held` instead, so it can never outlive one.
+    //
+    // The charging hold is deliberately left alone: `charging` is gated on `online`, so
+    // the icon drops with it, and an armed charging hold is what lets the icon come back
+    // quickly when the cable returns.
+    let (hardware_unplug, unplug_run) =
+        battery_policy::unplug_release(vac_unplug, iin_ua, unsafe { UNPLUG_RUN });
+    unsafe { UNPLUG_RUN = unplug_run };
+    let online_hold = if hardware_unplug {
+        // `hold_ms = 0`: the window ends on this tick.
+        unsafe { ONLINE_HOLD }.update(false, now_ms, 0)
+    } else {
+        unsafe { ONLINE_HOLD }.update_evidence(raw_online, now_ms, ONLINE_HOLD_MS)
+    };
     let charging_hold = unsafe { CHARGING_HOLD }.update(
-        charging_raw(online_hold.held, iin_ua, iin_peak_ua),
+        charging_raw(online_hold.held, iin_ua, iin_peak_ua, soc_rising),
         now_ms,
         CHARGING_HOLD_MS,
     );
@@ -516,7 +574,13 @@ pub unsafe fn update_from_telemetry(
 /// diverges from it already at the edges of a nearly empty cell: at `raw = 1` it
 /// gives 0 % instead of 1 %, which would make Windows show "empty" on a cell that
 /// Android still holds a percent on.
-pub unsafe fn set_gauge_raw(raw: u8) {
+///
+/// The same sample feeds [`SOC_TREND`], which is the direction witness for the charging
+/// flag: the raw counter falls while the pack drains and rises while it fills, and it is
+/// the only direction this platform can give (the cell current's sign was measured not to
+/// discriminate - see [`update_from_telemetry`]). `now_ms` is the monotonic time of the
+/// telemetry tick that carried the sample.
+pub unsafe fn set_gauge_raw(raw: u8, now_ms: u64) {
     let pct = if raw == 255 {
         100
     } else if raw == 0 {
@@ -529,7 +593,21 @@ pub unsafe fn set_gauge_raw(raw: u8) {
         LAST_PCT = pct;
         SOC_SRC = SOC_SRC_GAUGE;
         GAUGE_FAILS = 0;
+        SOC_TREND = SOC_TREND.update(raw, now_ms);
     }
+}
+
+/// Whether the fuel counter's SOC has risen recently ([`SOC_TREND`]).
+///
+/// Read by the telemetry tick and published as the `SocRising` mark, so a dark charging
+/// flag can be told apart from a counter that is simply not answering.
+pub fn soc_rising() -> bool {
+    unsafe { SOC_TREND.rising }
+}
+
+/// Monotonic time of the last SOC rise, ms (zero - none yet).
+pub fn soc_last_rise_ms() -> u64 {
+    unsafe { SOC_TREND.last_rise_ms }
 }
 
 /// Counts consecutive failed gauge reads and returns the new number.
