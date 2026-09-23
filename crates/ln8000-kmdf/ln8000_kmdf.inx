@@ -23,10 +23,13 @@ Class       = System
 ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
 Provider    = %ProviderString%
 PnpLockDown = 1
-; Must stay ABOVE tablet-bound oem142 (20.46.10.591). cargo-wdk stampinf
-; uses STAMPINF_VERSION when set (see deploy/build-arm64.ps1); without it
-; stampinf -v * stamps wall-clock and can fall below oem142 on AM rebuilds.
-DriverVer   = 09/19/2026,20.47.10.660
+; This value is a fallback and a record of the release; the build always stamps
+; STAMPINF_VERSION over it (deploy/build-arm64.ps1), because cargo-wdk passes
+; stampinf -v * otherwise and a wall-clock stamp can land below what the tablet
+; already has. It must stay ABOVE every ln8000_kmdf package already in the
+; tablet's DriverStore - a lower DriverVer is refused as "Outranked". The query
+; that lists them is in docs/RELEASE.md ("the Outranked trap").
+DriverVer   = 09/22/2026,20.47.10.672
 
 [DestinationDirs]
 DefaultDestDir = 13
