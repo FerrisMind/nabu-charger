@@ -188,7 +188,13 @@ repository, because a reader of a release note should not have to find them.
   (750 ms), so one pulse window cannot release the flag any more, but the
   doubled-VBUS route is still open and neither change has been verified against
   this defect on hardware yet.
-* **A plain 5 V brick shows AC immediately but "charging" only after the pack's
+* **The AC verdict arrives seconds after the cable, not with it.** The verdict itself
+  (`OnlineRaw`) is computed on the first tick that sees the adapter, but the state Windows
+  reads follows the *next* tick, and the pump bring-up runs inside the telemetry tick and
+  blocks it: measured 8.7 s from insertion to AC on a Quick Charge brick and 5.6 s on a
+  plain 5 V one. The removal side is faster - a live capture on this version shows Windows
+  on "battery" 1.1 s after the cable came out.
+* **A plain 5 V brick shows AC but "charging" only after the pack's
   fuel counter steps up**, which can take minutes at 1.5 A. The LN8000 never
   enters a mode there (`LastEnableErr = -4`, `ModeNotReached`), so the platform's
   own buck carries the current and the pump sees none of it - `Iin` sits on its

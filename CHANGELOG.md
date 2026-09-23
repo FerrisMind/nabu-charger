@@ -33,8 +33,12 @@ working brick invisible, and the operator's meter - not the tray - was telling t
   `VBUS_ELEVATED_UV` the decision is now the 4.2 V floor plus the headroom over the cell,
   with the comparator having already spoken above it. An unplugged node is not this case -
   with no cable the reflection is `2 · VBAT` (measured 8.46 V at a 4.23 V cell and 8.86 V
-  at 4.43 V), which the doubling veto catches first. Windows now sees the adapter
-  (`pwr = 1`) on the first tick.
+  at 4.43 V), which the doubling veto catches first. The verdict itself (`OnlineRaw = 1`)
+  comes on the first tick that sees a live adapter; what Windows reads follows the next
+  tick, and the pump bring-up runs inside the telemetry tick and blocks it - measured 8.7 s
+  from insertion to `pwr = 1` on a Quick Charge brick (and 5.6 s on a plain 5 V one, where
+  the bring-up ends in `ModeNotReached`). Publishing the verdict before the bring-up is the
+  next change, not this release.
 
 * **The charging flag had no witness at all while the pump is idle.** LN8000 `Iin`
   measures the pump's own input, so when the platform buck carries the charge it sits on

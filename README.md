@@ -75,6 +75,7 @@ reachable.
 
 | Defect | What it does |
 |---|---|
+| AC arrives seconds after the cable | The verdict (`OnlineRaw`) is on the first tick, but Windows reads the *next* one and the pump bring-up blocks the tick: measured **8.7 s** from insertion to `pwr = 1` on a Quick Charge brick, 5.6 s on a plain 5 V one. Fix planned, not in this release |
 | Die temperature is published while the ADC hibernates | `AdcValid` bit 1 is reported for a channel that is asleep, so **160.0 °C** is published and every consumer prints it faithfully |
 | LN8000 VBAT reads low | 42–43 mV below the fuel gauge, and that channel feeds the 2:1 gate |
 | `EngageState` disagrees with `SuMode` | Publishes 4 (NO_HEADROOM) while `SuMode` stays 3 (switching); mark-only noise |
