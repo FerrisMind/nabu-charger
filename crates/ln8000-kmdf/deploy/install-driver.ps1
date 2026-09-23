@@ -35,6 +35,13 @@ function Get-TestSigning {
   return ($out -match 'testsigning\s+Yes')
 }
 
+# Secure Boot ignores the testsigning setting, so a test-signed package cannot load with
+# it on. `Confirm-SecureBootUEFI` throws where the firmware is not UEFI (not this tablet),
+# so $null means "cannot tell" and the check stays silent rather than guessing.
+function Get-SecureBoot {
+  try { return [bool](Confirm-SecureBootUEFI) } catch { return $null }
+}
+
 Assert-Admin
 
 $inf = Join-Path $PackageDir 'ln8000_kmdf.inf'
@@ -52,6 +59,14 @@ if (-not $SkipSignatureCheck) {
     Write-Host '      bcdedit /set testsigning on' -ForegroundColor Yellow
     Write-Host '  and reboot the tablet, then repeat the installation.' -ForegroundColor Yellow
     throw 'test signing is disabled'
+  }
+  # Secure Boot ignores the testsigning setting entirely, so a test-signed package is
+  # refused with it on even when the mode above reads Yes.
+  if ((Get-SecureBoot) -eq $true) {
+    Write-Host '  Secure Boot is ENABLED.' -ForegroundColor Yellow
+    Write-Host '  A test-signed driver cannot load while Secure Boot is on:' -ForegroundColor Yellow
+    Write-Host '  turn it off in the UEFI settings and repeat the installation.' -ForegroundColor Yellow
+    throw 'Secure Boot is enabled'
   }
 }
 
@@ -89,7 +104,8 @@ Write-Host '=== 3. driver binding check ===' -ForegroundColor Cyan
 $device = Get-PnpDevice -PresentOnly | Where-Object { $_.InstanceId -like "*$hwid*" } | Select-Object -First 1
 if (-not $device) {
   Write-Host "  device $hwid not found" -ForegroundColor Red
-  Write-Host '  check that a UEFI image with the PEIC node is loaded (see docs/DEPLOY-LN8000.md)' -ForegroundColor Yellow
+  Write-Host '  check that a UEFI image with the PEIC node is loaded' -ForegroundColor Yellow
+  Write-Host '  (the release archive ships INSTALL.md; the repository has docs/DEPLOY-LN8000.md)' -ForegroundColor Yellow
 } else {
   $driverService = (Get-PnpDeviceProperty -InstanceId $device.InstanceId -KeyName 'DEVPKEY_Device_Service' -ErrorAction SilentlyContinue).Data
   Write-Host ("  device  : " + $device.InstanceId)
