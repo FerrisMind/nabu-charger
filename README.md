@@ -23,18 +23,20 @@ porting Windows to a nabu-class tablet rather than using this driver.
 
 ## Project status
 
-Latest release: **0.3.0**, carrying driver **20.47.10.665** — the installable ARM64 package
-is attached to it (`nabu-ln8000-driver-0.3.0-arm64.zip`). That package is the one the release
-notes describe, including the access policy verified there — a process that is not elevated
-is refused with `ERROR_ACCESS_DENIED` (5).
+Latest release: **0.3.1**, carrying driver **20.47.10.672** — the installable ARM64 package
+is attached to it (`nabu-ln8000-driver-0.3.1-arm64.zip`). That is the package installed on
+the development tablet (`oem166.inf`, device node `OK` / `CM_PROB_NONE`), and the numbers
+below were measured on it: a Quick Charge brick negotiated to 8.3 V, `Iin` 0.23–1.28 A, SoC
+196 → 199, the charging flag 338 ms after the verdict, and the unplug released in 1.1 s.
 
-The development tablet has moved ahead of it: it runs **20.47.10.672** (`oem166.inf`), the
-in-tree 0.3.1 build, device node `OK` / `CM_PROB_NONE`. The 0.3.1 archive is built
-(`nabu-ln8000-driver-0.3.1-arm64.zip`) and not published.
+The previous release, **0.3.0** (driver 20.47.10.665), introduced the access policy verified
+there — a process that is not elevated is refused with `ERROR_ACCESS_DENIED` (5).
 
 **At a glance:** ✅ fast charging from a Quick Charge brick · ✅ live pump telemetry ·
-⚠️ a Power Delivery supply still does not grow the pack · ⚠️ the AC-verdict flap behind
-the backlight reset — the release run is 750 ms in 0.3.1, not yet verified against it
+⚠️ a Power Delivery supply still does not grow the pack · ⚠️ the AC-verdict flap behind the
+backlight reset — the removal path is now three ticks (750 ms) and was measured at 1.1 s
+from cable-out, but the doubled-VBUS route, which reads a pump that has left switching as
+"no adapter", is still open
 
 Every row below rests on a measurement on the tablet, not on a passing test. Where a
 defect is listed as unfixed, a live capture shows it happening — the evidence is in

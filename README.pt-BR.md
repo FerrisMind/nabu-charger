@@ -26,19 +26,21 @@ você estiver portando o Windows para um tablet da classe nabu, e não usando es
 
 ## Estado do projeto
 
-Última versão: **0.3.0**, com o driver **20.47.10.665** — o pacote ARM64 instalável está
-anexado a ela (`nabu-ln8000-driver-0.3.0-arm64.zip`). É esse pacote que as notas da versão
-descrevem, incluindo a política de acesso verificada nele — um processo sem elevação é
-recusado com `ERROR_ACCESS_DENIED` (5).
+Última versão: **0.3.1**, com o driver **20.47.10.672** — o pacote ARM64 instalável está
+anexado a ela (`nabu-ln8000-driver-0.3.1-arm64.zip`). É esse pacote que está instalado no
+tablet de desenvolvimento (`oem166.inf`, nó do dispositivo em `OK` / `CM_PROB_NONE`), e as
+medições abaixo foram feitas nele: uma fonte Quick Charge negociou até 8.3 V, `Iin`
+0.23–1.28 A, carga 196 → 199, o sinalizador de carregamento 338 ms após o veredito e a
+remoção liberada em 1.1 s.
 
-O tablet de desenvolvimento avançou além dela: nele está **20.47.10.672** (`oem166.inf`),
-a compilação 0.3.1 desta árvore, com o nó do dispositivo em `OK` / `CM_PROB_NONE`. O arquivo
-0.3.1 está montado (`nabu-ln8000-driver-0.3.1-arm64.zip`) e não publicado.
+A versão anterior, **0.3.0** (driver 20.47.10.665), introduziu a política de acesso
+verificada nela — um processo sem elevação é recusado com `ERROR_ACCESS_DENIED` (5).
 
 **Resumo:** ✅ carregamento rápido com uma fonte Quick Charge · ✅ telemetria ao vivo da
 bomba · ⚠️ uma fonte Power Delivery ainda não aumenta a carga da bateria · ⚠️ a queda do
-veredito de CA por trás do reset do brilho — a liberação passou a 750 ms na 0.3.1, ainda
-não verificada contra o defeito
+veredito de CA por trás do reset do brilho — a liberação passou a três ticks (750 ms) e foi
+medida em 1.1 s a partir da remoção do cabo, mas a rota do veto de duplicação, que lê uma
+bomba que saiu da comutação como "sem fonte", continua aberta
 
 Cada linha abaixo se apoia em uma medição feita no tablet, não em um teste que passou.
 Onde um defeito está marcado como não corrigido, uma captura ao vivo mostra o defeito
