@@ -5,6 +5,106 @@ and versions follow [SemVer](https://semver.org/lang/ru/).
 
 ## [Unreleased]
 
+Four changes to the input-presence and charging decisions, all measured on the
+development tablet on 22.09 (`docs/FINDINGS.md`). Two of them are **reversals of fixes
+made earlier the same day**: requiring current in the 4.6-6.0 V band, and the 4.6 V floor
+that band was built on. Both were undone because the measurement showed they make a
+working brick invisible, and the operator's meter - not the tray - was telling the truth.
+
+### Added
+
+* **Three marks that name the reason for an AC verdict**, so a rejection can be told from a
+  sleeping ADC in one dump: `VbatTickMv` is the `vbat_uv` the tick actually used, next to
+  `DoubledVeto` (`vin_is_doubled_vbat` on that value) and `OnlineRaw` (1 online, 0 offline,
+  2 no evidence). The tick's `vbat_uv` is the ADC's VBAT channel - a converter node, not the
+  cell, and it reads `Vin / 2` in switching - so below 6 V the floor, the veto and the
+  headroom test all rest on a node whose meaning moves with the pump's state, and a live
+  rejection could not be attributed without it.
+
+### Fixed
+
+* **A working 5 V brick was published as "on battery" for a whole session.** Measured with
+  the operator's brick delivering ~1.5 A into the pack through the platform's own SMB5
+  buck: `Vin = 4 400 000-4 544 000` (the loaded node), cell `4 130 000-4 180 000`,
+  `Iin` on the 39 120 uA ADC floor because the pump never reaches its mode, `FAULT1` bit 4
+  **clear** (the hardware comparator saying the bus is present), and the tray on
+  `BattPwr = 2` with Windows applying the DC idle policy to a tablet sitting on a brick.
+  The 4.6 V floor (`VBUS_ONLINE_UV`) is what rejected it, so the floor is gone: below
+  `VBUS_ELEVATED_UV` the decision is now the 4.2 V floor plus the headroom over the cell,
+  with the comparator having already spoken above it. An unplugged node is not this case -
+  with no cable the reflection is `2 · VBAT` (measured 8.46 V at a 4.23 V cell and 8.86 V
+  at 4.43 V), which the doubling veto catches first. Windows now sees the adapter
+  (`pwr = 1`) on the first tick.
+
+* **The charging flag had no witness at all while the pump is idle.** LN8000 `Iin`
+  measures the pump's own input, so when the platform buck carries the charge it sits on
+  the ADC floor and `CHARGING` could never be published - the operator's complaint, with
+  his meter showing the current. The witness is now the fuel counter's SOC
+  (`battery_policy::SocTrend`, fed by the 30 s gauge poll): it rises while the pack fills
+  and falls while it drains, and a fall clears the verdict on the spot. The counter's
+  *cell current* was rejected for this role on measurement, not on principle: on 22.09 it
+  read **negative in both directions** - while the pump pushed ~3.5 A into a pack whose SOC
+  climbed `223 -> 234`, and while the pack drained at 0.54 A with the cable out and the SOC
+  falling `234 -> 233`. The magnitude matched the cell current in both states; the sign did
+  not follow, so the field stays a diagnostic (`FgIbatUa`) and the SOC decides. New marks
+  `SocRising` and `SocRiseAgeMs`.
+
+* **A removal took 7-8 s to reach Windows, and every second of it was the hold.** With the
+  cable pulled, `FAULT1` bit 4 asserted within one telemetry tick, and the 8 s
+  `ONLINE_HOLD_MS` window then kept `POWER_ON_LINE` published until it expired (measured:
+  `14:57:30.816 -> 14:57:38.842`, 8.03 s). The tick now ends the online window on the spot
+  when the hardware says the input is gone *and* no current is flowing into the pack
+  (`crates/ln8000-kmdf/src/battery.rs`). The current test keeps the existing rule that a
+  stale bit cannot drop the input while the pack is really charging. The charging hold is
+  deliberately left armed: `charging` is gated on `online`, so the flag still drops with it
+  and still returns quickly when the cable comes back. **The verdict must hold for three
+  consecutive ticks** (`battery_policy::UNPLUG_RELEASE_RUN`): on 22.09 at 20:34 the same bit
+  came and went in 290 ms windows every 15-40 s with a working 5 V brick attached, because
+  the driver's own engagement pulses collapse the adapter's output, and releasing on the
+  first of them kept the tray dark for the whole session. A 290 ms window is longer than the
+  250 ms telemetry tick, so *two* samples fit inside one window - three ticks (750 ms) are
+  the first run a window cannot produce, and that is the whole cost of a real removal now.
+  The SOC trend is deliberately not part of this test: a rise can be up to
+  `SOC_RISE_HOLD_MS` old, and a history cannot outvote the live verdict of a removal.
+
+* **The 4.6-6.0 V band published AC for an input that was not there** - measured
+  4 928 000-5 072 000 uV with the pump engaged and `Iin` on the 39 120 uA ADC floor, cable
+  out, five seconds of it. Requiring current in that band was tried and **reverted the same
+  day** (see the bullet above): with this brick the pump never reaches its mode, so no
+  current ever flows and the band answered "no adapter" forever while the tablet charged.
+  The band stays voltage-only; the phantom route through it stays open and is documented as
+  such in `docs/FINDINGS.md`, because a single tick cannot separate the two cases.
+
+* **A hibernated ADC made an insertion invisible, with nothing in the driver able to wake
+  it.** The LN8000 ADC leaves initialisation in `AutoHibernate` with the `Sec4` delay, so
+  about four seconds of pump idle put it to sleep; a sleeping ADC reads *successfully* with
+  `0x00` in every channel, so `Vin` is zero, `sample.input_present` is false, and charging,
+  HVDCP and the online verdict all see "no adapter" - while `ADC_CTRL` is written only
+  inside `Pump::configure()`, which runs at device start and on recovery paths that need a
+  live sample to be reached at all. Measured after the 20.47.10.666 install: `AdcValid` bit
+  0 set, `SuVinUv = 0`, `SuIin = 0`, `BattVbat = 0` with the telemetry tick demonstrably
+  alive (`SocAgeMs` advancing between two reads 6 s apart). The tick now uses the hardware's
+  own VBUS comparator, which keeps working while the ADC sleeps
+  (`battery_policy::adc_wake_needed`): VBUS present with unusable samples wakes the chip
+  (`Pump::set_adc_mode(AdcMode::Normal)`), VBUS gone returns it to `AutoHibernate` so the
+  idle current comes back. New marks `AdcAwake` and `AdcWakeN` make both visible in a dump.
+  The 20:34 event shows the chip waking on the brick by itself (`usable = 1` with
+  `awake = 0` before any write), so this is a safety net rather than the cure it first
+  looked like.
+
+### Changed
+
+* Driver version **20.47.10.672** (package version 0.3.1). It has to outrank the
+  `20.47.10.671` package on the development tablet: a lower DriverVer is refused as
+  "Outranked".
+
+## [0.3.0] - 2026-09-22
+
+The first release with an installable ARM64 package: driver **20.47.10.665**, built from
+this tree and published as `nabu-ln8000-driver-0.3.0-arm64.zip`. The version is a minor
+bump rather than a patch because the access policy below is a breaking change for any
+client that opened the pump without elevation.
+
 ### Added
 
 * **An access policy on the device object.** Every control code is `FILE_ANY_ACCESS` and
@@ -18,6 +118,12 @@ and versions follow [SemVer](https://semver.org/lang/ru/).
 * `docs/FINDINGS.md`: the six hardware findings this project produced, each with the code
   or the measurement it rests on, plus the defects that are still open and what a reader
   can do with the findings.
+* **A project status section in all three READMEs** - what works and what does not, with
+  the measurement behind every row - and build-and-install instructions, including the
+  two requirements that were previously written down nowhere: test signing has to be on
+  and Secure Boot off, because the packages are test-signed.
+* A release archive assembled by `deploy/build-arm64.ps1` and the procedure in
+  [docs/RELEASE.md](docs/RELEASE.md).
 
 ### Changed
 
@@ -32,6 +138,88 @@ and versions follow [SemVer](https://semver.org/lang/ru/).
   [PROVENANCE.md](PROVENANCE.md).
 * One comment in `crates/core/src/apsd.rs` had been copied verbatim, misspelling
   included, from `smb5-lib.c`; it is rewritten in this project's own words.
+* **Every crate now carries the same version.** The workspace was at `0.1.0`, `spb` and
+  `ln8000-kmdf` at `0.2.0`, and `cli`/`host` pinned `charger-core` at `0.1.0` by hand, so
+  a version bump in one place could not be made without editing five files that nothing
+  kept in step. `spb` now inherits the workspace version and the two hand-written pins are
+  gone. The Cargo version tracks the project; the Windows driver version
+  (`20.47.10.665`) is stamped separately by `STAMPINF_VERSION` and has to outrank what
+  the tablet already has, or the install is refused as `Outranked`.
+* The README no longer quotes `docs/STATE-2026-09-17.md` as the current state; that page
+  is marked as superseded in part, because its headline claim ("charging under Windows
+  does not work") stopped being true when the access path to the node was solved.
+
+### Fixed
+
+* `docs/ACCEPTANCE.md` recorded `LLVM 23` as the toolchain, which contradicts the LLVM
+  **17.0.6** the kernel drivers actually need; the line now says which checks need LLVM at
+  all and which version.
+* **The access policy did not work at first, and the fault was not in the SDDL string.**
+  Measured on the tablet: the assignment returned success - the `SddlSt` mark read `0` -
+  and `WdfDeviceCreate` then failed with `STATUS_INVALID_SECURITY_DESCR` (`0xC0000079`),
+  which the node reported as `CM_PROB_FAILED_ADD` (31). A security descriptor cannot be
+  attached to an **unnamed** device object: `WdfDeviceInitAssignSDDLString` requires the
+  driver to name the object first, or to call `WdfDeviceInitSetCharacteristics` with
+  `FILE_AUTOGENERATED_DEVICE_NAME`, and a PnP device must not name its own object. The
+  driver now asks for the autogenerated name before it assigns the descriptor, and the
+  device started on the first install afterwards - driver stage mark `STAGE_DONE`, node
+  `OK`, no reboot required. Two earlier hypotheses were **wrong** and are recorded here so
+  that nobody re-derives them: a missing NUL terminator in the UTF-16 buffer, and a `const`
+  array whose temporary does not outlive the call. The terminator and the `static` remain in
+  the code because they match the canonical `DECLARE_CONST_UNICODE_STRING` form, not because
+  either of them was the fix.
+* **`deploy/nabu-ln8000.ps1` could not send a buffer, so `status`, `sessions`, `read` and
+  `write` all failed.** Three defects, none of them visible on the development host. The
+  buffer parameter was named `Input`, which collides with PowerShell's automatic `$Input`
+  - the enumerator of the incoming pipeline - so binding `-Input <byte[]>` failed with
+  "cannot convert ArrayListEnumeratorSimple to System.Byte[]" before the body ran.
+  `Marshal::SizeOf($Type)` and `Marshal::PtrToStructure($ptr, $Type)` bind to the `object`
+  overloads and then try to marshal the `RuntimeType` itself. The parameter is now
+  `-Buffer`, `SizeOf` receives an instance, and the generic `PtrToStructure[T]` is reached
+  by reflection. Verified on the tablet: `status` prints the mode, the session state, the
+  fault registers, the counters and the ADC fields.
+* **The reproducibility check compared a file with itself.** `deploy/build-arm64.ps1`
+  hashed the `.sys` files in `artifacts/` before the second build and hashed the same files
+  again afterwards, but the second build writes into the crate's `target/` tree and nothing
+  copies it back - so the verdict was a file against itself and the manifest always said
+  `true`. It now reads the package that the second build produced and compares the images
+  byte by byte, ignoring the Authenticode certificate table and the PE checksum, which are
+  the only places a timestamped signature differs. Measured across repeated builds: every
+  section of the image is identical every time, and the binary installed on the tablet
+  differs from the binary in the release archive in **nothing but** the signature and the
+  checksum - so the artifact a release carries is the code that was verified on hardware.
+* **The first version of the fixed check over-claimed.** It printed "bit-for-bit identical
+  between builds, signature included" whenever `Compare-PeImage` found no difference
+  outside the certificate table and the checksum - but that helper ignores those two
+  fields, so its zero was never proof of equality, and reading it as proof is the same
+  mistake as the one above in a new coat. Measured against the previous build's bytes:
+  512 of the signature's 7168 bytes and 2 checksum bytes differ, so the images are
+  identical and the signatures are not. The block now hashes the full bytes as well and
+  reports the three cases separately (identical, signature-only, not reproducible), and
+  `reproducible_note` in the manifest says which one occurred.
+* **And the second build was still a cache hit.** Both rebuilds finished in 0.12 s:
+  cargo had nothing to do, so even with the comparison fixed the check could only ever
+  witness a re-signature. `cargo clean -p <name>` does not help - it left what
+  cargo-wdk's nested package project reuses, reporting "Removed 0 files" for one of the
+  two crates. The block now deletes `target\aarch64-pc-windows-msvc\release` before the
+  second build and aborts unless that build prints `Compiling <crate>`, so a cache hit
+  fails the check instead of passing it. With the cache gone the image still comes out
+  identical and the signature does not, which is the claim the manifest makes.
+
+### Known limitations
+
+* **The AC-verdict flap behind the brightness reset is open.** It is the ❌ row of the
+  README status table and the release notes repeat it, because a release note that omits
+  the one defect a user is most likely to notice would be the only dishonest document in
+  this repository.
+* **In standby the ADC channels read zero.** Measured on 2026-09-22 with the driver in
+  `STANDBY` (mode 1, no critical fault): the registers and counters are live - `samples`
+  reached 1238 - while `input current`, `battery voltage` and `input voltage` came back as
+  `0`, and the die temperature as `1600` (tenths of °C). A zero raw ADC code decodes to
+  exactly `+160.0 °C` (`crates/ln8000-kmdf/src/lib.rs`), so this is the signature of the
+  ADC not producing a reading, and the driver's protection treats it as unusable
+  (`guard::die_temp_usable`). The fields are only meaningful during a charge session; they
+  are recorded here because the diagnostic tool now prints them.
 
 ## [0.2.2] - 2026-09-17
 

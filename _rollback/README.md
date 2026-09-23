@@ -1,17 +1,22 @@
 # Rollback snapshot
 
-`oem154-20.47.10.660/` is the driver package that is installed on the development
-tablet, copied out of the DriverStore (`pnputil /enum-drivers` lists it as `oem154.inf`)
-so that it can be put back if a later build misbehaves.
+`oem154-20.47.10.660/` was the driver package installed on the development tablet when it
+was captured, copied out of the DriverStore (`pnputil /enum-drivers` listed it as
+`oem154.inf`) so that it can be put back if a later build misbehaves. The tablet has moved
+on since: it now runs `oem166.inf` / `20.47.10.672`, the in-tree 0.3.1 build, after
+`oem159` / `20.47.10.665` was the first package there with the device access policy in
+force.
 
 Only the INF is committed. `*.sys` and `*.cat` are build outputs and `.gitignore`
 excludes them, so this directory cannot be reinstalled from a clone — the binaries stay
 on the machine that captured them. The INF is here to be read: compare its `[Version]`,
 its device list and its hardware key against `crates/ln8000-kmdf/ln8000_kmdf.inx`.
 
-Its `DriverVer` is `09/19/2026,20.47.10.660`, the same as the current source. That makes
-it a snapshot of what is installed rather than an older release, and it means the INF
-cannot be reinstalled over the current one without forcing the version.
+Its `DriverVer` is `09/19/2026,20.47.10.660`, several releases behind the current source
+(`09/22/2026,20.47.10.671`). That makes it a snapshot of what was installed at the time
+rather than a copy of the current build, and it means the INF cannot be installed over a
+newer package without forcing the version: the loader refuses the lower `DriverVer` as
+`Outranked`.
 
 ## It predates the device access policy
 

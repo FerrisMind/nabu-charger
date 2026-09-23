@@ -2,6 +2,8 @@
 
 [English](README.md) | [Русский](README.ru.md) | **Português (Brasil)**
 
+![Status: prévia experimental](https://img.shields.io/badge/status-experimental%20preview-orange?style=for-the-badge) ![Dispositivo: Xiaomi Pad 5](https://img.shields.io/badge/device-Xiaomi%20Pad%205-blue?style=for-the-badge) ![Plataforma: Windows 11 ARM64](https://img.shields.io/badge/platform-Windows%2011%20ARM64-0078D4?style=for-the-badge)
+
 > Esta é uma tradução do [README em inglês](README.md). O texto em inglês é o
 > principal: se os dois divergirem, vale o inglês.
 
@@ -21,6 +23,73 @@ A parte reutilizável deste trabalho não é o driver, e sim o que se descobriu 
 hardware: [docs/FINDINGS.md](docs/FINDINGS.md) reúne seis achados sobre o carregamento
 nesta plataforma, cada um com o código ou a medição em que se apoia. Comece por ali se
 você estiver portando o Windows para um tablet da classe nabu, e não usando este driver.
+
+## Estado do projeto
+
+Última versão: **0.3.0**, com o driver **20.47.10.665** — o pacote ARM64 instalável está
+anexado a ela (`nabu-ln8000-driver-0.3.0-arm64.zip`). É esse pacote que as notas da versão
+descrevem, incluindo a política de acesso verificada nele — um processo sem elevação é
+recusado com `ERROR_ACCESS_DENIED` (5).
+
+O tablet de desenvolvimento avançou além dela: nele está **20.47.10.672** (`oem166.inf`),
+a compilação 0.3.1 desta árvore, com o nó do dispositivo em `OK` / `CM_PROB_NONE`. O arquivo
+0.3.1 está montado (`nabu-ln8000-driver-0.3.1-arm64.zip`) e não publicado.
+
+**Resumo:** ✅ carregamento rápido com uma fonte Quick Charge · ✅ telemetria ao vivo da
+bomba · ⚠️ uma fonte Power Delivery ainda não aumenta a carga da bateria · ⚠️ a queda do
+veredito de CA por trás do reset do brilho — a liberação passou a 750 ms na 0.3.1, ainda
+não verificada contra o defeito
+
+Cada linha abaixo se apoia em uma medição feita no tablet, não em um teste que passou.
+Onde um defeito está marcado como não corrigido, uma captura ao vivo mostra o defeito
+acontecendo: as evidências estão em [docs/FINDINGS.md](docs/FINDINGS.md) e na lista de
+defeitos mais adiante.
+
+### Status resumido
+
+| Recurso | Notas | Status |
+|---|---|---|
+| 🔌 Carregamento rápido com fonte Quick Charge / HVDCP | Medido: SoC 44 → 85 %, `Iin` 1,13–1,62 A, `Vin` 8,7–9,4 V, bomba em modo 2:1 | ✅ |
+| 🔎 Detecção de adaptador (APSD) e política de corrente | Tabelas de decodificação e limites por tipo de adaptador, conferidos com o driver Android: 80 verificações, 0 divergências | ✅ |
+| ⚙️ Núcleo da bomba: registradores, modos, proteções, ADC, proteção térmica | 125 testes unitários, 6 de integração, 2 doctests; conferido com o cabeçalho do fabricante | ✅ |
+| 📈 Telemetria ao vivo e journal de sessão | `Vin`, `Iin`, `VBAT`, temperatura do cristal, falhas e modo, lidos da bomba por I²C no tablet | ✅ |
+| 📦 Pacote ARM64 assinado, build reproduzível, rollback | Verificação do pacote 35/35, dos fontes 80/80, rollback verificado no tablet | ✅ |
+| 🎛 Limites e perfil de proteção pelo registro | Alterá-los exige uma escrita no registro e reiniciar o dispositivo, não recompilar | ✅ |
+| 🔋 Fonte Power Delivery (USB-C) | O driver obtém CA, mas a bateria não ganha carga; a negociação acima de 5 V fica com a parte Type-C da plataforma, então os 33 W completos ficam fora de alcance | ⚠️ |
+| 🖥 A superfície de IOCTL do driver SMB | `GET_STATUS` responde; `READ_REG`, `WRITE_REG`, `SET_ICL`, `GET_JOURNAL`, `DETECT_START`, `APPLY_POLICY` retornam `STATUS_NOT_IMPLEMENTED`. A lógica por trás deles está escrita e testada com mock; a ligação no kernel não | ⚠️ |
+| 🔬 Enquadramento da resposta SPMI | Não confirmado por engenharia reversa, então as leituras de registrador seguem provisórias | ⚠️ |
+| 💡 Queda do veredito de CA / reset do brilho | **Não corrigida.** Uma captura ao vivo mostra CA → CC → CA em 2,647 s com o cabo imóvel e a bomba ociosa | ❌ |
+| 📱 Outros dispositivos SM8150 | Só o Xiaomi Pad 5 foi testado; o driver se associa se o nó existir em I²C 0x51 | ⚠️ |
+| 🧩 Um dispositivo com LN8000 mas sem o nó `PEIC` na DSDT | Não suportado — exige alteração de ACPI | ❌ |
+
+### Defeitos conhecidos, não corrigidos
+
+Todos são achados ao vivo ou no código, e cada um tem reprodução; não há suposições
+aqui.
+
+**O veredito de CA cai com a fonte conectada** — é o que importa, e a correção
+implantada não o cobre. Quando a bomba sai do modo 2:1, `Iin` fica no piso de 39 mA do
+ADC e `Vin` recua para `2 · VBAT`, que é o ponto de operação *normal* de uma bomba 2:1,
+não evidência de ausência. O veto de VBUS dobrado em `online_raw` lê isso como "sem
+adaptador", a retenção de 8 s expira, e o Windows vê uma troca de fonte de energia — é
+assim que acontece o reset do brilho relatado. Medido no tablet com o cabo imóvel:
+CA → CC → CA em 2,647 s, com o bit 4 de `Fault1Sts` *limpo*, ou seja, o próprio detector
+de VBUS do hardware dizia que o cabo estava lá, e com todas as leituras plenamente
+utilizáveis, então o novo ramo `held` nunca foi alcançável.
+
+| Defeito | O que ele faz |
+|---|---|
+| A temperatura do cristal é publicada com o ADC hibernando | O bit 1 de `AdcValid` é reportado para um canal adormecido, então **160,0 °C** é publicado e todo consumidor o imprime fielmente |
+| O VBAT do LN8000 lê baixo | 42–43 mV abaixo do medidor de combustível, e esse canal alimenta o portão do modo 2:1 |
+| `EngageState` discorda de `SuMode` | Publica 4 (NO_HEADROOM) enquanto `SuMode` fica em 3 (switching); ruído apenas na marca |
+
+Duas falhas de hardware deste tablet não têm relação com o driver, mas aparecem na
+telemetria dele: o nó PMIC TCC `ACPI\QCOM0582` está em estado de erro, e o `WUDFRd`
+falha ao carregar 48 vezes para a plataforma de sensores `ACPI\QCOM059F`.
+
+As ressalvas de build e de ferramentas — a exigência do WDK, a versão do LLVM, o que
+fica com a plataforma — estão em
+[Limitações e ressalvas honestas](#limitações-e-ressalvas-honestas).
 
 ## Estrutura
 
@@ -149,11 +218,31 @@ Mais detalhes: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md),
   partir de 5 V, mas não entrega os 33 W completos.
 * **O driver do LN8000 está implantado e em medição, não concluído.** O driver KMDF
   para o nó ACPI `PEIC` (endereço I²C 0x51) está compilado e instalado no tablet.
-  [docs/STATE-2026-09-17.md](docs/STATE-2026-09-17.md) registra os defeitos ainda
-  abertos, e [docs/DEPLOY-LN8000.md](docs/DEPLOY-LN8000.md) é o procedimento de
-  instalação e diagnóstico.
+  Os defeitos abertos estão na seção de estado do projeto acima e em
+  [docs/FINDINGS.md](docs/FINDINGS.md); [docs/DEPLOY-LN8000.md](docs/DEPLOY-LN8000.md)
+  é o procedimento de instalação e diagnóstico.
+  [docs/STATE-2026-09-17.md](docs/STATE-2026-09-17.md) é um retrato datado, anterior
+  ao caminho de acesso funcional - leia-o pelo que foi descartado, não pelo estado
+  atual.
 
-## Compilando o driver
+## Compilando e instalando o driver
+
+A versão curta está abaixo. O procedimento completo, a ferramenta de diagnóstico, os
+perfis de configuração, a tabela de falhas e o registro de riscos estão em
+[docs/DEPLOY-LN8000.md](docs/DEPLOY-LN8000.md).
+
+### O que é necessário
+
+| Requisito | Versão / observação |
+|---|---|
+| Rust | O canal é fixado pelo `rust-toolchain.toml`; adicione o alvo com `rustup target add aarch64-pc-windows-msvc` |
+| Windows Driver Kit | WDK 10.0.26100 — a compilação com `cargo wdk` precisa dele |
+| LLVM / libclang | **17.0.6**. É o que gera as ligações do `bindgen`, e a 23.x quebra a compilação. Aponte `LIBCLANG_PATH` para `C:\Program Files\LLVM\bin` |
+| cargo-wdk | `cargo install cargo-wdk --locked` |
+| O tablet | Windows 11 ARM64 com **assinatura de teste ligada e Secure Boot desligado**. Os drivers são assinados com certificado de teste, e sem isso o Windows não os carrega |
+| Permissões | Administrador no tablet para a instalação e para a ferramenta de diagnóstico — o objeto de dispositivo do driver é restrito a `LocalSystem` e Administradores |
+
+### Compilação
 
 ```powershell
 rustup target add aarch64-pc-windows-msvc
@@ -167,16 +256,53 @@ cd crates/kmdf        ; cargo wdk build --target-arch arm64 --profile release
 cd crates/ln8000-kmdf ; cargo wdk build --target-arch arm64 --profile release
 ```
 
-Os pacotes são gravados em `artifacts/driver-arm64/` (SMB) e
+O `deploy/build-arm64.ps1` compila os dois, assina-os e grava as somas de verificação e o
+manifesto da compilação. Os pacotes são gravados em `artifacts/driver-arm64/` (SMB) e
 `artifacts/driver-ln8000-arm64/` (LN8000). Ambos são gerados localmente e não são
-versionados no git.
+versionados no git. O LN8000 é o que tem procedimento de instalação; o driver SMB compila
+para ARM64, mas os IOCTLs dele são stubs e ele não foi implantado no tablet — a tabela de
+status acima diz quais respondem.
 
-Instalação e diagnóstico do LN8000 — [docs/DEPLOY-LN8000.md](docs/DEPLOY-LN8000.md):
-`install-driver.ps1`, `nabu-ln8000.ps1 status|sessions|read|write|journal`,
-`run-acceptance.ps1` (o protocolo de aceitação automatizado) e
-`uninstall-driver.ps1`. Um script PowerShell que contém texto não ASCII é salvo em
-UTF-8 com BOM, porque o PowerShell 5.1, caso contrário, o decodifica como ANSI e
-quebra a análise das aspas.
+`deploy/assemble-release.ps1 -Version <x.y.z>` empacota o kit instalável no arquivo de
+release. Todo o procedimento — os dois números de versão e por que existem dois, e as
+verificações que condicionam um release — está em [docs/RELEASE.md](docs/RELEASE.md).
+
+### Instalação no tablet
+
+No tablet, como administrador:
+
+```powershell
+bcdedit /set testsigning on     # depois reiniciar uma vez
+```
+
+Copie `artifacts/driver-ln8000-arm64/` para o tablet, por exemplo para `C:\nabu-ln8000\`,
+e execute o instalador a partir dessa pasta:
+
+```powershell
+cd C:\nabu-ln8000
+.\install-driver.ps1           # verifica o modo de assinatura, instala, associa ACPI\QCOM057E, inicia
+.\nabu-ln8000.ps1 status       # esperado: mode SWITCHING 2:1, ou BYPASS 1:1 como retorno seguro
+```
+
+Não é preciso alterar o ACPI nem regravar a UEFI: o nó `PEIC` (`_HID = QCOM057E`, I²C 0x51
+em `\_SB.I2C5`) já está descrito na DSDT do tablet e o driver se associa a ele.
+
+### Atualização e reversão
+
+```powershell
+.\update-driver.ps1                 # instala por cima, mantém o pacote anterior
+.\uninstall-driver.ps1              # para o serviço e remove o pacote
+pnputil /add-driver $env:ProgramData\nabu-fastcharge\backup\ln8000_kmdf.inf /install
+```
+
+O driver não escreve nada na firmware nem altera configurações de energia, então removê-lo
+devolve o dispositivo ao comportamento anterior à instalação.
+
+O resto do conjunto de ferramentas — `nabu-ln8000.ps1 status|sessions|read|write|journal`,
+`run-acceptance.ps1` (o protocolo de aceitação automatizado) — está descrito em
+[docs/DEPLOY-LN8000.md](docs/DEPLOY-LN8000.md). Um script PowerShell que contém texto não
+ASCII é salvo em UTF-8 com BOM, porque o PowerShell 5.1, caso contrário, o decodifica como
+ANSI e quebra a análise das aspas.
 
 ## Licença e política de acesso
 
