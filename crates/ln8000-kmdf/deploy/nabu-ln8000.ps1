@@ -72,22 +72,39 @@ function Open-Device {
   return $handle
 }
 
+# The buffer parameter must not be named `Input`: PowerShell has an automatic
+# variable `$Input` (the enumerator of the incoming pipeline), and binding
+# `-Input <byte[]>` fails with "cannot convert ...ArrayListEnumeratorSimple... to
+# System.Byte[]" before the body ever runs. Measured on the tablet: every command
+# that sends a buffer died on this line.
 function Invoke-DeviceIoControl {
-  param([IntPtr]$Handle, [uint32]$Code, [byte[]]$Input, [uint32]$OutputSize)
+  param([IntPtr]$Handle, [uint32]$Code, [byte[]]$Buffer, [uint32]$OutputSize)
   $output = New-Object byte[] $OutputSize
   $returned = 0
-  $ok = [NabuNative]::DeviceIoControl($Handle, $Code, $Input, [uint32]($Input.Length), $output, $OutputSize, [ref]$returned, [IntPtr]::Zero)
+  $ok = [NabuNative]::DeviceIoControl($Handle, $Code, $Buffer, [uint32]($Buffer.Length), $output, $OutputSize, [ref]$returned, [IntPtr]::Zero)
   return [pscustomobject]@{ Ok = $ok; Bytes = $output; Returned = $returned; Error = [Runtime.InteropServices.Marshal]::GetLastWin32Error() }
 }
 
 function Read-Struct {
   param([byte[]]$Bytes, [Type]$Type)
-  $size = [Runtime.InteropServices.Marshal]::SizeOf($Type)
+  # `Marshal::SizeOf($Type)` cannot be used from PowerShell: the binder picks the
+  # `SizeOf(object)` overload and then fails to marshal the RuntimeType itself
+  # ("cannot marshal System.RuntimeType as an unmanaged structure"). An instance of
+  # the struct takes that same overload with a real value and returns the size of
+  # the struct. Measured on the tablet: `status` died here.
+  $size = [Runtime.InteropServices.Marshal]::SizeOf([Activator]::CreateInstance($Type))
   $buffer = New-Object byte[] $size
   [Array]::Copy($Bytes, $buffer, [Math]::Min($Bytes.Length, $size))
   $handle = [Runtime.InteropServices.GCHandle]::Alloc($buffer, 'Pinned')
   try {
-    return [Runtime.InteropServices.Marshal]::PtrToStructure($handle.AddrOfPinnedObject(), $Type)
+    # `PtrToStructure($ptr, $Type)` has the same problem as `SizeOf($Type)`: the
+    # binder prefers the `object` overload and tries to marshal the RuntimeType
+    # itself. Only the generic overload does the right thing, and it has to be
+    # reached by reflection because PowerShell cannot pick `PtrToStructure[T]`.
+    $method = [Runtime.InteropServices.Marshal].GetMethods() |
+      Where-Object { $_.Name -eq 'PtrToStructure' -and $_.IsGenericMethod -and $_.GetParameters().Count -eq 1 } |
+      Select-Object -First 1
+    return $method.MakeGenericMethod($Type).Invoke($null, @($handle.AddrOfPinnedObject()))
   } finally {
     $handle.Free()
   }
@@ -124,7 +141,7 @@ public struct Ln8000Reg {
 function Invoke-Status {
   $handle = Open-Device
   try {
-    $result = Invoke-DeviceIoControl -Handle $handle -Code $IOCTL.GET_STATUS -Input (New-Object byte[] 0) -OutputSize 64
+    $result = Invoke-DeviceIoControl -Handle $handle -Code $IOCTL.GET_STATUS -Buffer (New-Object byte[] 0) -OutputSize 64
     if (-not $result.Ok) { throw ("DeviceIoControl GET_STATUS: error " + $result.Error) }
     $status = Read-Struct $result.Bytes ([Ln8000Status])
     if ($status.Magic -ne $STATUS_MAGIC) {
@@ -158,7 +175,7 @@ function Invoke-Status {
 function Invoke-Sessions {
   $handle = Open-Device
   try {
-    $result = Invoke-DeviceIoControl -Handle $handle -Code $IOCTL.GET_SESSIONS -Input (New-Object byte[] 0) -OutputSize 48
+    $result = Invoke-DeviceIoControl -Handle $handle -Code $IOCTL.GET_SESSIONS -Buffer (New-Object byte[] 0) -OutputSize 48
     if (-not $result.Ok) { throw ("DeviceIoControl GET_SESSIONS: error " + $result.Error) }
     $s = Read-Struct $result.Bytes ([Ln8000Sessions])
     Write-Host '=== LN8000: charge sessions ===' -ForegroundColor Cyan
@@ -183,7 +200,7 @@ function Invoke-ReadReg {
   try {
     $input = New-Object byte[] 8
     $input[0] = [byte]$Address
-    $result = Invoke-DeviceIoControl -Handle $handle -Code $IOCTL.READ_REG -Input $input -OutputSize 8
+    $result = Invoke-DeviceIoControl -Handle $handle -Code $IOCTL.READ_REG -Buffer $input -OutputSize 8
     if (-not $result.Ok) { throw ("DeviceIoControl READ_REG: error " + $result.Error) }
     $reg = Read-Struct $result.Bytes ([Ln8000Reg])
     if ($reg.ErrorCode -ne 0) { throw ("the driver returned error code " + $reg.ErrorCode) }
@@ -201,7 +218,7 @@ function Invoke-WriteReg {
     $input = New-Object byte[] 8
     $input[0] = [byte]$Address
     $input[1] = [byte]$Value
-    $result = Invoke-DeviceIoControl -Handle $handle -Code $IOCTL.WRITE_REG -Input $input -OutputSize 8
+    $result = Invoke-DeviceIoControl -Handle $handle -Code $IOCTL.WRITE_REG -Buffer $input -OutputSize 8
     if (-not $result.Ok) { throw ("DeviceIoControl WRITE_REG: error " + $result.Error) }
     Write-Host ("  wrote 0x{0:X2} to 0x{1:X2}" -f $Value, $Address)
   } finally {
