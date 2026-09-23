@@ -108,11 +108,12 @@ use ioctl::{
     Ln8000Sample, Ln8000SamplesRequest, Ln8000Sessions, Ln8000Status, LN8000_STATUS_MAGIC,
     LN8000_STATUS_VERSION,
 };
+use ln8000::battery_policy;
 use ln8000::encoding::decode_iin_limit;
 use ln8000::{
     bypass_allowed_by_vin, bypass_strikes_expired, charge_mode, evaluate, regs, resolve_bypass,
-    AdcChannel, BypassResolution, GuardAction, GuardLimits, OpMode, Pump, PumpConfig, PumpError,
-    PumpState, Telemetry, TelemetrySample, SWITCHING_MIN_VIN_UV,
+    AdcChannel, AdcMode, BypassResolution, GuardAction, GuardLimits, OpMode, Pump, PumpConfig,
+    PumpError, PumpState, Telemetry, TelemetrySample, SWITCHING_MIN_VIN_UV,
 };
 use spb::SpbBus;
 use wdk::println;
@@ -389,6 +390,21 @@ struct DriverState {
     hvdcp_retry_next_ms: u64,
     /// Last cable-present sample (Vin > unplug floor) for re-plug edge detect.
     last_input_present: bool,
+    /// The tick has taken the ADC out of `AutoHibernate` ([`AdcMode::Normal`]).
+    ///
+    /// Set when a tick saw unusable samples while the hardware said VBUS was
+    /// present ([`battery_policy::adc_wake_needed`]), cleared when the comparator
+    /// said VBUS was gone and the chip was put back to sleep. Without it the tick
+    /// would write `ADC_CTRL` on every such tick, and the mode it left behind
+    /// would be invisible in a dump.
+    adc_awake: bool,
+    /// How many times the ADC was woken by the comparator, ever.
+    ///
+    /// Evidence for the field: a sleeping ADC is the reason an insertion can be
+    /// invisible, so a dump has to show whether the wake path ever ran. Zero here
+    /// with `AdcValid` bit 0 set in every dump means the comparator never told the
+    /// tick that a source was there.
+    adc_wake_n: u32,
     /// Edge detect armed after PrepareHardware autostart (avoids double-negotiate).
     hvdcp_edge_armed: bool,
     /// Monotonic time of the last bus correction towards the 2:1 window, ms.
@@ -498,6 +514,8 @@ impl DriverState {
             hvdcp_retry_attempts: 0,
             hvdcp_retry_next_ms: 0,
             last_input_present: false,
+            adc_awake: false,
+            adc_wake_n: 0,
             hvdcp_edge_armed: false,
             last_window_nudge_ms: 0,
             window_best_err_uv: u32::MAX,
@@ -1627,7 +1645,10 @@ unsafe extern "C" fn evt_device_add(
 
     // Access policy. The control codes are `FILE_ANY_ACCESS` and the driver makes
     // no requestor check, so the descriptor set here is the only thing standing
-    // between the pump and any process on the tablet. Not fatal: see `sddl`.
+    // between the pump and any process on the tablet. A failure here is not
+    // survivable - `WdfDeviceCreate` below rejects the same initialisation
+    // structure with the same status and the device fails to start - so the code
+    // is recorded as a mark and the failure is printed. See `sddl`.
     // SAFETY: `device_init` is still owned by the driver; the device is created below.
     let sddl_status = unsafe { sddl::assign(device_init) };
     if sddl_status < 0 {
@@ -2228,6 +2249,7 @@ unsafe extern "C" fn evt_prepare_hardware(
                     .max(u32::try_from(iin.max(0)).unwrap_or(0)),
                 vac_unplug,
                 input_readings_usable,
+                battery::soc_rising(),
                 monotonic_ms(),
             );
         }
@@ -2553,6 +2575,33 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
     // motionless - that is, a backlight policy reset via Kernel-Power 105.
     let input_readings_usable = sample.vbat_valid && vbus_read.is_ok() && sample.vbus_uv > 0;
 
+    // A sleeping ADC cannot see the brick that has just arrived, and nothing else
+    // here wakes it: `ADC_CTRL` is written only inside `Pump::configure()`, which
+    // runs at device start and on recovery paths that need a live sample to be
+    // reached at all. The hardware's VBUS comparator keeps working while the ADC
+    // sleeps, so the tick uses it: VBUS present with unusable samples means the
+    // chip is in `AutoHibernate` - wake it and the next tick carries real samples.
+    // VBUS gone means there is nothing to measure, so it may sleep again and keep
+    // its idle current.
+    match battery_policy::adc_wake_needed(input_readings_usable, vac_unplug) {
+        Some(true) if !st.adc_awake => match pump.set_adc_mode(AdcMode::Normal) {
+            Ok(()) => {
+                st.adc_awake = true;
+                st.adc_wake_n = st.adc_wake_n.saturating_add(1);
+            }
+            Err(err) => println!("ln8000-kmdf: ADC wake failed: {err}"),
+        },
+        Some(false) if st.adc_awake => {
+            if pump.set_adc_mode(AdcMode::AutoHibernate).is_ok() {
+                st.adc_awake = false;
+            }
+        }
+        _ => {}
+    }
+
+    // The fuel counter's direction for this tick: the pack's own SOC rose recently, which
+    // is the only charging evidence available while the pump is idle and the platform buck
+    // carries the charge. It is read from `battery.rs`, where the SOC sample arrives.
     // SAFETY: BattC status notify is DISPATCH-safe; we run at PASSIVE.
     unsafe {
         battery::update_from_telemetry(
@@ -2562,6 +2611,7 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
             st.max_iin_ua,
             vac_unplug,
             input_readings_usable,
+            battery::soc_rising(),
             sample.ts_ms,
         );
     }
@@ -2591,6 +2641,58 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
         // ordinary path ran on this tick or "no sample, but the hardware says
         // VBUS is present".
         mark_device_value(device, "InputUsable", u32::from(input_readings_usable));
+        // The ADC's power mode and the count of comparator wakes: a sleeping ADC
+        // reads zeros and makes an insertion invisible, so a dump has to show both
+        // whether the chip is awake and whether the wake path has ever run.
+        mark_device_value(device, "AdcAwake", u32::from(st.adc_awake));
+        mark_device_value(device, "AdcWakeN", st.adc_wake_n);
+        // Why the AC verdict came out the way it did. Below 6 V `online_raw` can only
+        // reject a live adapter through the floor, the doubled-VBUS veto or the headroom
+        // over the pack, and all three read `vbat_uv` - which is the ADC's VBAT channel,
+        // a converter node rather than the cell (it reads `Vin / 2` in switching). So a
+        // dump has to carry the value the tick actually used next to the two derived
+        // tests, or a rejection cannot be told from a sleep.
+        mark_device_value(device, "VbatTickMv", sample.vbat_uv / 1000);
+        mark_device_value(
+            device,
+            "DoubledVeto",
+            u32::from(ln8000::encoding::vin_is_doubled_vbat(
+                sample.vbat_uv,
+                sample.vbus_uv,
+            )),
+        );
+        // The raw verdict before any hold: 1 online, 0 offline, 2 no evidence (no
+        // usable sample and the hardware did not say VBUS was gone).
+        mark_device_value(
+            device,
+            "OnlineRaw",
+            match battery_policy::online_raw_with_evidence(
+                sample.vbus_uv,
+                sample.vbat_uv,
+                sample.iin_ua,
+                vac_unplug,
+                input_readings_usable,
+            ) {
+                None => 2,
+                Some(false) => 0,
+                Some(true) => 1,
+            },
+        );
+        // The fuel counter's direction and the age of the last rise. It is the only
+        // charging evidence while the pump is idle and the platform buck carries the
+        // charge, so a dark charging flag has to be distinguishable from a counter that
+        // is simply not answering - this pair is what says which of the two happened.
+        mark_device_value(device, "SocRising", u32::from(battery::soc_rising()));
+        mark_device_value(
+            device,
+            "SocRiseAgeMs",
+            u32::try_from(
+                sample
+                    .ts_ms
+                    .saturating_sub(battery::soc_last_rise_ms()),
+            )
+            .unwrap_or(u32::MAX),
+        );
         // Current peak over the observation window: we write it once per
         // IIN_WINDOW_MS and start a new window, so that afterwards it is visible
         // whether the driver drew current at all.
@@ -2625,7 +2727,7 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
     if !device.is_null() {
         match gauge {
             GaugePoll::Raw(raw) => {
-                unsafe { battery::set_gauge_raw(raw) };
+                unsafe { battery::set_gauge_raw(raw, sample.ts_ms) };
                 mark_device_value(device, "SocRaw", u32::from(raw));
             }
             GaugePoll::Failed => {
@@ -3879,6 +3981,7 @@ unsafe fn handle_get_status(request: WDFREQUEST) {
                 // Suitability of the input samples: the same flag as in the
                 // telemetry tick - a zero channel means "no sample".
                 status.vbat_uv > 0 && status.vbus_uv > 0,
+                battery::soc_rising(),
                 monotonic_ms(),
             );
         }

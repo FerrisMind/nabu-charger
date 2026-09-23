@@ -1113,6 +1113,26 @@ impl<T: RegisterBus> Pump<T> {
         })
     }
 
+    /// Sets the ADC operating mode (`ADC_CTRL` bits 5:7).
+    ///
+    /// The chip leaves initialisation in [`AdcMode::AutoHibernate`] with the `Sec4`
+    /// delay, so roughly four seconds of pump idle put the ADC to sleep; a sleeping
+    /// ADC then reads *successfully* with `0x00` in every channel, which on the
+    /// power path is indistinguishable from "no adapter". Nothing else in this crate
+    /// writes `ADC_CTRL` outside [`Self::configure`], so a caller that has a reason
+    /// to believe the input is there while the samples are zeros has to wake it
+    /// here: `Normal` starts measuring again, `AutoHibernate` gives the idle current
+    /// back. Bits 4:0 are preserved (hibernation delay and the high NTC threshold
+    /// bits live there).
+    ///
+    /// # Errors
+    ///
+    /// * [`PumpError::NotOpen`] - the chip is not open.
+    /// * [`PumpError::Bus`] - the bus did not respond.
+    pub fn set_adc_mode(&mut self, mode: AdcMode) -> Result<(), PumpError> {
+        self.update(regs::ADC_CTRL, 0x07 << 5, mode.code() << 5, "adc_mode")
+    }
+
     /// Reads one ADC channel sample.
     ///
     /// The code occupies two neighbouring registers (10 bits), so it is read as a pair.
