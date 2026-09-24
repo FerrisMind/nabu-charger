@@ -22,12 +22,6 @@
 .PARAMETER Subject
   The subject cargo-wdk asks signtool for. Default CN=WDRLocalTestCert.
 
-.PARAMETER Trust
-  Also add the certificate to the user `Root` and `TrustedPublisher` stores, so that
-  Authenticode verification returns Valid instead of UnknownError. The archive ships the .cer
-  and INSTALL.md has the reader import it into the machine stores; this is that same step, for
-  the machine that builds.
-
 .PARAMETER ClearCachedCertFiles
   Remove `WDRLocalTestCert.cer` left in the build output by an earlier build. cargo-wdk reuses
   such a file without consulting the store, and the target directories are restored from the CI
@@ -35,14 +29,19 @@
   would carry a certificate that does not match its own .sys, and the install would fail with
   CERT_E_UNTRUSTEDROOT.
 
+  Nothing here touches a trust store. Adding a certificate to `Root` raises a security-consent
+  dialog, and a runner has nobody to answer it: the step that tried waited until its timeout.
+  A test-signed driver is not trusted on the machine that builds it - `Authenticode` reads
+  `UnknownError` there, on the runner and on a development machine alike - and the certificate
+  becomes trusted where the driver is installed, through the .cer in the package.
+
 .EXAMPLE
-  pwsh -NoProfile -File .\deploy\prepare-test-cert.ps1 -Trust -ClearCachedCertFiles
+  pwsh -NoProfile -File .\deploy\prepare-test-cert.ps1 -ClearCachedCertFiles
 #>
 [CmdletBinding()]
 param(
   [string]$StoreName = 'WDRTestCertStore',
   [string]$Subject = 'CN=WDRLocalTestCert',
-  [switch]$Trust,
   [switch]$ClearCachedCertFiles
 )
 
@@ -83,17 +82,6 @@ if ($cert) {
   $cert = Get-StoreCertificate $StoreName $Subject
   if (-not $cert) { throw "the certificate did not land in Cert:\CurrentUser\$StoreName" }
   Write-Host "certificate in place: $($cert.Thumbprint), private key: $($cert.HasPrivateKey)"
-}
-
-if ($Trust) {
-  foreach ($name in 'Root', 'TrustedPublisher') {
-    $have = Get-StoreCertificate $name $Subject
-    if ($have -and $have.Thumbprint -eq $cert.Thumbprint) { Write-Host "already trusted in $name" }
-    else {
-      Add-ToStore $name $cert
-      Write-Host "added to ${name}: Authenticode verification will read Valid on this machine"
-    }
-  }
 }
 
 if ($ClearCachedCertFiles) {

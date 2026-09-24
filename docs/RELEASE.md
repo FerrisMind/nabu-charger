@@ -166,15 +166,17 @@ on a runner and then leaves a **draft** release with the archive attached:
 * it builds both drivers twice and fails unless the reproducibility verdict is `true`;
 * it runs `verify-package.ps1` (35 criteria) and the four checks of step 4 - the built
   `DriverVer`, the INF's access policy, the PE machine field and the signature. The
-  signature check is stricter than a local one: the certificate that signed the package has
-  to be the certificate the archive ships, or the install stops with
-  `CERT_E_UNTRUSTEDROOT`;
+  signature check is stricter than a local one: the package has to be signed, the signature
+  has to be intact, and the certificate it was made with has to be the certificate the
+  archive ships, or the install stops with `CERT_E_UNTRUSTEDROOT`;
 * `deploy/prepare-test-cert.ps1` runs before the build. `cargo-wdk` test-signs with the
   `WDRLocalTestCert` certificate from the *user* store `WDRTestCertStore`, and a machine
   without one fails inside the package step with `SignTool Error: File not found`. The
-  script creates the certificate when it is missing, trusts it for the length of the run,
-  and drops any `.cer` an earlier build left in the target directories - a stale file would
-  otherwise be packaged beside a signature made with another key;
+  script creates the certificate when it is missing and drops any `.cer` an earlier build
+  left in the target directories - a stale file would otherwise be packaged beside a
+  signature made with another key. It touches no trust store: the packages are test-signed,
+  the runner reads `UnknownError` from them the way a development machine does, and the
+  certificate becomes trusted on the tablet, from the `.cer` in the package;
 * it assembles the archive and attaches it to the run as an artifact first, so a failure in
   the release step still leaves the archive downloadable;
 * the release notes are the changelog's own `## [<version>]` section plus what the archive

@@ -102,9 +102,8 @@ jobs:
       # cargo-wdk test-signs every package with the certificate it finds in the *user* store
       # `WDRTestCertStore`, subject `WDRLocalTestCert`, and hands that store name to signtool.
       # The image carries no such certificate: the first dry run stopped inside the build with
-      # `SignTool Error: File not found`. The script creates one when it is missing, trusts it
-      # for the length of this run so the Authenticode checks below mean what they say, and
-      # drops a stale `WDRLocalTestCert.cer` from the restored build cache.
+      # `SignTool Error: File not found`. The script creates one when it is missing and drops a
+      # stale `WDRLocalTestCert.cer` from the restored build cache.
       - name: Prepare the test signing certificate
         shell: pwsh
         # The step is a certificate store and a few file deletions; if it ever blocks, fail
@@ -112,7 +111,7 @@ jobs:
         timeout-minutes: 10
         run: |
           $ErrorActionPreference = 'Stop'
-          pwsh -NoProfile -File .\deploy\prepare-test-cert.ps1 -Trust -ClearCachedCertFiles
+          pwsh -NoProfile -File .\deploy\prepare-test-cert.ps1 -ClearCachedCertFiles
           if ($LASTEXITCODE -ne 0) { throw "prepare-test-cert.ps1 failed with exit code $LASTEXITCODE" }
 
       - name: Install cargo-wdk
@@ -206,7 +205,15 @@ jobs:
           foreach ($name in 'ln8000_kmdf.sys', 'ln8000_kmdf.cat') {
             $sig = Get-AuthenticodeSignature (Join-Path $kit $name)
             Write-Host ("  {0}: {1}, signed by {2}" -f $name, $sig.Status, $sig.SignerCertificate.Subject)
-            if ($sig.Status -ne 'Valid') { throw "$name is not validly signed: $($sig.Status)" }
+            # These packages are test-signed, and the machine that builds them does not trust
+            # the test root - nothing is installed into a trust store here, because adding a
+            # certificate to `Root` raises a consent dialog that a runner cannot answer. So
+            # `Valid` is not the criterion. What has to hold is that a signature is there, that
+            # it is intact (`UnknownError` is the untrusted-root reading), and that it is the
+            # shipped certificate's.
+            if ($sig.Status -notin @('Valid', 'UnknownError')) { throw "${name}: the signature is not intact - Authenticode reads $($sig.Status)" }
+            if (-not $sig.SignerCertificate) { throw "$name carries no signer certificate" }
+            if ($sig.SignerCertificate.Subject -ne 'CN=WDRLocalTestCert') { throw "$name is signed by '$($sig.SignerCertificate.Subject)', not by CN=WDRLocalTestCert" }
             if (-not $signer) { $signer = $sig.SignerCertificate.Thumbprint }
             elseif ($sig.SignerCertificate.Thumbprint -ne $signer) { throw "$name and ln8000_kmdf.sys are signed by different certificates" }
           }
