@@ -214,11 +214,19 @@ pub const PUMP_VIN_TRIM_UV: i32 = 10_500_000;
 /// fixed 9.5 V sits *above* the band once the pack passes ~4.42 V (live 18.09:
 /// bus held at 9.888 V against a 9.04–9.24 V band → mode 3 at the 39 mA floor).
 pub const PUMP_VIN_TARGET_MIN_UV: i32 = 9_500_000;
-/// Absolute floor for a derived target (µV) — mirrors
-/// [`ln8000::encoding::SWITCHING_MIN_VIN_UV`], the gate below which 2:1 is never
-/// requested. At a low pack this pins the target at 8.0 V, which for Vbat ≥
-/// 3.2 V still lands inside or just above the band.
-pub const PUMP_VIN_TARGET_ABS_MIN_UV: u32 = 8_000_000;
+/// Absolute floor for a derived target (µV) — the elevated boundary
+/// ([`ln8000::encoding::ELEVATED_MIN_VIN_UV`]): below it the bus is a ~5 V input
+/// and 2:1 is never requested, whatever the pack says.
+///
+/// It mirrors the 2:1 admission floor, and it used to sit at
+/// [`ln8000::encoding::SWITCHING_MIN_VIN_UV`] (8,0 V) instead. That pinned the
+/// target *above the transfer band* for any cell under ~3,875 V, because the
+/// band is `2*Vbat + {200..400} mV`: live 24.09 with the pack at 3,68–3,70 V the
+/// band was [7,56; 7,80] V while the target read 8,00 V — 200 mV above the top,
+/// exactly where the pump reports mode 3 and carries the 39 mA floor. The bus
+/// was then walked between 6,7 V and 9,0 V with the mode flapping
+/// switching ↔ bypass ↔ standby (see the note in [`trim_vin_for_pump`]).
+pub const PUMP_VIN_TARGET_ABS_MIN_UV: u32 = 6_000_000;
 /// Ceiling for a derived target (µV) — the highest bus reachable within
 /// [`MAX_PULSE_CNT`] INC pulses from the 5 V baseline ([`estimated_vbus_uv`]).
 /// Every practical band top is below it: `2*4.45 + 0.4 = 9.3 V`.
@@ -245,6 +253,16 @@ pub const WINDOW_NUDGE_MS: u64 = 10_000;
 /// out of 2:1 (mode 3↔1 flap, peaks 0.31/0.55 A between the drops). Callers
 /// must also require the *window peak* to be at the floor, not just one sample.
 pub const IIN_DEAD_FLOOR_UA: u32 = 60_000;
+/// IIN above which a mode-3 pump counts as *carrying power* (µA) - the threshold
+/// `transfer_is_useful` applies and the gate that keeps the bus correction off a
+/// working transfer.
+///
+/// The threshold and both predicates live in [`ln8000::encoding`], next to the
+/// transfer band they protect, so that they are covered by the host-side tests
+/// (this crate is `no_std` with `panic=abort` and its own tests never execute).
+/// The reasoning, with the live numbers, is in the doc comment at the
+/// definition.
+pub use ln8000::encoding::{should_walk_window, transfer_is_useful};
 
 // QC3 window invariants: the target must pass the 2:1 admission gate
 // (`2*Vbat + 250 mV`) across the whole reachable capacity of the pack and must be

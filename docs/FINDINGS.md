@@ -687,16 +687,19 @@ voltage, and that band moves as the pack charges. This project derives everythin
 
 | Constant | Value | Function | Result |
 |---|---|---|---|
-| `SWITCHING_HEADROOM_UV` | 250 mV | `min_vin_for_switching_uv` | admission: `2*vbat + 250 mV` |
+| `ELEVATED_MIN_VIN_UV` | 6.0 V | `charge_mode` | above this the only elevated mode is 2:1; 1:1 lives in `[4.2; 6.0) V` |
+| `SWITCHING_HEADROOM_UV` | 250 mV | `min_vin_for_switching_uv` | admission: `max(2*vbat + 250 mV, 6.0 V)` |
 | `SWITCHING_WINDOW_FLOOR_UV` | 200 mV | `window_floor_uv(vbat)` | band floor: `2*vbat + 200 mV` |
 | `SWITCHING_WINDOW_TOP_UV` | 400 mV | `window_top_uv(vbat)` | band top: `2*vbat + 400 mV` |
 | `SWITCHING_WINDOW_TARGET_UV` | 300 mV | `window_target_uv(vbat)` | bus target: `2*vbat + 300 mV` |
-| `SWITCHING_MIN_VIN_UV` | 8.0 V | - | absolute minimum input for 2:1 |
+| `SWITCHING_MIN_VIN_UV` | 8.0 V | - | the vendor 9 V-class bus boundary (the `FORCE_9V` wait, the sticky 2:1 verdict) - **not** the admission gate since 25.09 |
 
 `vin_in_switching_window(vin, vbat)` tests the closed band and returns false for a non-positive Vin
-or an unknown pack. Below the absolute 8.0 V floor 2:1 is never requested and the 1:1 bypass is the
-only elevated path; the mode chooser never selects 1:1 at or above 8.0 V, because that would put the
-input straight across the cell.
+or an unknown pack. Admission is pack-relative with a 6.0 V absolute floor, so a 3.70 V pack is
+admitted from 7.65 V rather than from a fixed 8.0 V (that fixed floor left the 6.0-7.65 V hole to
+the 1:1 path, see §7). The 1:1 bypass is never selected at or above 6.0 V, because above that the
+input is no longer a five-volt one and 1:1 would put the difference straight across the chip: live
+24.09 that path ran `Vin = 6.73 V` / `Iin = 2.76 A`, i.e. 2.9 V burnt on the pass FETs.
 
 How the band was derived: four measured points on 18.09 with the pack at 4.40-4.44 V. `9.088 V ->
 1887 mA` and `9.280 V -> 2513 mA` carry power; `9.744 V -> 39 mA` and `9.888 V -> 39 mA` are the
@@ -725,6 +728,60 @@ absolute floor, 9.6 V ceiling, compile-time assertions), `:445-504` (`target_vbu
 `crates/ln8000-kmdf/src/lib.rs:3078-3189` (the tick that nudges the bus and the 18.09/19.09
 measurements in the comments); `crates/ln8000/tests/thermal.rs:1-13,214-246` (a raised Vin never
 falls back to 1:1; at 5 V it does).
+
+---
+
+## 7. The bus is its own load: why a correct band still flapped (24-25.09)
+
+The operator's report was «заряд нестабильный: то падает, то нет» - the current alternates between
+the transfer and nothing. Four causes, all of them found in the driver's own marks rather than in a
+theory, and three of them in code this project had written itself.
+
+**1. The band was anchored to a channel that mirrors the bus.** The transfer band and the QC3 target
+were computed from `AdcChannel::Vbat`, the pump's own cell channel. During 2:1 that channel reads the
+converter rail, i.e. about `Vin/2`: live `VbatTickMv` 3 930-3 945 mV while the fuel gauge read
+`FgVbattMv` 3 704 mV, and `DoubledVeto = 1` in 15 % of the mode-3 rows, which is the driver's own
+"this reading is twice the battery" verdict. For a 3.70 V cell the band came out `[8.13; 8.33] V`
+against a real `[7.60; 7.80] V`, and `PUMP_VIN_TARGET_ABS_MIN_UV = 8.0 V` pinned the target above the
+band top for any pack under ~3.875 V. The bus was therefore parked above the band where the pump
+carries the 39 mA ADC floor, and the pulse batches walked it 7.6 → 8.9 V while chasing that phantom
+target. The anchor is now the fuel gauge (`anchor_cell_vbat_uv`, marks `CellVbatMv` / `CellSrc`,
+`CellSrc = 1` = gauge; the gauge's channel does not move with the bus).
+
+**2. 1:1 was allowed from 4.2 V up to 8.0 V.** For a cell at 3.74 V the 2:1 gate is 7.73 V, so the
+6.0-7.7 V hole ran the 1:1 bypass: live `SuMode = 2`, `Vin = 6.73 V`, `Iin = 2.76 A`, `Fault1Sts = 0`
+- 2.9 V of difference burnt across the pass FETs, and the loaded bus sagging under 6 V, at which
+point `desired` became `None` and the mode decision was recomputed. 1:1 is now a five-volt mode
+(`ELEVATED_MIN_VIN_UV = 6 V`).
+
+**3. A tick without an admissible mode stopped a running transfer.** The bus is its own load: a
+3.875 V cell reads 8.11 V idle and 7.80-7.95 V under 0.9 A, i.e. below the 8.00 V admission gate on
+every loaded tick - so the driver called `set_charging(false)`, the load went away, the bus relaxed
+above the gate, 2:1 came back, and the next loaded tick stopped it again. Live 675: `SuMode 3` ↔
+`SuMode 1` at 0.9 A ↔ the 39 mA floor with `ChargeAttemptN` 2→7 in about two minutes. A stopped
+charge is now allowed only when nothing is carrying (`stop_running_charge`).
+
+**4. The same "the sampled verdict outranks a live transfer" mistake in the other direction.** The
+first form of the walk gate refused *every* correction while the pump carried current: with the bus
+at 7.90 V loaded (floor 7.97 V for a 3.884 V cell) that cost the current - 0.81 A average over 240
+samples, against 1,887 A measured at 218 mV of overdrive. The rule is now directional
+(`should_walk_window(dead, transferring, below_band)`): a carrying transfer is never pulsed *down* -
+the old anchor mirrored the bus, so a downward correction chased its own estimate - but it is walked
+*up* when its own sag drags the loaded bus below the floor.
+
+**Verification, live, 25.09 with `20.47.10.677`.** An 8-minute soak while the pack charged, sampling
+the marks once a second: 480 of 480 samples in `SuMode = 3` carrying, `Iin` 1.28-1.81 A (avg 1.70 A),
+zero mode 3 enter/leave transitions, zero runs at the 39 mA floor, `ChargeAttemptN` 1→1,
+`SuPulseCnt` 1→1 (not one QC3 pulse in eight minutes), `Fault1Sts = 0` on every sample, `CellSrc = 1`
+throughout, cell 3 972 → 4 003 mV, bus 8.144-8.272 V against a band floor of ~8.21 V for that cell.
+The same charger and pack earlier the same day on `20.47.10.675` - the build with the anchor fixes
+but before causes 3 and 4 - gave 240 samples of `SuMode 3` ↔ `SuMode 1` and `Iin` 0.44-0.89 A.
+
+The lesson worth keeping: a band derived from a channel that moves with the bus cannot be used to
+drive that bus, and a *sampled* verdict about a loaded bus must never switch off or correct down a
+transfer that is visibly carrying current. Both rules are now pure functions in
+`crates/ln8000/src/encoding.rs` (`should_walk_window`, `stop_running_charge`) so that they are
+covered by host tests - the KMDF crate's own tests never execute (see §6 note on `no_std`).
 
 ---
 

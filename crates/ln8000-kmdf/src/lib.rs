@@ -438,6 +438,16 @@ struct DriverState {
     /// snapshot goes over the same SPMI bus and through the same SUPERUSER slot
     /// as the counter poll.
     last_chgr_mark_ms: u64,
+    /// Cell voltage from the PM8150B fuel gauge (µV), 0 - no sample yet.
+    ///
+    /// The anchor of the transfer band, the 2:1 admission gate and the QC3
+    /// target ([`ln8000::battery_policy::anchor_cell_vbat_uv`]). It is refreshed
+    /// with the [`Self::last_chgr_mark_ms`] snapshot and is deliberately allowed
+    /// to be stale for up to [`GAUGE_POLL_MS`]: the cell moves millivolts per
+    /// second, while the pump's own `Vbat` channel reads the converter rail the
+    /// moment 2:1 starts, and a band that moves with the bus is what makes a
+    /// correction chase its own target (see the anchor's doc comment).
+    fg_vbatt_uv: u32,
     /// Raw FCC from the [`FCC_POLICY_VALUE_NAME`] parameter - what the policy
     /// raises the buck limit to while the pump is carrying current. Zero - the
     /// policy is off, and then nobody touches register `0x1061`.
@@ -524,6 +534,7 @@ impl DriverState {
             re_elevate_next_ms: 0,
             re_elevate_backoff_ms: 0,
             last_chgr_mark_ms: 0,
+            fg_vbatt_uv: 0,
             fcc_cfg_raw: 0,
             fcc_boot_raw: 0,
             fcc_raised: false,
@@ -2304,7 +2315,10 @@ fn engage_state(input_present: bool, vin_uv: i32, vbat_uv: u32, mode: OpMode) ->
     if !input_present {
         return ENGAGE_NO_INPUT;
     }
-    if vin_uv >= SWITCHING_MIN_VIN_UV && charge_mode(vin_uv, vbat_uv).is_none() {
+    // "Elevated" is the boundary where the input stops being a ~5 V source and
+    // 1:1 becomes forbidden (`ELEVATED_MIN_VIN_UV`), not the old 8,0 V line: a bus
+    // in the 6–8 V hole with no headroom is exactly the state this code is for.
+    if vin_uv >= ln8000::encoding::ELEVATED_MIN_VIN_UV && charge_mode(vin_uv, vbat_uv).is_none() {
         return ENGAGE_NO_HEADROOM;
     }
     match mode {
@@ -2861,6 +2875,11 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
                     mark_device_value(device, "FgVbattMv", regs.fg_vbatt_uv / 1000);
                     mark_device_value(device, "VbatAdcMv", sample.vbat_uv / 1000);
                     mark_device_value(device, "ChgrErr", 0);
+                    // The same sample, kept for the band / admission / target math
+                    // of the next ticks: the fuel gauge is the only cell reading
+                    // that does not move with the bus (see
+                    // `DriverState::fg_vbatt_uv`).
+                    st.fg_vbatt_uv = regs.fg_vbatt_uv;
 
                     // The one-shot buck FCC write probe - the only way to find out
                     // whether the CHGR peripheral accepts a write at all. The live
@@ -3150,6 +3169,31 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
     }
     let vbus_uv = u32::try_from(vbus.max(0)).unwrap_or(0);
     let vbat_uv = sample.vbat_uv;
+    // The band, the 2:1 gate and the QC3 target all ride on ONE cell voltage, and
+    // the pump's own `Vbat` channel stops being a cell reading the moment 2:1
+    // starts: it then reports the middle of the converter bus (≈ Vin/2, see
+    // `ln8000::encoding::VBAT_VIN_HALF_SLACK_UV`). A band anchored to that number
+    // moves with the bus it is supposed to measure, so the correction chases its
+    // own target and walks the bus out of the transfer.
+    //
+    // Live 24.09 (this build's own marks, pump in 2:1): `HvdcpTarget = 8,18 V`
+    // — `2 × 3,94 V`, where 3,94 V was the rail-mirroring `VbatAdcMv` — while
+    // `FgVbattMv` on the same board read 3,704 V, i.e. the real band for that
+    // pack was [7,60; 7,80] V. The bus was then walked by pulse batches between
+    // 6,7 V and 9,0 V with `NudgeInc`/`BoostInc` firing while 2,2 A flowed, and
+    // the pump fell out of 2:1 (mode 1 at the brick's open-circuit level) every
+    // few seconds: `ChargeAttemptN` +5 per 20 s.
+    let cell_vbat_uv = ln8000::battery_policy::anchor_cell_vbat_uv(st.fg_vbatt_uv, vbat_uv);
+    if !device.is_null() {
+        // Which anchor the tick ran on, and its value: a band decision is not
+        // readable afterwards without them (`CellSrc`: 0 - pump ADC, 1 - gauge).
+        mark_device_value(device, "CellVbatMv", cell_vbat_uv / 1000);
+        mark_device_value(
+            device,
+            "CellSrc",
+            u32::from(cell_vbat_uv == st.fg_vbatt_uv && st.fg_vbatt_uv != 0),
+        );
+    }
     // The mode is chosen from Vin AND Vbat (cp_qc30: 2:1 only at
     // Vin >= 2*Vbat + 250 mV). An elevated Vin without headroom gives None: the
     // 1:1 bypass is forbidden there, and we do not spin a standby loop - the
@@ -3159,13 +3203,21 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
     // where `charge_mode` requires `2*Vbat + 250 mV` = 8,22 V - that is, bypass.
     // Downgrading on an instantaneous sample tore the working 2:1 every ~5 s
     // (live measurement 19.09 11:28 on MDY-11-EP: mode 1→3→1 at 0,42 A,
-    // `ChargeAttemptN` +1 per break). The sticky decision rests on the absolute
-    // 2:1 floor (8,0 V): sag is a consequence of load, not a loss of the ability
-    // to transfer.
-    let desired = if pump_alive && vbus_uv >= u32::try_from(SWITCHING_MIN_VIN_UV).unwrap_or(0) {
+    // `ChargeAttemptN` +1 per break). The sticky decision rests on the band FLOOR
+    // for the cell: sag is a consequence of load, not a loss of the ability to
+    // transfer. The floor, not the old absolute 8,0 V, because for a pack under
+    // ~3,875 V the whole band lies below 8,0 V (live 24.09, cell 3,70 V: band
+    // [7,60; 7,80] V) and the pump transfers there quite happily - the 8,0 V line
+    // would have torn that state down on every tick. It is never lowered into the
+    // 5 V region: the floor is lifted to the elevated boundary first, so a ~5 V
+    // brick with a deeply discharged pack cannot be mistaken for a 2:1 bus.
+    let band_floor_uv = ln8000::encoding::window_floor_uv(cell_vbat_uv).max(
+        u32::try_from(ln8000::encoding::ELEVATED_MIN_VIN_UV).unwrap_or(0),
+    );
+    let desired = if pump_alive && vbus_uv >= band_floor_uv {
         Some(OpMode::Switching)
     } else {
-        charge_mode(vbus, vbat_uv)
+        charge_mode(vbus, cell_vbat_uv)
     };
     let mode_ok = matches!(
         (desired, status.op_mode),
@@ -3177,7 +3229,7 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
         mark_device_value(
             device,
             "EngageState",
-            engage_state(sample.input_present, vbus, vbat_uv, status.op_mode),
+            engage_state(sample.input_present, vbus, cell_vbat_uv, status.op_mode),
         );
     }
     // The 2:1 transfer band follows the cell: while the cell takes on charge, its
@@ -3186,15 +3238,21 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
     // end the same way: mode 3 is retained (`SYS_STS=0x04`) while the transfer
     // drops to the 39 mA additive floor.
     //
-    // The input counts as elevated from `SWITCHING_MIN_VIN_UV` already: the 1:1
-    // bypass is forbidden there, so "elevated but not in 2:1" is a state to fix
-    // rather than to leave. The previous form required `desired == Switching`,
-    // while a bus BELOW the band floor gives `desired = None` (`charge_mode`
-    // requires `2*Vbat + 250 mV`) - and nobody raised it: live measurement
-    // 18.09 22:38, Vin 8,88 V with the band at [9,00; 9,20] V, mode 1, 39 mA, the
-    // attempt counter stood still because `(None, standby)` counts as a consistent
-    // state.
-    let elevated = vbus_uv >= u32::try_from(SWITCHING_MIN_VIN_UV).unwrap_or(0);
+    // The input counts as elevated from the boundary where it stops being a ~5 V
+    // source (`ELEVATED_MIN_VIN_UV`, 6,0 V): 1:1 is forbidden there, so "elevated
+    // but not in 2:1" is a state to fix rather than to leave. The previous form
+    // required `desired == Switching`, while a bus BELOW the band floor gives
+    // `desired = None` (`charge_mode` requires `2*Vbat + 250 mV`) - and nobody
+    // raised it: live measurement 18.09 22:38, Vin 8,88 V with the band at
+    // [9,00; 9,20] V, mode 1, 39 mA, the attempt counter stood still because
+    // `(None, standby)` counts as a consistent state.
+    //
+    // The boundary moved down from 8,0 V on 24.09, with the pack, not the mode
+    // list, as the reason: for a cell under ~3,875 V the whole transfer band lies
+    // below 8,0 V (live: cell 3,70 V, band [7,60; 7,80] V), so a dead transfer at
+    // 7,0–7,9 V - the state the correction exists for - had no entry into this
+    // block at all, while the very same bus in the same state was 1:1'd instead.
+    let elevated = vbus_uv >= u32::try_from(ln8000::encoding::ELEVATED_MIN_VIN_UV).unwrap_or(0);
     // A bus above 5 V is no longer a "five-volt" input: the 1:1 bypass there heats
     // the voltage difference across the chip, while the 2:1 transfer band is only
     // one QC3 step higher. The previous condition (`elevated || dead_band`)
@@ -3213,7 +3271,14 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
     // Leaving the bypass to raise the bus: on this tick the mode decision must not
     // be recomputed, it was computed from the old Vin (see below).
     let mut left_bypass_for_walk = false;
-    if vbat_uv > 0 && (elevated || dead_band || bypass_below_gate) {
+    // Whether the pump is carrying real power right now (mode 3 with a window peak
+    // above the useful floor). It gates the correction below: a live transfer is
+    // its own evidence about where the band is, and the band estimate is derived
+    // from a channel that mirrors the bus during 2:1 - see
+    // [`hvdcp::should_walk_window`].
+    let transferring = status.op_mode == OpMode::Switching
+        && hvdcp::transfer_is_useful(st.max_iin_ua);
+    if cell_vbat_uv > 0 && (elevated || dead_band || bypass_below_gate) {
         // "Dead" current is the ADC floor (39,1 mA), not "little": at the top of
         // the charge the cell draws 0,1–0,5 A, and by the instantaneous sample such
         // ticks looked dead. So it is required that both the instantaneous sample
@@ -3222,10 +3287,10 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
         let dead = status.op_mode == OpMode::Switching
             && sample.iin_ua <= hvdcp::IIN_DEAD_FLOOR_UA
             && st.max_iin_ua <= hvdcp::IIN_DEAD_FLOOR_UA;
-        let outside = !ln8000::encoding::vin_in_switching_window(vbus, vbat_uv);
+        let outside = !ln8000::encoding::vin_in_switching_window(vbus, cell_vbat_uv);
         if outside || dead {
             let now = monotonic_ms();
-            let target = hvdcp::target_vbus_uv(vbat_uv);
+            let target = hvdcp::target_vbus_uv(cell_vbat_uv);
             let err = vbus_uv.abs_diff(target);
             // Progress resets the delay; a stall (the brick does not hold the QC3
             // step, or this is a PD adapter for which the pulses are a waste of
@@ -3248,7 +3313,23 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
             let urgent = matches!(desired, Some(OpMode::Bypass))
                 && status.op_mode == OpMode::Bypass
                 && st.window_stall_n == 0;
-            if urgent || now.saturating_sub(st.last_window_nudge_ms) >= cooldown {
+            // A third opinion decides whether a pulse batch may run at all: a pump
+            // in 2:1 that is moving real current is never pulsed *down*
+            // ([`hvdcp::should_walk_window`]). Live 24.09 this is what ended the
+            // flap: the batches below fired *while* 2,2 A flowed, walked the bus
+            // 7,6 → 8,9 V and dropped the pump out of 2:1 with every round. Upward
+            // is a different matter: the band is the *loaded* bus, and a live
+            // transfer drags it below the floor by its own sag - that is the one
+            // correction a working transfer needs, and refusing it cost the
+            // current (live 676: 0,8 A at 7,90 V loaded against a 7,97 V floor).
+            let below_band = vbus_uv < ln8000::encoding::window_floor_uv(cell_vbat_uv);
+            let walk_allowed = hvdcp::should_walk_window(dead, transferring, below_band);
+            if !device.is_null() {
+                // Why the correction did or did not run on this tick
+                // (`WindowLive = 1` - held back, a live transfer above its floor).
+                mark_device_value(device, "WindowLive", u32::from(!walk_allowed));
+            }
+            if walk_allowed && (urgent || now.saturating_sub(st.last_window_nudge_ms) >= cooldown) {
                 st.last_window_nudge_ms = now;
                 st.window_stall_n = st.window_stall_n.saturating_add(1);
                 // In 1:1 an INC pulse raises the input directly onto the cell: the
@@ -3271,7 +3352,7 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
                         st.usbin_id,
                         &mut st.hvdcp,
                         vbus,
-                        vbat_uv,
+                        cell_vbat_uv,
                         dead,
                     )
                 };
@@ -3464,10 +3545,14 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
                 }
             }
         }
-    } else if desired.is_none()
-        && matches!(status.op_mode, OpMode::Switching | OpMode::Bypass)
+    } else if matches!(status.op_mode, OpMode::Switching | OpMode::Bypass)
         && !action.is_change()
+        && ln8000::encoding::stop_running_charge(desired.is_some(), transferring)
     {
+        // A transfer that is carrying current is not stopped on a sampled verdict
+        // ([`ln8000::encoding::stop_running_charge`]): the loaded bus sits below
+        // the admission gate, and stopping on it produced the mode 3 ↔ mode 1
+        // alternation (0,9 A ↔ the 39 mA floor) seen live on 24.09.
         let _ = pump.set_charging(false, &mut por_delay);
     }
 
@@ -3753,12 +3838,16 @@ fn run_hvdcp_and_land(device: WDFDEVICE) -> i32 {
     // SAFETY: called from prepare / IOCTL / timer; WDF serializes them.
     let st = unsafe { state() };
     let usbin_id = st.usbin_id;
-    let vbat_uv = st
+    let pump_vbat_uv = st
         .pump
         .as_mut()
         .and_then(|p| p.read_adc(AdcChannel::Vbat).ok())
         .map(|v| u32::try_from(v.max(0)).unwrap_or(0))
         .unwrap_or(4_000_000);
+    // The QC3 raise aims at the band centre, so it must ride on the cell and not
+    // on a channel that mirrors the bus once the pump engages (see the anchor's
+    // doc comment): the raise itself is what can put the pump into 2:1.
+    let vbat_uv = ln8000::battery_policy::anchor_cell_vbat_uv(st.fg_vbatt_uv, pump_vbat_uv);
     let (code, _) = {
         let pump = &mut st.pump;
         let hvdcp_st = &mut st.hvdcp;
@@ -3785,6 +3874,12 @@ fn run_hvdcp_and_land(device: WDFDEVICE) -> i32 {
             .read_adc(AdcChannel::Vbat)
             .ok()
             .map_or(vbat_uv, |v| u32::try_from(v.max(0)).unwrap_or(vbat_uv));
+        // Same anchor as the tick: the gauge when it has a plausible sample, else
+        // this channel. The raise above may already have put the pump into 2:1, and
+        // from that moment this channel reads the converter rail - a band taken from
+        // it would sit a half-volt above the real one and leave the bus there (live
+        // 24.09: `HvdcpTarget` 8,18 V against a 3,70 V cell).
+        let vbat_now = ln8000::battery_policy::anchor_cell_vbat_uv(st.fg_vbatt_uv, vbat_now);
         let mut engage = charge_mode(vin, vbat_now);
         if engage != Some(OpMode::Switching) && vin >= hvdcp::FIVE_V_STAY_MAX_UV {
             // The input is elevated (not the five-volt branch), but 2:1 is not yet

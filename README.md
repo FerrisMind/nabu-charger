@@ -27,8 +27,8 @@ Latest release: **0.3.1**, carrying driver **20.47.10.672**. That package
 (`nabu-ln8000-driver-0.3.1-arm64.zip`) was built and measured by hand, before this
 repository was made public; the releases on this page are produced by the `release`
 workflow. The development tablet has moved
-past that package and now runs **20.47.10.674** (`oem168.inf`, device node `OK` /
-`CM_PROB_NONE`); its two fixes are still unreleased and are described below and in the
+past that package and now runs **20.47.10.677** (`oem171.inf`, device node `OK` /
+`CM_PROB_NONE`); its fixes are still unreleased and are described below and in the
 changelog. Numbers measured on the shipped 0.3.1 package: a Quick Charge brick negotiated
 to 8.3 V, `Iin` 0.23–1.28 A, SoC 196 → 199, the charging flag 338 ms after the verdict, and
 the unplug released in 1.1 s.
@@ -37,6 +37,11 @@ The previous release, **0.3.0** (driver 20.47.10.665), introduced the access pol
 there — a process that is not elevated is refused with `ERROR_ACCESS_DENIED` (5).
 
 **At a glance:** ✅ fast charging from a Quick Charge brick · ✅ live pump telemetry ·
+⚠️ the charge current no longer alternates between the transfer and the 39 mA floor — fixed in
+the tree and awaiting a release: the transfer band and the QC3 target now come from the fuel
+gauge instead of a pump channel that mirrors the bus, a running transfer is neither pulsed
+down nor switched off on a sampled verdict, and 1:1 is a five-volt mode again (8 minutes live:
+480/480 samples carrying `Iin` 1.28–1.81 A, no mode transitions) ·
 ⚠️ a Power Delivery supply still does not grow the pack · ⚠️ the AC-verdict flap behind the
 backlight reset is fixed in the tree and awaits a release: a tick that reads only the pump's
 `2 · VBAT` reflection now carries no verdict, and the removal path stays on the hardware bit
@@ -61,7 +66,7 @@ defect is listed as unfixed, a live capture shows it happening — the evidence 
 | 🔋 Power Delivery (USB-C) supply | The driver gets AC, but the pack does not gain capacity; the negotiation above 5 V stays with the platform's Type-C part, so the full 33 W is out of reach | ⚠️ |
 | 🖥 The SMB driver's IOCTL surface | `GET_STATUS` answers; `READ_REG`, `WRITE_REG`, `SET_ICL`, `GET_JOURNAL`, `DETECT_START`, `APPLY_POLICY` return `STATUS_NOT_IMPLEMENTED`. The logic behind them is written and mock-tested; the kernel-side plumbing is not | ⚠️ |
 | 🔬 SPMI response framing | Not confirmed by reverse engineering, so register readings stay provisional | ⚠️ |
-| 💡 AC-verdict flap / backlight reset | Fixed in the tree (unreleased, driver `20.47.10.674`), awaiting a release. The 22.09 capture of the flap is in `docs/FINDINGS.md`; the 24.09 build was confirmed live — one no-verdict tick on the pull, DC 1.0 s after the cable, AC in the first sample after the replug | ⚠️ |
+| 💡 AC-verdict flap / backlight reset | Fixed in the tree (unreleased, driver `20.47.10.677`), awaiting a release. The 22.09 capture of the flap is in `docs/FINDINGS.md`; the 24.09 build was confirmed live — one no-verdict tick on the pull, DC 1.0 s after the cable, AC in the first sample after the replug | ⚠️ |
 | 💡 Panel brightness oscillates about once a second | Measured 24.09: the OS brightness flips between two fixed levels every 1.1–1.3 s for minutes, with no power-source event, no `Kernel-Power` 105 and the driver's marks constant. Independent of `ADAPTBRIGHT`, `DisplayEnhancementService`, the refresh rate and input. Not tied to the adapter: two episodes ran while the pack charged (43–53 % SOC), one ran on battery with no adapter at all (27–30 % SOC) | ❌ |
 | 📱 Other SM8150 devices | Only the Xiaomi Pad 5 has been tested; the driver binds if the node exists at I²C 0x51 | ⚠️ |
 | 🧩 A device with an LN8000 but no `PEIC` node in its DSDT | Not supported — this needs an ACPI change | ❌ |
@@ -78,7 +83,7 @@ which is how the reported backlight reset happened. Measured on the tablet with 
 AC → DC → AC in 2.647 s, with `Fault1Sts` bit 4 *clear*, so the hardware's own VBUS detector said the
 cable was there, and with every reading fully usable.
 
-**Fixed in the tree, not yet in a release** (driver `20.47.10.674`, `oem168.inf`): a tick that reads
+**Fixed in the tree, not yet in a release** (driver `20.47.10.677`, `oem171.inf`): a tick that reads
 only the reflection carries no verdict, so it cannot age the hold, while a real removal is still ended
 by the hardware bit. Confirmed live on 24.09: the pull produced exactly one `OnlineRaw = 2` /
 `DoubledVeto = 1` tick, the release followed three ticks later with `FAULT1` bit 4, and Windows saw DC
@@ -88,11 +93,11 @@ and with the adapter off as well as on — and is listed on its own.
 
 | Defect | What it does |
 |---|---|
-| AC arrives seconds after the cable | The verdict (`OnlineRaw`) is on the first tick, but Windows reads the *next* one and the pump bring-up blocks the tick: measured **8.7 s** from insertion to `pwr = 1` on a Quick Charge brick, 5.6 s on a plain 5 V one. **Fixed in the tree** (unreleased, `20.47.10.674`): the online hold is front-armed, and the 24.09 replug carried the flag in its first sample |
+| AC arrives seconds after the cable | The verdict (`OnlineRaw`) is on the first tick, but Windows reads the *next* one and the pump bring-up blocks the tick: measured **8.7 s** from insertion to `pwr = 1` on a Quick Charge brick, 5.6 s on a plain 5 V one. **Fixed in the tree** (unreleased, `20.47.10.677`): the online hold is front-armed, and the 24.09 replug carried the flag in its first sample |
 | Panel brightness oscillates about once a second | The OS brightness flips between two fixed levels every 1.1–1.3 s, in episodes of minutes, with no power-source event, no `Kernel-Power` 105 and no change in the driver's marks; the `Power` service host burns about one core during an episode. Not `ADAPTBRIGHT` (off and on both flicker), not the refresh rate, not input, not tied to the adapter: 24.09 brought two episodes on the charger (43–53 % SOC) and one on battery (27–30 % SOC, no power-state transition in a 2.6 h record). An episode starts when the brightness is changed by hand, and while one runs the power scheme's stored brightness is rewritten between the levels the panel shows, so the writes are in Windows' own brightness pipeline. It also takes the third-party "Ultra Performance" power scheme: on stock Balanced the same hand-driven brightness moves produce no episode, and switching back to that scheme and moving the slider brings the flicker back within seconds. What inside the scheme starts the loop is open; the 24.09 record is in `docs/FINDINGS.md` |
 | Die temperature is published while the ADC hibernates | `AdcValid` bit 1 is reported for a channel that is asleep, so **160.0 °C** is published and every consumer prints it faithfully |
-| LN8000 VBAT reads low | 42–43 mV below the fuel gauge, and that channel feeds the 2:1 gate |
-| `EngageState` disagrees with `SuMode` | Publishes 4 (NO_HEADROOM) while `SuMode` stays 3 (switching); mark-only noise |
+| LN8000 VBAT reads low | 42–43 mV below the fuel gauge. It used to feed the 2:1 gate; since 25.09 the gate, the band and the target take the cell from the gauge (`CellSrc = 1`) |
+| `EngageState` disagrees with `SuMode` | Publishes 4 (NO_HEADROOM) while `SuMode` stays 3 (switching). Normal during a transfer: the loaded bus sits below the admission gate. Mark-only noise since 25.09 — that state no longer switches the charge off |
 
 Two hardware faults on this tablet are unrelated to this driver but visible in its
 telemetry: the PMIC TCC node `ACPI\QCOM0582` is in an error state, and `WUDFRd` fails

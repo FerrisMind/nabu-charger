@@ -979,7 +979,7 @@ mod tests {
             BypassResolution::Allowed
         );
         assert_eq!(
-            resolve_bypass(7_999_999, 4_400_000, 5, &limits),
+            resolve_bypass(5_900_000, 4_400_000, 5, &limits),
             BypassResolution::Allowed,
             "the denial counter must not obstruct a legitimate bypass"
         );
@@ -1003,8 +1003,9 @@ mod tests {
                 reason: "die_temp_bypass_no_vin_headroom",
             }
         );
-        // 8.0 V is already denied; an input below 4.2 V is too (1:1 is useless).
-        for vin in [8_000_000, 8_416_000, 12_000_000] {
+        // 6 V and above is already denied (elevated bus); an input below 4.2 V is
+        // too (1:1 is useless).
+        for vin in [6_000_000, 6_700_000, 8_000_000, 8_416_000, 12_000_000] {
             assert!(
                 !matches!(
                     resolve_bypass(vin, 4_200_000, 0, &limits),

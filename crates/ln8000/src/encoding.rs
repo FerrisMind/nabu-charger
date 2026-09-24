@@ -85,11 +85,35 @@ impl OpMode {
 
 /// Absolute minimum pump input for 2:1 switching (µV).
 ///
-/// The live gate is [`min_vin_for_switching_uv`] (`2 * Vbat + 250 mV`, Android
-/// `cp_qc30.c` `VBUS_COMP` for the LN8000 build); this constant stays as the
-/// absolute floor below which 2:1 is never requested. Below it the 1:1 bypass
-/// is used for a ~5 V input.
+/// **Not** the admission gate — that is [`min_vin_for_switching_uv`]
+/// (`2 * Vbat + 250 mV`, Android `cp_qc30.c` `VBUS_COMP`, with
+/// [`ELEVATED_MIN_VIN_UV`] as the absolute floor). This constant stays as the
+/// boundary of the vendor 9 V-class bus: it is what the `FORCE_9V` wait treats
+/// as "the brick answered", and what the driver uses for a *sticky* 2:1 verdict
+/// while the pump already runs (a sag under load must not downgrade a working
+/// transfer).
+///
+/// It is deliberately no longer the admission floor. Live 24.09 (cell 3,70 V,
+/// `FgVbattMv` 3704): the band for that pack is [7,60; 7,80] V, i.e. entirely
+/// *below* this 8 V line, so a gate pinned here admitted nothing inside the
+/// band — the driver held the bus at 8,0–9,0 V (above the band top, where the
+/// pump carries the 39 mA floor) and any DEC batch that landed at 7,6–7,9 V fell
+/// through to the 1:1 bypass instead: 2,7 A with 2,9 V across the pass FETs, the
+/// loaded bus sagging to 6,7 V, and a mode flap switching ↔ bypass ↔ standby
+/// every few seconds.
 pub const SWITCHING_MIN_VIN_UV: i32 = 8_000_000;
+
+/// Bus at or above this is no longer a ~5 V input (µV).
+///
+/// Above it 1:1 is forbidden (the pass FETs would carry `Vin − Vbat`, live 2,9 V
+/// at 2,7 A) and 2:1 is admitted from the pack-relative gate alone. Below it the
+/// 5 V high-current bypass is the right path for a DCP-class brick.
+///
+/// 6,0 V is the same boundary the HVDCP retreat test uses for "the brick stayed
+/// near 5 V" (a 5 V brick sags to 4,45–5,05 V under load; 6 V is above anything
+/// a 5 V source reaches), and the same one the bus policy uses to decide that a
+/// 5 V-state correction is no longer silencable (see `FIVE_V_STAY_MAX_UV`).
+pub const ELEVATED_MIN_VIN_UV: i32 = 6_000_000;
 
 /// Headroom above `2 * Vbat` required to enter 2:1 (µV).
 ///
@@ -99,14 +123,28 @@ pub const SWITCHING_HEADROOM_UV: u32 = 250_000;
 
 /// Minimum Vin that can physically feed 2:1 at `vbat_uv` (µV).
 ///
-/// Live nabu case: a PD brick at 8.416 V with the pack at 4.275 V cannot run
-/// 2:1 (needs ≥ 2·4.275 + 0.25 = 8.8 V) — `enable_switching` then returns
+/// The pack-relative half is Android's gate; the absolute half is
+/// [`ELEVATED_MIN_VIN_UV`], below which the bus is a 5 V input and 2:1 is never
+/// requested. The absolute floor used to be [`SWITCHING_MIN_VIN_UV`] (8,0 V),
+/// which for any cell under ~3,875 V sits *above* the transfer band top
+/// (`2*Vbat + 400 mV`) — a state in which the pump reports mode 3 and carries the
+/// 39 mA floor while the driver keeps pulsing. Live 24.09 with the pack at
+/// 3,68–3,70 V: gate 8,0 V, band [7,56; 7,80] V, bus walked between 6,7 V and
+/// 9,0 V with the transfer in 2:1 barely half the time.
+///
+/// Live nabu case (PD brick): 8.416 V with the pack at 4.275 V cannot run 2:1
+/// (needs ≥ 2·4.275 + 0.25 = 8.8 V) — `enable_switching` then returns
 /// `ModeNotReached` every tick. Exit to standby instead of retrying.
 #[must_use]
 pub const fn min_vin_for_switching_uv(vbat_uv: u32) -> u32 {
-    vbat_uv
+    let pack_gate = vbat_uv
         .saturating_mul(2)
-        .saturating_add(SWITCHING_HEADROOM_UV)
+        .saturating_add(SWITCHING_HEADROOM_UV);
+    if pack_gate < ELEVATED_MIN_VIN_UV as u32 {
+        ELEVATED_MIN_VIN_UV as u32
+    } else {
+        pack_gate
+    }
 }
 
 /// Top of the 2:1 transfer band above `2 * Vbat` (µV) — 400 mV.
@@ -180,6 +218,73 @@ pub const fn vin_in_switching_window(vin_uv: i32, vbat_uv: u32) -> bool {
 #[must_use]
 pub const fn non_negative_uv(vin_uv: i32) -> u32 {
     if vin_uv > 0 { vin_uv.unsigned_abs() } else { 0 }
+}
+
+/// IIN above which a mode-3 pump counts as *carrying power* (µA).
+///
+/// The bus correction ([`should_walk_window`]) reads this against the *window
+/// peak*: 0,3 A sits far above the LN8000 `Iin` ADC floor (39 mA — 8 × 4,89 mA,
+/// the pump's zero) and below every measured working point — 0,75–2,86 A live in
+/// 2:1, 2,7 A in 1:1 on 24.09. A single instantaneous sample dips to the floor
+/// between the pump's own current pulses, so the instantaneous value is not a
+/// witness of "no transfer"; the peak over the window is.
+pub const IIN_USEFUL_UA: u32 = 300_000;
+
+/// Whether a mode-3 pump carries useful power (window peak above [`IIN_USEFUL_UA`]).
+#[must_use]
+pub const fn transfer_is_useful(max_iin_ua: u32) -> bool {
+    max_iin_ua > IIN_USEFUL_UA
+}
+
+/// Whether the tick may move the bus with a QC3 pulse batch.
+///
+/// The band is the *loaded* bus: a live 2:1 pulls it down by the sag of the brick
+/// and the cable, so "below the band" during a transfer is the load's signature,
+/// not a fault, and one INC step is what recovers the current. Live 24.09 the
+/// driver ran 1,7 A with the loaded bus inside its band; with no correction at
+/// all a 3,884 V cell sat at 7,90 V loaded (band floor 7,97 V) and carried
+/// 0,8 A, against 1,887 A measured at 218 mV of overdrive.
+///
+/// Pulsing *down* on a live transfer is the case this gate exists for: the old
+/// band was anchored to the pump's own `Vbat` channel, which during 2:1 reads the
+/// converter rail (≈ `Vin/2`, see [`VBAT_VIN_HALF_SLACK_UV`]) - a number that
+/// moves with the very bus the band is supposed to measure. The correction then
+/// chased its own target: live 24.09 it held `HvdcpTarget = 8,18 V` (`2 × 3,94 V`
+/// from the rail) against a 3,704 V cell, i.e. a target ~0,5 V above the real
+/// band, and the batches walked the bus 7,6 → 8,9 V with the pump dropping out of
+/// 2:1 and the current falling 2,2 A → 0,5 A every round (`NudgeInc` 6 /
+/// `BoostInc` 6 with `WindowDead = 0`). An anchor that mirrors the bus must never
+/// drive it down; a transfer that is carrying current is its own evidence about
+/// where the band is.
+///
+/// * `dead` - mode 3 on the 39 mA floor (window peak included): the bus is in the
+///   wrong place, correct it in either direction;
+/// * `below_band` - the loaded bus is under the floor: raise it, transfer or not;
+/// * otherwise a live transfer is left alone.
+#[must_use]
+pub const fn should_walk_window(dead: bool, transferring: bool, below_band: bool) -> bool {
+    dead || !transferring || below_band
+}
+
+/// Whether a tick that found no admissible mode may stop a running charge.
+///
+/// `admissible` is `charge_mode(..).is_some()` - the answer to "may 2:1 start on
+/// this bus?", measured on the bus as it is *right now*. A live 2:1 is the load
+/// on that very bus and lifts the cell with its own current, so the loaded sample
+/// comes out below the admission gate: live 24.09, 3,875 V relaxed cell (8,00 V
+/// gate) with the bus at 8,11 V idle, while the same bus under 0,9 A of transfer
+/// read 7,80–7,95 V, i.e. `desired = None` on every loaded tick (`EngageState = 4`
+/// in the driver marks, `SuMode = 3` at the same moment).
+///
+/// Stopping on such a sample is what produced the alternation the operator sees
+/// (mode 3 at ~0,9 A ↔ mode 1 at the 39 mA floor, `ChargeAttemptN` +1 per round):
+/// stop → the load is gone → the bus relaxes above the gate → 2:1 again → the
+/// next loaded sample is below it → stop. A transfer that is carrying current is
+/// therefore never stopped by the sampled verdict; the conditions that own a
+/// running charge are the guard (current, temperature, taper), not this gate.
+#[must_use]
+pub const fn stop_running_charge(admissible: bool, transferring: bool) -> bool {
+    !admissible && !transferring
 }
 
 /// Minimum Vin to attempt any charge mode (µV).
@@ -329,18 +434,25 @@ pub const fn vbat_near_float_with_vin(
 
 /// Picks the charge-pump mode from measured Vin **and** Vbat (Android-style).
 ///
-/// * `Vin >= 2*Vbat + 250 mV` (and `Vin >= SWITCHING_MIN_VIN_UV`) → 2:1
-/// * `CHARGE_MIN_VIN_UV .. SWITCHING_MIN_VIN_UV` → 1:1 bypass (5 V path)
+/// * `Vin >= 2*Vbat + 250 mV` (with [`ELEVATED_MIN_VIN_UV`] as the absolute
+///   floor) → 2:1
+/// * `CHARGE_MIN_VIN_UV .. ELEVATED_MIN_VIN_UV` → 1:1 bypass (5 V path)
 /// * elevated but no headroom, or Vin too low → `None` (standby)
 ///
-/// The bypass is **never** selected at `Vin >= SWITCHING_MIN_VIN_UV`: 1:1 feeds
-/// the input straight to the pack, so 8 V+ there would be a battery overvoltage.
+/// The bypass is **never** selected above [`ELEVATED_MIN_VIN_UV`]: 1:1 feeds the
+/// input straight to the pack, so a raised Vin there is both a battery
+/// overvoltage risk and, short of it, `Vin − Vbat` burned in the pass FETs. The
+/// old upper bound ([`SWITCHING_MIN_VIN_UV`], 8,0 V) left a 6–8 V hole in which
+/// the driver itself kept landing after a DEC overshoot, and the 1:1 it then
+/// selected sagged the bus to 6,7 V at 2,7 A — the flap described in
+/// [`min_vin_for_switching_uv`]. Above 6 V the honest answer for a bus with no
+/// 2:1 headroom is standby: the caller's bus correction owns that state.
 #[must_use]
 pub const fn charge_mode(vin_uv: i32, vbat_uv: u32) -> Option<OpMode> {
     let headroom_ok = non_negative_uv(vin_uv) >= min_vin_for_switching_uv(vbat_uv);
-    if vin_uv >= SWITCHING_MIN_VIN_UV && headroom_ok {
+    if headroom_ok {
         Some(OpMode::Switching)
-    } else if vin_uv >= CHARGE_MIN_VIN_UV && vin_uv < SWITCHING_MIN_VIN_UV {
+    } else if vin_uv >= CHARGE_MIN_VIN_UV && vin_uv < ELEVATED_MIN_VIN_UV {
         Some(OpMode::Bypass)
     } else {
         None
@@ -350,8 +462,9 @@ pub const fn charge_mode(vin_uv: i32, vbat_uv: u32) -> Option<OpMode> {
 /// Whether 1:1 (bypass) is allowed at this input - the only gate for `EN_1TO1`.
 ///
 /// `EN_1TO1` connects the input straight to the battery, so the mode is allowed
-/// only in the bypass window (`CHARGE_MIN_VIN_UV … SWITCHING_MIN_VIN_UV`). At a
-/// raised Vin (QC/PD) it is forbidden: 8 V and above on the cell is overvoltage.
+/// only in the bypass window (`CHARGE_MIN_VIN_UV … ELEVATED_MIN_VIN_UV`). At a
+/// raised Vin (QC/PD) it is forbidden: `Vin − Vbat` across the pass FETs now,
+/// and the cell's own limit a step later.
 ///
 /// The predicate is common to every path that can enable 1:1: mode selection in
 /// [`charge_mode`], thermal protection, the `SET_MODE` IOCTL and recovery after
@@ -650,12 +763,15 @@ mod tests {
         // Vin too low for anything.
         assert_eq!(charge_mode(4_000_000, 4_000_000), None);
         assert_eq!(charge_mode(4_199_999, 4_000_000), None);
-        // 5 V path: bypass while Vin stays below the 2:1 floor.
+        // 5 V path: bypass while Vin stays below the elevated floor.
         assert_eq!(charge_mode(4_200_000, 4_000_000), Some(OpMode::Bypass));
         assert_eq!(charge_mode(4_448_000, 4_000_000), Some(OpMode::Bypass)); // TA200 under load
         assert_eq!(charge_mode(5_000_000, 4_000_000), Some(OpMode::Bypass));
-        assert_eq!(charge_mode(7_999_999, 4_000_000), Some(OpMode::Bypass));
-        // 2:1 needs 2*Vbat + 250 mV: exactly 8.25 V at Vbat 4.0 V.
+        assert_eq!(charge_mode(5_999_999, 4_000_000), Some(OpMode::Bypass));
+        // A 4.0 V pack gates 2:1 at 8.25 V; below the elevated floor drains to
+        // standby, not to 1:1 (4.0 V on the cell from an 8 V bus).
+        assert_eq!(charge_mode(6_000_000, 4_000_000), None);
+        assert_eq!(charge_mode(7_999_999, 4_000_000), None);
         assert_eq!(charge_mode(8_000_000, 4_000_000), None);
         assert_eq!(charge_mode(8_249_999, 4_000_000), None);
         assert_eq!(charge_mode(8_250_000, 4_000_000), Some(OpMode::Switching));
@@ -664,16 +780,42 @@ mod tests {
     }
 
     #[test]
+    fn low_pack_admits_2to1_inside_its_own_band() {
+        // Live 24.09: cell 3,68–3,70 V (`FgVbattMv` 3704 against `VbatAdcMv`
+        // 3695, standby), band [7,56; 7,80] V — every point of it below the old
+        // 8,0 V admission floor, which is why the driver could not hold the
+        // transfer there.
+        let vbat = 3_700_000;
+        assert_eq!(min_vin_for_switching_uv(vbat), 7_650_000);
+        // The band centre (the target the correction aims at) is admitted.
+        assert_eq!(window_target_uv(vbat), 7_700_000);
+        assert_eq!(charge_mode(7_700_000, vbat), Some(OpMode::Switching));
+        // Admission keeps the vendor 250 mV gate while the band floor is 200 mV
+        // above 2*Vbat, so the lowest 50 mV of the band is refused — the same
+        // asymmetry as before, now sitting 350 mV lower for this pack.
+        assert_eq!(charge_mode(7_600_000, vbat), None);
+        // Above the band the bus is still admitted (2:1 is not refused for being
+        // too high — the pump carries the floor there and the correction owns
+        // the bus), and the elevated floor no longer 1:1's it.
+        assert_eq!(charge_mode(7_800_000, vbat), Some(OpMode::Switching));
+        assert_eq!(charge_mode(8_000_000, vbat), Some(OpMode::Switching));
+    }
+
+    #[test]
     fn elevated_vin_without_headroom_is_never_bypass() {
         // Live nabu: PD brick 8.416 V while the pack sits at 4.275 V.
         // 2:1 needs >= 8.8 V, and 1:1 would put 8.4 V across the battery.
         assert_eq!(min_vin_for_switching_uv(4_275_000), 8_800_000);
         assert_eq!(charge_mode(8_416_000, 4_275_000), None);
-        // Absolute floor still binds for a low pack: 7.5 V >= 2*3.5+0.25 V.
-        assert_eq!(charge_mode(7_500_000, 3_500_000), Some(OpMode::Bypass));
-        assert_eq!(charge_mode(8_000_000, 3_500_000), Some(OpMode::Switching));
-        // Sanity: no 1:1 selection at or above the 2:1 floor.
-        for vin in (8_000_000..12_000_000).step_by(250_000) {
+        // A bus in the 6–8 V hole is standby, never 1:1: live 24.09 the 1:1
+        // selected there carried 2,7 A with 2,9 V across the pass FETs and
+        // sagged the bus to 6,7 V.
+        assert_eq!(charge_mode(6_700_000, 3_700_000), None);
+        assert_eq!(charge_mode(7_500_000, 3_500_000), Some(OpMode::Switching));
+        assert_eq!(charge_mode(7_249_999, 3_500_000), None);
+        assert_eq!(charge_mode(7_250_000, 3_500_000), Some(OpMode::Switching));
+        // Sanity: no 1:1 selection at or above the elevated floor.
+        for vin in (6_000_000..12_000_000).step_by(250_000) {
             assert_ne!(
                 charge_mode(vin, 4_200_000),
                 Some(OpMode::Bypass),
@@ -685,11 +827,12 @@ mod tests {
     #[test]
     fn hvdcp_bus_target_admits_switching_across_the_pack_range() {
         // Host-side mirror of `hvdcp::target_vbus_uv`: the mid-band target,
-        // clamped up to the absolute 2:1 floor so a low pack still admits the
-        // mode. The KMDF crate is `no_std` with `panic=abort`, so its
-        // `#[cfg(test)]` tests cannot execute — this one stands in for them.
+        // clamped up to the elevated floor (`ELEVATED_MIN_VIN_UV`, 6 V) so a
+        // very low pack still admits the mode. The KMDF crate is `no_std` with
+        // `panic=abort`, so its `#[cfg(test)]` tests cannot execute — this one
+        // stands in for them.
         for vbat in (3_000_000..=4_500_000).step_by(50_000) {
-            let target = window_target_uv(vbat).max(SWITCHING_MIN_VIN_UV as u32);
+            let target = window_target_uv(vbat).max(ELEVATED_MIN_VIN_UV as u32);
             // The window is a few volts, so the conversion never saturates.
             let vin_uv = i32::try_from(target).unwrap_or(i32::MAX);
             assert_eq!(
@@ -697,9 +840,9 @@ mod tests {
                 Some(OpMode::Switching),
                 "target {target} must allow 2:1 at Vbat {vbat}"
             );
-            // Never above the band top unless the absolute floor pins it there.
+            // Never above the band top unless the elevated floor pins it there.
             assert!(
-                target <= window_top_uv(vbat).max(SWITCHING_MIN_VIN_UV as u32),
+                target <= window_top_uv(vbat).max(ELEVATED_MIN_VIN_UV as u32),
                 "target {target} is above the window at Vbat {vbat}"
             );
         }
@@ -731,8 +874,11 @@ mod tests {
     #[test]
     fn bypass_window_covers_only_the_five_volt_side() {
         // Single gate for every path that enables EN_1TO1 (thermal protection,
-        // SET_MODE, recovery after soft_reset): the 4.2-8 V window, regardless of Vbat.
-        for vin in [4_200_000, 4_500_000, 5_000_000, 7_999_999] {
+        // SET_MODE, recovery after soft_reset): the 4.2-6.0 V window, regardless of
+        // Vbat. The upper bound is the elevated boundary — above it the input is a
+        // QC/PD bus, and 1:1 would put `Vin − Vbat` across the pass FETs (live
+        // 24.09: 2,7 A with 2,9 V there, the bus sagging to 6,7 V).
+        for vin in [4_200_000, 4_500_000, 5_000_000, 5_999_999] {
             for vbat in [0, 3_900_000, 4_470_000] {
                 assert!(
                     bypass_allowed_by_vin(vin, vbat),
@@ -740,7 +886,9 @@ mod tests {
                 );
             }
         }
-        for vin in [8_000_000, 8_416_000, 9_000_000, 12_000_000] {
+        for vin in [
+            6_000_000, 6_700_000, 7_999_999, 8_416_000, 9_000_000, 12_000_000,
+        ] {
             for vbat in [0, 3_900_000, 4_275_000, 4_470_000] {
                 assert!(
                     !bypass_allowed_by_vin(vin, vbat),
@@ -859,5 +1007,45 @@ mod tests {
         // A failed read is invalid for any value.
         assert!(!vbat_reading_usable(false, 4_400_000));
         assert!(!vbat_reading_usable(false, 0));
+    }
+
+    #[test]
+    fn a_live_transfer_is_walked_up_but_never_down() {
+        // A dead transfer is the one case that always asks for a correction, in
+        // both directions of the band.
+        assert!(should_walk_window(true, false, false));
+        assert!(should_walk_window(true, true, false));
+        assert!(should_walk_window(true, true, true));
+        // Nothing flowing: the bus can be placed.
+        assert!(should_walk_window(false, false, false));
+        // Carrying and above the floor: leave it alone. Live 24.09 the driver
+        // pulsed exactly here (`WindowDead = 0`, `BoostInc` 6, 2,2 A in the same
+        // window) and walked the bus 7,6 -> 8,9 V out of the band.
+        assert!(!should_walk_window(false, true, false));
+        // Carrying and dragged below the floor by its own load: raise it - the
+        // sag is the load's signature, and one INC step is what recovers the
+        // current (live 676: 0,8 A at 7,90 V loaded against a 7,97 V floor).
+        assert!(should_walk_window(false, true, true));
+        // The carrier test sits above the LN8000 `Iin` floor (39 mA, the pump's
+        // zero) and below every measured working point.
+        assert_eq!(IIN_USEFUL_UA, 300_000);
+        assert!(!transfer_is_useful(39_000));
+        assert!(!transfer_is_useful(IIN_USEFUL_UA));
+        assert!(transfer_is_useful(680_000));
+        assert!(transfer_is_useful(2_200_000));
+        assert!(transfer_is_useful(2_760_000));
+    }
+
+    #[test]
+    fn a_live_transfer_outranks_the_sampled_band_verdict() {
+        // An admissible bus: nothing to stop.
+        assert!(!stop_running_charge(true, false));
+        assert!(!stop_running_charge(true, true));
+        // Not admissible and nothing flowing: the charge is stopped, as before.
+        assert!(stop_running_charge(false, false));
+        // Not admissible but carrying: left running. Live 24.09 this sample
+        // (`SuMode = 3`, 0,9 A, loaded bus 7,80 V against an 8,00 V gate) is what
+        // switched the charge off and started the flap.
+        assert!(!stop_running_charge(false, true));
     }
 }

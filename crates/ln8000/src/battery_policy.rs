@@ -576,6 +576,56 @@ pub const fn adc_wake_needed(input_readings_usable: bool, vac_unplug: bool) -> O
     None
 }
 
+/// Lowest cell voltage the PM8150B fuel gauge is trusted to report (µV).
+///
+/// Below it the sample is not a cell: the platform cuts off far above it, and a
+/// raw zero (register pair read, fuel gauge not measuring) would otherwise look
+/// like a deeply discharged pack and drag the whole transfer band down with it.
+pub const FG_VBATT_MIN_PLAUSIBLE_UV: u32 = 2_500_000;
+/// Highest cell voltage the PM8150B fuel gauge is trusted to report (µV).
+///
+/// The 16-bit pair tops out at 8,0 V (`65535 × 122,07 µV`), so a saturated /
+/// misdecoded register also lands below this; the cell's own hard limit
+/// (`bat-ovp` 4,56 V) is the physical reason for the bound.
+pub const FG_VBATT_MAX_PLAUSIBLE_UV: u32 = 4_600_000;
+
+/// Whether a fuel-gauge cell-voltage sample may drive the transfer band.
+#[must_use]
+pub const fn fg_vbatt_plausible(uv: u32) -> bool {
+    uv >= FG_VBATT_MIN_PLAUSIBLE_UV && uv <= FG_VBATT_MAX_PLAUSIBLE_UV
+}
+
+/// The cell voltage the transfer band, the 2:1 admission gate and the QC3 target
+/// all ride on: the fuel gauge when it has a plausible sample, else the pump's
+/// own VBAT channel.
+///
+/// # Why the choice exists
+///
+/// The band is anchored to the *cell* (`2·Vbat + {200,300,400} mV`), so the
+/// anchor has to be a cell measurement. The LN8000's own `Vbat` channel is one
+/// only while the pump is idle: in 2:1 it reads the middle of the converter bus
+/// (≈ `Vin/2`, see `encoding::VBAT_VIN_HALF_SLACK_UV`) — a number that moves with
+/// the very bus the band is supposed to measure. A correction driven by it
+/// chases its own target: live 24.09 the driver held `HvdcpTarget = 8,18 V`
+/// (that is `2 × 3,94 V` from the rail) while the fuel gauge reported a 3,70 V
+/// cell on the same board, i.e. the target sat ~0,5 V above the real band, and
+/// the bus was walked 7,6 → 8,9 V with the pump dropping out of 2:1 and the
+/// current falling to 0,5 A.
+///
+/// The PM8150B fuel gauge measures the cell at its own terminal on its own SPMI
+/// path and its own ADC (the `0x41A0` pair — the same snapshot the cell current
+/// comes from), so its sample does not move with the bus; it is capped to
+/// [`FG_VBATT_MIN_PLAUSIBLE_UV`]..[`FG_VBATT_MAX_PLAUSIBLE_UV`] so a failed read
+/// cannot move the band either.
+#[must_use]
+pub const fn anchor_cell_vbat_uv(fg_uv: u32, pump_uv: u32) -> u32 {
+    if fg_vbatt_plausible(fg_uv) {
+        fg_uv
+    } else {
+        pump_uv
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1202,5 +1252,27 @@ mod tests {
                 .update(true, 1_500, ONLINE_HOLD_MS)
                 .held
         );
+    }
+
+    #[test]
+    fn cell_anchor_prefers_the_gauge_and_bounds_it() {
+        // Live 24.09: the gauge said 3704 mV while the pump channel said 3695 mV
+        // in standby and 3940 mV in 2:1 - the gauge is the one that does not move
+        // with the bus, so it wins whenever it is plausible.
+        assert_eq!(anchor_cell_vbat_uv(3_704_000, 3_940_000), 3_704_000);
+        assert_eq!(anchor_cell_vbat_uv(3_704_000, 3_695_000), 3_704_000);
+        // The `0xFFFFFFFF` failure sentinel and a raw zero are not a cell and
+        // must not move the band down (or up).
+        assert_eq!(anchor_cell_vbat_uv(u32::MAX, 3_700_000), 3_700_000);
+        assert_eq!(anchor_cell_vbat_uv(0, 3_700_000), 3_700_000);
+        // Below the platform cutoff / above `bat-ovp` the sample is refused.
+        assert_eq!(anchor_cell_vbat_uv(2_499_999, 3_700_000), 3_700_000);
+        assert_eq!(anchor_cell_vbat_uv(4_600_001, 3_700_000), 3_700_000);
+        assert_eq!(anchor_cell_vbat_uv(4_600_000, 3_700_000), 4_600_000);
+        assert_eq!(anchor_cell_vbat_uv(2_500_000, 3_700_000), 2_500_000);
+        // With no gauge sample at all the pump channel is still the fallback.
+        assert_eq!(anchor_cell_vbat_uv(0, 0), 0);
+        assert!(fg_vbatt_plausible(3_700_000));
+        assert!(!fg_vbatt_plausible(u32::MAX));
     }
 }

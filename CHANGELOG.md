@@ -7,6 +7,46 @@ and versions follow [SemVer](https://semver.org/lang/ru/).
 
 ### Fixed
 
+* **The charge no longer alternates between the transfer and the 39 mA floor**
+  (the operator's «заряд нестабильный: то падает, то нет»). Four coupled causes, all
+  measured live on 24.09 and 25.09:
+  1. **1:1 was allowed from 4,2 V up to 8,0 V of input.** For a 3,74 V cell the 2:1
+     gate is only 7,73 V, so the 6,0–7,7 V hole ran the 1:1 path: live `SuMode = 2`
+     at `Vin = 6,73 V` / `Iin = 2,76 A` - 2,9 V of difference burnt across the chip.
+     The boundary is now `ELEVATED_MIN_VIN_UV = 6 V`: 1:1 stays a five-volt mode, and
+     above it `charge_mode` is either 2:1 or nothing.
+  2. **The transfer band and the QC3 target were anchored to the pump's own `Vbat`
+     channel**, which during 2:1 reads the converter rail (≈ `Vin/2`): live
+     `VbatTickMv` 3 930–3 945 mV against `FgVbattMv` 3 704 mV, `DoubledVeto = 1` in
+     15 % of the mode-3 rows. The band came out `[8,13; 8,33] V` for a 3,70 V cell
+     whose real band is `[7,60; 7,80] V`, and `PUMP_VIN_TARGET_ABS_MIN_UV = 8,0 V`
+     pinned the target above the band top for any pack under ~3,875 V - the bus was
+     parked where the pump carries only the floor. The band, the target and the
+     post-negotiation landing now take the cell from the fuel gauge
+     (`anchor_cell_vbat_uv`; `CellVbatMv` / `CellSrc` marks, `CellSrc = 1` = gauge),
+     the target floor is 6 V, and the admission gate is pack-relative with a 6 V
+     absolute floor (`min_vin_for_switching_uv`).
+  3. **A tick that found no admissible mode stopped a running transfer**
+     (`set_charging(false)`). The bus is its own load: a 3,875 V cell reads 8,11 V
+     idle against 7,80–7,95 V under 0,9 A, i.e. below the 8,00 V admission gate on
+     every loaded tick, so the driver stopped, the load went away, the bus relaxed
+     above the gate, 2:1 came back - mode 3 ↔ mode 1 at ~0,9 A ↔ the 39 mA floor with
+     `ChargeAttemptN` +1 per round (live 675: `ChargeAttemptN` 2→7 in ~2 min).
+     `stop_running_charge` now requires that nothing is carrying.
+  4. **Pulse batches fired while a live transfer ran**: live `WindowDead = 0`,
+     `NudgeInc = 6` / `BoostInc = 6` with a 2,2 A peak in the same window and
+     `TrimDec` 7→0 in 20 s. `should_walk_window(dead, transferring, below_band)`
+     never pulses a carrying transfer *down* - the old anchor mirrored the bus, so
+     the correction chased its own estimate - but does walk it *up* when its own sag
+     drags the loaded bus below the floor. The first, blanket form of that gate (no
+     correction at all while carrying) cost the current: 0,81 A average over 240
+     samples against 1,70 A with the direction rule.
+  Verified live on 25.09 with `20.47.10.677`, an 8-minute soak while charging: 480 of
+  480 samples in `SuMode = 3` carrying, `Iin` 1,28–1,81 A (avg 1,70 A), zero mode
+  transitions, zero runs at the 39 mA floor, `ChargeAttemptN` 1→1, `SuPulseCnt` 1→1,
+  `Fault1Sts = 0` on every sample, cell 3,972 → 4,003 V. On the same charger and pack
+  earlier that day (`20.47.10.675`) the same record was 240 samples of `SuMode 3` ↔
+  `SuMode 1` and `Iin` 0,44–0,89 A.
 * **The AC verdict no longer flips while the brick stays attached, and a tick that
   reads only a reflection carries no verdict.** The one rejection in `online_raw` that
   also happens with a live adapter is the doubling veto: while the pump is out of

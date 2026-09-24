@@ -45,11 +45,11 @@ if (-not $env:LIBCLANG_PATH) { $env:LIBCLANG_PATH = 'C:\Program Files\LLVM\bin' 
 # stampinf -v * (wall-clock), which can stamp below what is already installed
 # and the install is then refused as "Outranked". Keep this in lockstep with the
 # DriverVer line in crates/ln8000-kmdf/ln8000_kmdf.inx.
-# Highest package on the tablet at the time of writing: oem167, which is
-# 20.47.10.673 (oem166 is 20.47.10.672). This version (20.47.10.674) stamps above
-# them; the next build after this one has to stamp above 674.
+# Highest package on the tablet at the time of writing: oem170, which is
+# 20.47.10.675 (oem169 is 20.47.10.676). This version (20.47.10.677) stamps above
+# them; the next build after this one has to stamp above 677.
 if (-not $env:STAMPINF_VERSION) {
-  $env:STAMPINF_VERSION = '20.47.10.674'
+  $env:STAMPINF_VERSION = '20.47.10.677'
 }
 Write-Host ("STAMPINF_VERSION=" + $env:STAMPINF_VERSION) -ForegroundColor DarkGray
 
