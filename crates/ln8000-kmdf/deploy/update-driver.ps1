@@ -24,7 +24,36 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 }
 
 $version = (Get-Item -LiteralPath (Join-Path $PackageDir 'ln8000_kmdf.sys')).VersionInfo.FileVersion
+if (-not $version) {
+  # These packages carry no version resource in the .sys: the hook that stamps one is not
+  # part of the build. The INF is where the version actually is.
+  $infText = Get-Content -LiteralPath $inf -Raw
+  $m = [regex]::Match($infText, 'DriverVer\s*=\s*([^\r\n]+)')
+  if ($m.Success) { $version = $m.Groups[1].Value.Trim() } else { $version = '(not declared)' }
+}
 Write-Host ("=== updating to version " + $version) -ForegroundColor Cyan
+
+# 0. Trust the certificate this package is signed with. Every build carries its own
+# self-signed test certificate, so an update over an older release is signed by a
+# certificate the machine has never seen and pnputil refuses it with 0x800B0109
+# (CERT_E_UNTRUSTEDROOT). Measured on the tablet on 24.09.2026 while installing the
+# 0.3.3 archive over a local build. install-driver.ps1 does the same before its install.
+$cer = Join-Path $PackageDir 'WDRLocalTestCert.cer'
+if (Test-Path -LiteralPath $cer) {
+  $thumb = (Get-PfxCertificate -FilePath $cer).Thumbprint
+  foreach ($store in @('Root', 'TrustedPublisher')) {
+    $present = Get-ChildItem "Cert:\LocalMachine\$store" -ErrorAction SilentlyContinue |
+      Where-Object { $_.Thumbprint -eq $thumb }
+    if ($present) {
+      Write-Host "  certificate already in $store" -ForegroundColor DarkGray
+    } else {
+      Import-Certificate -FilePath $cer -CertStoreLocation "Cert:\LocalMachine\$store" | Out-Null
+      Write-Host "  certificate added to $store" -ForegroundColor Green
+    }
+  }
+} else {
+  Write-Host '  no WDRLocalTestCert.cer nearby - assuming the signing certificate is trusted' -ForegroundColor DarkGray
+}
 
 # 1. Save the currently installed package - this is the rollback point.
 New-Item -ItemType Directory -Path $BackupDir -Force | Out-Null

@@ -115,6 +115,25 @@ These are the checks that catch the mistakes this project has actually made:
 | Machine field of the PE header is `0xAA64` | a host-architecture build links and signs but will not load |
 | `Get-AuthenticodeSignature` reports `Valid` for the `.sys` and the `.cat` | test signing has to be on at the target for this to matter, but a broken signature fails earlier |
 | `.\deploy\verify-package.ps1` | the repository's own package check, 35 criteria |
+| `WDRLocalTestCert.cer` in the archive matches the signer of the `.cat` and the `.sys` | every build makes its own test certificate; the archive must ship the one that signed it, or the reader imports a certificate that cannot help |
+| The archive that is about to be published, installed and read back on the tablet | the image is tied to the crate versions, not only to the sources - see below |
+
+### The image is tied to the crate versions
+
+Bumping `[workspace.package] version` changes the image: the version enters each crate's
+disambiguator, so symbol names and every reference to them move. Measured on 24.09.2026
+while preparing 0.3.3 - the same sources built at `0.3.2` and at `0.3.3` differ in
+13 659 bytes outside the signature and the checksum, while two builds of the *same*
+version differ in **0 bytes** there (and the second codegen pass inside
+`build-arm64.ps1` reports the same).
+
+Two consequences:
+
+* A package built before the bump is not the package the release ships, even if the
+  sources are otherwise identical. Verify the archive, not an earlier local build.
+* `reproducible: true` in the manifest means what it says: two builds of one tree agree
+  byte for byte outside the signature. It does not carry across a version bump.
+
 
 The machine-field check, without opening a disassembler:
 

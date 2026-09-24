@@ -137,6 +137,12 @@ All seven codes are implemented in the driver:
 .\update-driver.ps1
 ```
 
+`update-driver.ps1` imports `WDRLocalTestCert.cer` from the package into `Root` and
+`TrustedPublisher` before installing. Every build carries its own self-signed test
+certificate, so an update over an older release is signed by a certificate the machine
+has not seen, and `pnputil` refuses it with `0x800B0109` (`CERT_E_UNTRUSTEDROOT`) - a
+missing trust anchor, not a signing error. Measured on the tablet on 24.09.2026.
+
 **Rollback:**
 
 ```powershell

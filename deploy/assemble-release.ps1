@@ -152,6 +152,13 @@ cd ln8000
 The driver writes nothing to firmware and changes no power settings, so removing
 it returns the device to its pre-installation behaviour.
 
+Each build carries its own self-signed test certificate (`WDRLocalTestCert.cer` in this
+archive), so an update over an older release is signed by a certificate the machine has
+never seen. Both scripts import this archive's certificate into `Root` and
+`TrustedPublisher` themselves before installing; without that step `pnputil` refuses the
+package with `0x800B0109` (`CERT_E_UNTRUSTEDROOT`), which is not a signing error but a
+missing trust anchor.
+
 `update-driver.ps1` exports the installed package to
 `%ProgramData%\nabu-fastcharge\backup` before installing the new one, and that export is
 the rollback point. A package whose `DriverVer` is lower than the one already in the

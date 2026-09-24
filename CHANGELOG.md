@@ -56,6 +56,17 @@ archive itself is verified on the same tablet before the release is published.
   local build used to measure the battery switch; it never shipped, and the released
   number is above it so an install over that test build is accepted.
 
+### Fixed
+
+* **`update-driver.ps1` imports the archive's test certificate before installing, and
+  reads the version from the INF.** Every build produces its own self-signed
+  `WDRLocalTestCert`, so an update over an older release was signed by a certificate the
+  machine had never seen and `pnputil` refused it with `0x800B0109`
+  (`CERT_E_UNTRUSTEDROOT`) - measured on the tablet on 24.09.2026 while installing this
+  release's archive over a local build. `install-driver.ps1` already imported the
+  certificate; the update path did not. The version banner was also empty, because these
+  packages carry no version resource in the `.sys` and the script read it from there.
+
 ### Known, and deliberately not fixed
 
 * **A patched `qcpmicext8150.sys` (`usbfix` / fix20) is outside the verified
