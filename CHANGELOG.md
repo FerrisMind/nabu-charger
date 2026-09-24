@@ -5,6 +5,8 @@ and versions follow [SemVer](https://semver.org/lang/ru/).
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-09-24
+
 ### Fixed
 
 * **The charge no longer alternates between the transfer and the 39 mA floor**
