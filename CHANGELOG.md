@@ -29,9 +29,11 @@ and versions follow [SemVer](https://semver.org/lang/ru/).
   the release came with `FAULT1` bit 4 three ticks later, and Windows saw DC 1,0 s after
   the cable. The phantom unplug is not the whole backlight story: on the same day, with
   `20.47.10.674` installed, the panel brightness oscillated about once a second between
-  two fixed levels for minutes at a time - with the adapter attached, no `Kernel-Power`
+  two fixed levels for minutes at a time - with no `Kernel-Power`
   105 and no change in the driver's own marks - so that oscillation has a different cause
-  and the marks above are what tell the two apart.
+  and the marks above are what tell the two apart. The adapter is not part of it either:
+  two episodes ran while it charged the pack and a third ran on battery with no adapter
+  at all (27-30 % SOC, not one power-state transition in a 2.6 h record).
 * **AC now arrives with the cable, not one blocked tick later.** The verdict was
   already correct on the first tick that saw the adapter (`OnlineRaw = 1`), but the
   hold that publishes `POWER_ON_LINE` needed two consecutive raw-true samples

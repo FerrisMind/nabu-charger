@@ -40,8 +40,8 @@ there — a process that is not elevated is refused with `ERROR_ACCESS_DENIED` (
 ⚠️ a Power Delivery supply still does not grow the pack · ⚠️ the AC-verdict flap behind the
 backlight reset is fixed in the tree and awaits a release: a tick that reads only the pump's
 `2 · VBAT` reflection now carries no verdict, and the removal path stays on the hardware bit
-(three ticks, measured at 1.1 s from cable-out) · ⚠️ a ~1 Hz panel-brightness oscillation
-seen with the adapter attached is a **separate** defect and is still unexplained
+(three ticks, measured at 1.1 s from cable-out) · ⚠️ a ~1 Hz panel-brightness oscillation,
+measured on the adapter and on battery alike, is a **separate** defect and is still unexplained
 
 Every row below rests on a measurement on the tablet, not on a passing test. Where a
 defect is listed as unfixed, a live capture shows it happening — the evidence is in
@@ -61,7 +61,7 @@ defect is listed as unfixed, a live capture shows it happening — the evidence 
 | 🖥 The SMB driver's IOCTL surface | `GET_STATUS` answers; `READ_REG`, `WRITE_REG`, `SET_ICL`, `GET_JOURNAL`, `DETECT_START`, `APPLY_POLICY` return `STATUS_NOT_IMPLEMENTED`. The logic behind them is written and mock-tested; the kernel-side plumbing is not | ⚠️ |
 | 🔬 SPMI response framing | Not confirmed by reverse engineering, so register readings stay provisional | ⚠️ |
 | 💡 AC-verdict flap / backlight reset | Fixed in the tree (unreleased, driver `20.47.10.674`), awaiting a release. The 22.09 capture of the flap is in `docs/FINDINGS.md`; the 24.09 build was confirmed live — one no-verdict tick on the pull, DC 1.0 s after the cable, AC in the first sample after the replug | ⚠️ |
-| 💡 Panel brightness oscillates about once a second with the adapter attached | Measured 24.09: the OS brightness flips between two fixed levels every 1.1–1.3 s for minutes while the pack charges, with no power-source event, no `Kernel-Power` 105 and the driver's marks constant. Independent of `ADAPTBRIGHT`, `DisplayEnhancementService`, the refresh rate, input and the charge level | ❌ |
+| 💡 Panel brightness oscillates about once a second | Measured 24.09: the OS brightness flips between two fixed levels every 1.1–1.3 s for minutes, with no power-source event, no `Kernel-Power` 105 and the driver's marks constant. Independent of `ADAPTBRIGHT`, `DisplayEnhancementService`, the refresh rate and input. Not tied to the adapter: two episodes ran while the pack charged (43–53 % SOC), one ran on battery with no adapter at all (27–30 % SOC) | ❌ |
 | 📱 Other SM8150 devices | Only the Xiaomi Pad 5 has been tested; the driver binds if the node exists at I²C 0x51 | ⚠️ |
 | 🧩 A device with an LN8000 but no `PEIC` node in its DSDT | Not supported — this needs an ACPI change | ❌ |
 
@@ -82,13 +82,13 @@ only the reflection carries no verdict, so it cannot age the hold, while a real 
 by the hardware bit. Confirmed live on 24.09: the pull produced exactly one `OnlineRaw = 2` /
 `DoubledVeto = 1` tick, the release followed three ticks later with `FAULT1` bit 4, and Windows saw DC
 1.0 s after the cable. The same build carries the latency fix in the table below. The brightness
-oscillation measured the same day is a different defect — it runs with no power-source event at all —
-and is listed on its own.
+oscillation measured the same day is a different defect — it runs with no power-source event at all,
+and with the adapter off as well as on — and is listed on its own.
 
 | Defect | What it does |
 |---|---|
 | AC arrives seconds after the cable | The verdict (`OnlineRaw`) is on the first tick, but Windows reads the *next* one and the pump bring-up blocks the tick: measured **8.7 s** from insertion to `pwr = 1` on a Quick Charge brick, 5.6 s on a plain 5 V one. **Fixed in the tree** (unreleased, `20.47.10.674`): the online hold is front-armed, and the 24.09 replug carried the flag in its first sample |
-| Panel brightness oscillates about once a second | With the adapter attached and the pack charging, the OS brightness flips between two fixed levels every 1.1–1.3 s, in episodes of minutes, with no power-source event, no `Kernel-Power` 105 and no change in the driver's marks; the `Power` service host burns about one core during an episode. Not `ADAPTBRIGHT` (off and on both flicker), not the refresh rate, not input, not the charge level. Cause not established; the 24.09 record is in `docs/FINDINGS.md` |
+| Panel brightness oscillates about once a second | The OS brightness flips between two fixed levels every 1.1–1.3 s, in episodes of minutes, with no power-source event, no `Kernel-Power` 105 and no change in the driver's marks; the `Power` service host burns about one core during an episode. Not `ADAPTBRIGHT` (off and on both flicker), not the refresh rate, not input, not tied to the adapter: 24.09 brought two episodes on the charger (43–53 % SOC) and one on battery (27–30 % SOC, no power-state transition in a 2.6 h record). Cause not established; the 24.09 record is in `docs/FINDINGS.md` |
 | Die temperature is published while the ADC hibernates | `AdcValid` bit 1 is reported for a channel that is asleep, so **160.0 °C** is published and every consumer prints it faithfully |
 | LN8000 VBAT reads low | 42–43 mV below the fuel gauge, and that channel feeds the 2:1 gate |
 | `EngageState` disagrees with `SuMode` | Publishes 4 (NO_HEADROOM) while `SuMode` stays 3 (switching); mark-only noise |

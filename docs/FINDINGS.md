@@ -587,10 +587,11 @@ Evidence: the marks read over SSH at 21:0x-21:40; the 250 ms poller writing `mar
 
 ### A ~1 Hz panel-brightness oscillation that is not a power-source event (24.09)
 
-With `20.47.10.674` installed and the adapter **attached and carrying current**, the panel brightness
-started flipping between two fixed levels and stayed in that state for minutes: episodes
-13:09:37-13:12:58 and 13:18:00-13:30:5x, each level held 1.1-1.3 s (about 2.1 s per full cycle),
-with quiet windows 13:13-13:17 and from 13:31. Measured properties:
+With `20.47.10.674` installed the panel brightness started flipping between two fixed levels and
+stayed in that state for minutes. Three episodes on 24.09: two with the adapter **attached and
+carrying current**, 13:09:37-13:12:58 and 13:18:00-13:30:5x, each level held 1.1-1.3 s (about 2.1 s
+per full cycle) with quiet windows 13:13-13:17 and from 13:31; and one with **no adapter at all**,
+15:15:44-15:38:13, on battery. Measured properties:
 
 * The flip is in the OS's own brightness value, not in the reading. The registry value under
   `ADED5E82...` (`VIDEONORMALLEVEL`) alternated `73 <-> 85` in anti-phase with the WMI
@@ -599,23 +600,37 @@ with quiet windows 13:13-13:17 and from 13:31. Measured properties:
 * No power-source event on any row: `BattPwr` stayed `5` (`POWER_ON_LINE | CHARGING`), `OnlineRaw`
   `1`, `InputUsable` `1`, `SuVinUv`/`SuIin`/`SuMode`/`DoubledVeto` constant, and no `Kernel-Power`
   105 arrived. Charge current followed the brightness (the brighter level drew more panel power).
+  The battery-only episode reads `BattPwr = 2` (`POWER_ON_BATTERY`), `OnlineRaw` `0` and
+  `InputUsable` `0` on every one of its rows.
 * Not `ADAPTBRIGHT` (episodes ran with it Off and with it On), not the refresh rate (120 Hz
-  throughout), not input (`GetLastInputInfo` showed ~2 h idle), not the charge level: episodes ran
-  at 43-53 % SOC and were absent at 39-42 % and 54-55 %, so the "<45-50 %" association is not
-  supported by these logs.
+  throughout), not input (`GetLastInputInfo` showed ~2 h idle), not the charge level: the adapter
+  episodes ran at 43-53 % SOC and were absent at 39-42 % and 54-55 %, so the "<45-50 %" association
+  is not supported by those two logs - but the third episode ran at 27-30 % SOC, inside that band,
+  so the low-SOC suspicion survives while "the adapter is required" does not.
 * The `Power` service host (one svchost carrying `BrokerInfrastructure`, `DcomLaunch`, `Power`,
   `SystemEventsBroker`) consumed about a full core during the episodes - 65.41 CPU-s in 60 s, and
   4.89 s in a 5 s sample - and dropped to idle when they ended. Stopping
   `DisplayEnhancementService` coincided with one episode's end, but the A-B-A test (stop, wait,
   restart) showed no return of the flicker, i.e. the episode had simply ended; causality is **not**
   established.
-* The operator ended it by unplugging and replugging the charger at 13:34 (reported, no flicker
-  after); nothing in the driver's marks changed across that.
+* The operator ended the second episode by unplugging and replugging the charger at 13:34 (reported,
+  no flicker after); nothing in the driver's marks changed across that. The adapter stayed off
+  afterwards and the third episode arrived with none.
+* The third episode, 15:15:44-15:38:13 (22.5 min), ran entirely on battery. The fast poller switched
+  itself to a 0.34 s cadence and wrote `state = FLICK` for 4000 consecutive samples, while `ac`,
+  `BattPwr`, `OnlineRaw` and `InputUsable` never changed on any sample - the whole 2.6 h record
+  (13:35:44-16:11:53) holds **not one** power-state transition, and the OS percentage fell
+  monotonically 56 -> 18 %, so nothing was charging. Brightness alternated `73 <-> 85` and
+  `85 <-> 51`, the same values as the adapter episodes; 1190 changes over 1351 s means nearly every
+  0.34 s sample differed. The `Power` service host burned 1.29 cores on average (max 1.52) through
+  those 22.5 minutes and 0 outside them - its only other sample above 0.5 is 13:34:15, the moment
+  the adapter came off. `DisplayEnhancementService` stayed `Running` and stayed cheap (`deCpu` max
+  0.05), which weakens it as the CPU source without proving causality either way.
 
 This is a separate defect from the phantom power-source flip: the `[Unreleased]` fix removes a
-verdict from a reflection tick and can neither produce nor suppress it. First live capture with
-causal fields is on the tablet (`flick677.log`, `marks676.csv`, `pwr676.log`); the cause is still
-open (item 12 below).
+verdict from a reflection tick and can neither produce nor suppress it. The campaign that carries
+the causal fields has now been read (`flick677.log`, `marks676.csv`, `pwr676.log` on the tablet);
+the cause is still open (item 12 below).
 
 ## 6. The 2:1 switching window is derived from the pack voltage, not fixed
 
@@ -784,15 +799,17 @@ understood that is said explicitly.
    Evidence: `docs/COMPAT-MATRIX.md:29-33,118-122`; `docs/COMPAT-MATRIX.md:136-143` (the correction
    about the percentage signal).
 
-12. **The panel brightness oscillates about once a second, with the adapter attached, and the cause
-    is not established.** Episodes on 24.09 flipped the OS brightness between two fixed levels
-    (`73 <-> 85`, later `58 <-> 95`) every 1.1-1.3 s for minutes, with no power-source event, no
-    `Kernel-Power` 105, and the driver's marks constant; the `Power` service host burned about one
-    core throughout. It is independent of `ADAPTBRIGHT`, `DisplayEnhancementService`, the refresh
-    rate, input, and the charge level. The full measurement record is the 24.09 subsection above.
-    Evidence: the registry-only sampler and the `flick677.log`/`marks676.csv`/`pwr676.log` campaign
-    on the tablet; the driver marks in `HKLM\SYSTEM\CurrentControlSet\Enum\ACPI\QCOM057E\2&DABA3FF&0\
-    Device Parameters`.
+12. **The panel brightness oscillates about once a second and the cause is not established.**
+    Episodes on 24.09 flipped the OS brightness between two fixed levels (`73 <-> 85`, later
+    `58 <-> 95`) every 1.1-1.3 s for minutes, with no power-source event, no `Kernel-Power` 105, and
+    the driver's marks constant; the `Power` service host burned about one core throughout. The
+    adapter is **not** required: two of the three episodes ran while it charged the pack, but the
+    third (15:15:44-15:38:13, 27-30 % SOC) ran on battery for all 22.5 minutes with not one
+    power-state transition anywhere in the record. It is independent of `ADAPTBRIGHT`,
+    `DisplayEnhancementService`, the refresh rate, and input. The full measurement record is the
+    24.09 subsection above. Evidence: the registry-only sampler and the
+    `flick677.log`/`marks676.csv`/`pwr676.log` campaign on the tablet; the driver marks in
+    `HKLM\SYSTEM\CurrentControlSet\Enum\ACPI\QCOM057E\2&DABA3FF&0\Device Parameters`.
 
 ---
 

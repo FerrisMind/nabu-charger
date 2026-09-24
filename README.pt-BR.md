@@ -44,8 +44,8 @@ bomba · ⚠️ uma fonte Power Delivery ainda não aumenta a carga da bateria �
 veredito de CA por trás do reset do brilho está corrigida na árvore e aguarda lançamento: um
 tick que lê apenas o reflexo `2 · VBAT` não carrega mais veredito, e a remoção continua sendo
 encerrada pelo bit de hardware (três ticks, medidos em 1.1 s a partir da remoção do cabo) ·
-⚠️ uma oscilação de ~1 Hz do brilho da tela com a fonte conectada é um defeito **separado** e
-ainda não explicado
+⚠️ uma oscilação de ~1 Hz do brilho da tela, medida tanto com a fonte conectada quanto na
+bateria, é um defeito **separado** e ainda não explicado
 
 Cada linha abaixo se apoia em uma medição feita no tablet, não em um teste que passou.
 Onde um defeito está marcado como não corrigido, uma captura ao vivo mostra o defeito
@@ -66,7 +66,7 @@ defeitos mais adiante.
 | 🖥 A superfície de IOCTL do driver SMB | `GET_STATUS` responde; `READ_REG`, `WRITE_REG`, `SET_ICL`, `GET_JOURNAL`, `DETECT_START`, `APPLY_POLICY` retornam `STATUS_NOT_IMPLEMENTED`. A lógica por trás deles está escrita e testada com mock; a ligação no kernel não | ⚠️ |
 | 🔬 Enquadramento da resposta SPMI | Não confirmado por engenharia reversa, então as leituras de registrador seguem provisórias | ⚠️ |
 | 💡 Queda do veredito de CA / reset do brilho | Corrigida na árvore (não lançada, driver `20.47.10.674`), aguardando lançamento. A captura de 22.09 está em `docs/FINDINGS.md`; a build de 24.09 foi confirmada ao vivo: um tick sem veredito na remoção, CC 1,0 s depois do cabo, CA na primeira amostra após reconectar | ⚠️ |
-| 💡 O brilho da tela oscila cerca de uma vez por segundo com a fonte conectada | Medido em 24.09: o brilho do sistema alterna entre dois níveis fixos a cada 1,1–1,3 s por minutos enquanto a bateria carrega, sem evento de fonte, sem `Kernel-Power` 105 e com as marcas do driver constantes. Independente de `ADAPTBRIGHT`, `DisplayEnhancementService`, taxa de atualização, entrada e nível de carga | ❌ |
+| 💡 O brilho da tela oscila cerca de uma vez por segundo | Medido em 24.09: o brilho do sistema alterna entre dois níveis fixos a cada 1,1–1,3 s por minutos, sem evento de fonte, sem `Kernel-Power` 105 e com as marcas do driver constantes. Independente de `ADAPTBRIGHT`, `DisplayEnhancementService`, taxa de atualização e entrada. Não depende da fonte: dois episódios com a bateria carregando (43–53 %) e um na bateria sem fonte alguma (27–30 %) | ❌ |
 | 📱 Outros dispositivos SM8150 | Só o Xiaomi Pad 5 foi testado; o driver se associa se o nó existir em I²C 0x51 | ⚠️ |
 | 🧩 Um dispositivo com LN8000 mas sem o nó `PEIC` na DSDT | Não suportado — exige alteração de ACPI | ❌ |
 
@@ -90,13 +90,13 @@ enquanto uma remoção real continua sendo encerrada pelo bit de hardware. Confi
 em 24.09: a remoção produziu exatamente um tick `OnlineRaw = 2` / `DoubledVeto = 1`, a
 liberação veio três ticks depois pelo bit 4 de `FAULT1`, e o Windows viu CC 1,0 s depois do
 cabo. A mesma build traz a correção de latência da tabela abaixo. A oscilação de brilho
-medida no mesmo dia é um defeito diferente — ela ocorre sem nenhum evento de fonte — e está
-listada separadamente.
+medida no mesmo dia é um defeito diferente — ela ocorre sem nenhum evento de fonte, e tanto
+com a fonte conectada quanto sem ela — e está listada separadamente.
 
 | Defeito | O que ele faz |
 |---|---|
 | O CA chega segundos depois do cabo | O veredito (`OnlineRaw`) está no primeiro tick, mas o Windows lê o *seguinte* e a subida da bomba bloqueia o tick: medidos **8,7 s** da inserção até `pwr = 1` numa fonte Quick Charge e 5,6 s numa fonte de 5 V simples. **Corrigido na árvore** (não lançado, `20.47.10.674`): a retenção online é armada na frente, e na reconexão de 24.09 o sinalizador já estava na primeira amostra |
-| O brilho da tela oscila cerca de uma vez por segundo | Com a fonte conectada e a bateria carregando, o brilho do sistema alterna entre dois níveis fixos a cada 1,1–1,3 s, em episódios de minutos, sem evento de fonte, sem `Kernel-Power` 105 e sem mudança nas marcas do driver; o host do serviço `Power` consome cerca de um núcleo durante o episódio. Não é `ADAPTBRIGHT` (pisca com Off e com On), nem a taxa de atualização, nem entrada, nem o nível de carga. Causa não estabelecida; o registro de 24.09 está em `docs/FINDINGS.md` |
+| O brilho da tela oscila cerca de uma vez por segundo | O brilho do sistema alterna entre dois níveis fixos a cada 1,1–1,3 s, em episódios de minutos, sem evento de fonte, sem `Kernel-Power` 105 e sem mudança nas marcas do driver; o host do serviço `Power` consome cerca de um núcleo durante o episódio. Não é `ADAPTBRIGHT` (pisca com Off e com On), nem a taxa de atualização, nem entrada, nem dependente da fonte: 24.09 trouxe dois episódios na fonte (43–53 %) e um na bateria (27–30 %, nenhuma transição de estado de energia em 2,6 h de registro). Causa não estabelecida; o registro de 24.09 está em `docs/FINDINGS.md` |
 | A temperatura do cristal é publicada com o ADC hibernando | O bit 1 de `AdcValid` é reportado para um canal adormecido, então **160,0 °C** é publicado e todo consumidor o imprime fielmente |
 | O VBAT do LN8000 lê baixo | 42–43 mV abaixo do medidor de combustível, e esse canal alimenta o portão do modo 2:1 |
 | `EngageState` discorda de `SuMode` | Publica 4 (NO_HEADROOM) enquanto `SuMode` fica em 3 (switching); ruído apenas na marca |
