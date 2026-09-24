@@ -11,8 +11,11 @@ This release comes out of a report from a community machine running a patched PM
 stack (the `usbfix` / fix20 package, which replaces `qcpmicext8150.sys`). Two of its
 three complaints are answered by a switch and by diagnostics; the third is a documented
 incompatibility rather than a guessed fix. The battery switch was measured live on the
-development tablet with the driver stamp `20.47.10.678`, a test build; the released
-archive itself is verified on the same tablet before the release is published.
+development tablet with the driver stamp `20.47.10.678`, a test build, and the released
+archive was then installed on that same tablet and read back before publication: driver
+`20.47.10.679`, device node `OK`, and the battery check repeated on the shipping image
+(`PublishBattery` 1 -> `BatteryFlag=0` / `LifePercent=47`, `0` -> `BatteryFlag=128` /
+`LifePercent=255`, back to `1` -> `0` / `47`).
 
 ### Added
 
