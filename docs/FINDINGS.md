@@ -588,10 +588,11 @@ Evidence: the marks read over SSH at 21:0x-21:40; the 250 ms poller writing `mar
 ### A ~1 Hz panel-brightness oscillation that is not a power-source event (24.09)
 
 With `20.47.10.674` installed the panel brightness started flipping between two fixed levels and
-stayed in that state for minutes. Three episodes on 24.09: two with the adapter **attached and
+stayed in that state for minutes. Four episodes on 24.09: two with the adapter **attached and
 carrying current**, 13:09:37-13:12:58 and 13:18:00-13:30:5x, each level held 1.1-1.3 s (about 2.1 s
-per full cycle) with quiet windows 13:13-13:17 and from 13:31; and one with **no adapter at all**,
-15:15:44-15:38:13, on battery. Measured properties:
+per full cycle) with quiet windows 13:13-13:17 and from 13:31; one with **no adapter at all**,
+15:15:44-15:38:13, on battery; and one on the adapter again, 16:32:49-16:36:57, which is the first
+one whose onset was watched live. Measured properties:
 
 * The flip is in the OS's own brightness value, not in the reading. The registry value under
   `ADED5E82...` (`VIDEONORMALLEVEL`) alternated `73 <-> 85` in anti-phase with the WMI
@@ -622,20 +623,37 @@ per full cycle) with quiet windows 13:13-13:17 and from 13:31; and one with **no
   one idle interval), while `ac`, `BattPwr`, `OnlineRaw` and `InputUsable` never changed on any
   sample - the whole 2.6 h record (13:35:44-16:11:53) holds **not one** power-state transition, and
   the OS percentage fell monotonically 56 -> 18 %, so nothing was charging. Brightness alternated
-  `73 <-> 85` and `85 <-> 51`, the same values as the adapter episodes; 1190 changes in its 4000
-  samples is a change roughly every 1.14 s, i.e. the same ~2.2 s cycle the adapter episodes held.
+  `51 <-> 85`; 1190 changes in its 4000 samples is a change roughly every 1.14 s, i.e. the same
+  ~2.2 s cycle the adapter episodes held.
   The `Power` service host burned 1.29 cores on average (max 1.52) through those 22.5 minutes and 0
   outside them - its only other sample above 0.5 is 13:34:15, the moment the adapter came off.
   `DisplayEnhancementService` stayed `Running` and stayed cheap (`deCpu` max 0.05), which weakens it
   as the CPU source without proving causality either way.
-* The levels the oscillation moves between are values the OS already holds for different power
-  sources: on battery the tablet sat at `51` for the whole 2.6 h, and the single step when the
-  adapter went back in at 16:27:32 was `51 -> 73` - the AC level, applied once, cleanly, with no
-  episode. The episodes then alternated `73 <-> 85` and (earlier) `58 <-> 95`, so one level of each
-  pair matches a stored power-source brightness while the other two do not, and the power source
-  itself never flipped. That points at whatever makes the OS re-decide the brightness - the `Power`
-  host spinning is the same suspect - but it is a hint, not a cause: no reading in this record shows
-  who asked for the flip.
+* The trigger is a brightness change by hand. The fourth episode (16:32:49-16:36:57, 4 min 9 s, on
+  the adapter, 741 fast samples) began while the operator was moving the brightness slider himself:
+  the poller still wrote `state = ok` while the level already alternated `89 <-> 95`, and the `FLICK`
+  block opened seconds later. He reports the same for the earlier ones - it starts when he touches
+  the brightness and it does not matter which level he leaves it at.
+* The flip shows up in the power scheme's own stored value. `VIDEONORMALLEVEL`
+  (`...\Power\User\PowerSchemes\<scheme>\{7516b95f-...}\{aded5e82-...}`, the value
+  `powercfg /query SCHEME_CURRENT SUB_VIDEO` prints) alternated between the two levels the panel
+  showed - `69 <-> 97` in the fourth episode, with `ACSettingIndex` and `DCSettingIndex` moving
+  together - about once a second while it ran, and settled at `97/97` when it stopped. Zero System
+  events arrived at the onset, `ADAPTBRIGHT` reads `0/0` and the power source never changed, so
+  neither of those asked for a new level: the writes go through the same pipeline the slider uses.
+* Only Windows' own machinery is busy. The `Power` service host - that one svchost also carries
+  `DcomLaunch`, `BrokerInfrastructure` and `SystemEventsBroker` - burned 105 % of a core through the
+  fourth episode and read 0 % minutes after it ended, while `DisplayEnhancementService` stayed
+  `Running` and near-idle (`deCpu` max 0.05). There is no permanent WMI event subscription beyond
+  the stock `SCM` pair, no scheduled task repeating faster than a minute, and no third-party process
+  in sight besides WireGuard, two browser updaters and `TabTip`. The active scheme is a duplicated
+  third-party one (`6a93ec26-...`, "Revision - Ultra Performance"; the only other is stock
+  Balanced), which is the cheapest thing left to test.
+* The pairs differ between episodes and follow what the panel was set to: `73 <-> 85` and
+  `58 <-> 95` in the morning's two adapter episodes, `51 <-> 85` on battery in the afternoon (`51`
+  being where the panel sat while discharging), `69 <-> 97` in the fourth. A single step to `73` at
+  16:27:32, when the adapter went back in, was the panel restored to the level Windows keeps for AC
+  and was not an episode.
 
 This is a separate defect from the phantom power-source flip: the `[Unreleased]` fix removes a
 verdict from a reflection tick and can neither produce nor suppress it. The campaign that carries
@@ -811,14 +829,22 @@ understood that is said explicitly.
 
 12. **The panel brightness oscillates about once a second and the cause is not established.**
     Episodes on 24.09 flipped the OS brightness between two fixed levels (`73 <-> 85`, later
-    `58 <-> 95`) every 1.1-1.3 s for minutes, with no power-source event, no `Kernel-Power` 105, and
-    the driver's marks constant; the `Power` service host burned about one core throughout. The
-    adapter is **not** required: two of the three episodes ran while it charged the pack, but the
-    third (15:15:44-15:38:13, 27-30 % SOC) ran on battery for all 22.5 minutes with not one
-    power-state transition anywhere in the record. It is independent of `ADAPTBRIGHT`,
-    `DisplayEnhancementService`, the refresh rate, and input. The full measurement record is the
-    24.09 subsection above. Evidence: the registry-only sampler and the
-    `flick677.log`/`marks676.csv`/`pwr676.log` campaign on the tablet; the driver marks in
+    `58 <-> 95`, `51 <-> 85`, `69 <-> 97`) every 1.1-1.3 s for minutes, with no power-source event,
+    no `Kernel-Power` 105, and the driver's marks constant; the `Power` service host burned about
+    one core throughout and read 0 % minutes after each episode. The adapter is **not** required:
+    two episodes ran while it charged the pack, one (15:15:44-15:38:13, 27-30 % SOC) ran on battery
+    for all 22.5 minutes with not one power-state transition anywhere in the record, and the fourth
+    (16:32:49-16:36:57) ran on the adapter again. It is independent of `ADAPTBRIGHT` (reads `0/0`),
+    `DisplayEnhancementService` (running, near-idle), the refresh rate, and input. What is known
+    about the writer: the episodes start when the brightness is changed by hand, and while one runs
+    the power scheme's stored `VIDEONORMALLEVEL` is rewritten between the same two levels the panel
+    shows, settling when the episode ends - so the writes are in Windows' own brightness/scheme
+    pipeline, not in the driver or the panel. The active scheme is a duplicated third-party one
+    (`6a93ec26-...`, "Revision - Ultra Performance"). The full measurement record is the 24.09
+    subsection above. Evidence: the registry-only sampler and the
+    `flick677.log`/`marks676.csv`/`pwr676.log` campaign on the tablet; `powercfg /query
+    SCHEME_CURRENT SUB_VIDEO`, `powercfg /requests` and a per-process CPU sample taken mid-episode;
+    the driver marks in
     `HKLM\SYSTEM\CurrentControlSet\Enum\ACPI\QCOM057E\2&DABA3FF&0\Device Parameters`.
 
 ---
