@@ -23,8 +23,10 @@ porting Windows to a nabu-class tablet rather than using this driver.
 
 ## Project status
 
-Latest release: **0.3.1**, carrying driver **20.47.10.672** — the installable ARM64 package
-is attached to it (`nabu-ln8000-driver-0.3.1-arm64.zip`). The development tablet has moved
+Latest release: **0.3.1**, carrying driver **20.47.10.672**. That package
+(`nabu-ln8000-driver-0.3.1-arm64.zip`) was built and measured by hand, before this
+repository was made public; the releases on this page are produced by the `release`
+workflow. The development tablet has moved
 past that package and now runs **20.47.10.674** (`oem168.inf`, device node `OK` /
 `CM_PROB_NONE`); its two fixes are still unreleased and are described below and in the
 changelog. Numbers measured on the shipped 0.3.1 package: a Quick Charge brick negotiated
