@@ -616,16 +616,18 @@ per full cycle) with quiet windows 13:13-13:17 and from 13:31; and one with **no
 * The operator ended the second episode by unplugging and replugging the charger at 13:34 (reported,
   no flicker after); nothing in the driver's marks changed across that. The adapter stayed off
   afterwards and the third episode arrived with none.
-* The third episode, 15:15:44-15:38:13 (22.5 min), ran entirely on battery. The fast poller switched
-  itself to a 0.34 s cadence and wrote `state = FLICK` for 4000 consecutive samples, while `ac`,
-  `BattPwr`, `OnlineRaw` and `InputUsable` never changed on any sample - the whole 2.6 h record
-  (13:35:44-16:11:53) holds **not one** power-state transition, and the OS percentage fell
-  monotonically 56 -> 18 %, so nothing was charging. Brightness alternated `73 <-> 85` and
-  `85 <-> 51`, the same values as the adapter episodes; 1190 changes over 1351 s means nearly every
-  0.34 s sample differed. The `Power` service host burned 1.29 cores on average (max 1.52) through
-  those 22.5 minutes and 0 outside them - its only other sample above 0.5 is 13:34:15, the moment
-  the adapter came off. `DisplayEnhancementService` stayed `Running` and stayed cheap (`deCpu` max
-  0.05), which weakens it as the CPU source without proving causality either way.
+* The third episode, 15:15:44-15:38:13 (22.5 min), ran entirely on battery. The poller samples every
+  3 minutes when idle and drops to 0.34 s while an episode runs; it did that here and wrote
+  `state = FLICK` for 4000 consecutive samples (so the recorded onset can lag the real one by up to
+  one idle interval), while `ac`, `BattPwr`, `OnlineRaw` and `InputUsable` never changed on any
+  sample - the whole 2.6 h record (13:35:44-16:11:53) holds **not one** power-state transition, and
+  the OS percentage fell monotonically 56 -> 18 %, so nothing was charging. Brightness alternated
+  `73 <-> 85` and `85 <-> 51`, the same values as the adapter episodes; 1190 changes in its 4000
+  samples is a change roughly every 1.14 s, i.e. the same ~2.2 s cycle the adapter episodes held.
+  The `Power` service host burned 1.29 cores on average (max 1.52) through those 22.5 minutes and 0
+  outside them - its only other sample above 0.5 is 13:34:15, the moment the adapter came off.
+  `DisplayEnhancementService` stayed `Running` and stayed cheap (`deCpu` max 0.05), which weakens it
+  as the CPU source without proving causality either way.
 
 This is a separate defect from the phantom power-source flip: the `[Unreleased]` fix removes a
 verdict from a reflection tick and can neither produce nor suppress it. The campaign that carries
