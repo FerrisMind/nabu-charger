@@ -55,7 +55,6 @@ jobs:
   kernel-driver:
     name: kernel-mode driver (ARM64, WDK)
     runs-on: windows-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
@@ -65,14 +64,67 @@ jobs:
           toolchain: "1.97.0"
           targets: aarch64-pc-windows-msvc
 
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            crates/kmdf/target
+            crates/ln8000-kmdf/target
+          key: ${{ runner.os }}-wdk-${{ hashFiles('**/Cargo.lock') }}
+
+      # The image carries no WDK: without it the build stops on
+      # `cannot find directory: ...\Include\10.0.26100.0\km\crt`, because only the SDK
+      # is installed and `wdk-build` looks for the kernel headers under the same version
+      # folder. The versions match docs/HANDOVER.md.
+      - name: Install the Windows Driver Kit 10.0.26100
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($id in 'Microsoft.WindowsSDK.10.0.26100', 'Microsoft.WindowsWDK.10.0.26100') {
+            Write-Host "winget install --id $id"
+            winget install --id $id --exact --silent `
+              --accept-source-agreements --accept-package-agreements --disable-interactivity
+            # 0 = installed, 0x8A150061 = already installed, 0x8A15002B = no newer version.
+            # The gate is the header check below, not this exit code: the WDK setup also
+            # adds its Visual Studio integration, and a failure there must not be read
+            # as "the headers are missing".
+            Write-Host "  exit code: $LASTEXITCODE"
+          }
+          $crt = 'C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\km\crt'
+          if (-not (Test-Path $crt)) { throw "the kernel headers wdk-build looks for are missing: $crt" }
+          Write-Host "kernel headers present: $crt"
+
+      # bindgen parses the WDF headers with libclang. The image's LLVM (22.x) mangles
+      # them - `attempt to compute 1_usize - 56_usize, which would overflow` - so 17.0.6
+      # goes next to it in its own directory and LIBCLANG_PATH points there.
+      - name: Install LLVM 17.0.6 for bindgen
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Join-Path $env:RUNNER_TEMP 'LLVM-17.0.6-win64.exe'
+          Invoke-WebRequest -Uri 'https://github.com/llvm/llvm-project/releases/download/llvmorg-17.0.6/LLVM-17.0.6-win64.exe' -OutFile $installer
+          Start-Process -FilePath $installer -ArgumentList '/S', '/D=C:\llvm17' -Wait
+          $clang = 'C:\llvm17\bin\clang.exe'
+          if (-not (Test-Path $clang)) { throw "clang is not where the installer was told to put it: $clang" }
+          & $clang --version | Select-Object -First 1
+          "LIBCLANG_PATH=C:\llvm17\bin" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       - name: Install cargo-wdk
         run: cargo install cargo-wdk --locked
 
-      # Building the kernel part needs the WDK and LLVM 17.x (on 23.x bindgen breaks
-      # parsing of the WDF headers). The step does not fail the build until the base
-      # GitHub runner image is pinned to the right LLVM version: see docs/HANDOVER.md.
-      - name: Build the driver for ARM64
+      # RUSTFLAGS replaces the crate's .cargo/config.toml instead of extending it, so the
+      # three flags that file carries - the static CRT, panic=abort and /Brepro - are
+      # repeated here on top of the workspace's `-D warnings`.
+      - name: Build the SMB driver for ARM64
         working-directory: crates/kmdf
         env:
-          LIBCLANG_PATH: C:\Program Files\LLVM\bin
+          RUSTFLAGS: "-D warnings -C target-feature=+crt-static -C panic=abort -C link-arg=/Brepro"
+        run: cargo wdk build --target-arch arm64 --profile release
+
+      - name: Build the LN8000 driver for ARM64
+        working-directory: crates/ln8000-kmdf
+        env:
+          RUSTFLAGS: "-D warnings -C target-feature=+crt-static -C panic=abort -C link-arg=/Brepro"
         run: cargo wdk build --target-arch arm64 --profile release
