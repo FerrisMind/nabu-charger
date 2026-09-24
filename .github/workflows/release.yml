@@ -99,6 +99,19 @@ jobs:
           & $clang --version | Select-Object -First 1
           "LIBCLANG_PATH=C:\llvm17\bin" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
+      # cargo-wdk test-signs every package with the certificate it finds in the *user* store
+      # `WDRTestCertStore`, subject `WDRLocalTestCert`, and hands that store name to signtool.
+      # The image carries no such certificate: the first dry run stopped inside the build with
+      # `SignTool Error: File not found`. The script creates one when it is missing, trusts it
+      # for the length of this run so the Authenticode checks below mean what they say, and
+      # drops a stale `WDRLocalTestCert.cer` from the restored build cache.
+      - name: Prepare the test signing certificate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          pwsh -NoProfile -File .\deploy\prepare-test-cert.ps1 -Trust -ClearCachedCertFiles
+          if ($LASTEXITCODE -ne 0) { throw "prepare-test-cert.ps1 failed with exit code $LASTEXITCODE" }
+
       - name: Install cargo-wdk
         run: cargo install cargo-wdk --locked
 
@@ -186,11 +199,20 @@ jobs:
           if ($built -ne $inx) { throw "the built INF says DriverVer = $built, the .inx says $inx" }
           Write-Host "DriverVer in the built INF: $built"
           if ($text -notmatch 'HKR,,Security,,"D:P\(A;;GA;;;SY\)\(A;;GA;;;BA\)"') { throw "the built INF carries no device access policy" }
+          $signer = $null
           foreach ($name in 'ln8000_kmdf.sys', 'ln8000_kmdf.cat') {
             $sig = Get-AuthenticodeSignature (Join-Path $kit $name)
-            Write-Host ("  {0}: {1}" -f $name, $sig.Status)
+            Write-Host ("  {0}: {1}, signed by {2}" -f $name, $sig.Status, $sig.SignerCertificate.Subject)
             if ($sig.Status -ne 'Valid') { throw "$name is not validly signed: $($sig.Status)" }
+            if (-not $signer) { $signer = $sig.SignerCertificate.Thumbprint }
+            elseif ($sig.SignerCertificate.Thumbprint -ne $signer) { throw "$name and ln8000_kmdf.sys are signed by different certificates" }
           }
+          # The archive ships WDRLocalTestCert.cer and INSTALL.md has the reader import it into
+          # the machine stores, so the signature has to be that certificate's: a package whose
+          # .cer belongs to another key installs nowhere, with CERT_E_UNTRUSTEDROOT.
+          $shipped = (Get-PfxCertificate (Join-Path $kit 'WDRLocalTestCert.cer')).Thumbprint
+          if ($shipped -ne $signer) { throw "the package carries a certificate ($shipped) that did not sign its files ($signer)" }
+          Write-Host "signature and the shipped certificate agree: $signer"
           $bytes = [IO.File]::ReadAllBytes((Join-Path $kit 'ln8000_kmdf.sys'))
           $pe = [BitConverter]::ToInt32($bytes, 0x3C)
           $machine = [BitConverter]::ToUInt16($bytes, $pe + 4)

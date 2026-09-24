@@ -156,6 +156,40 @@ machine field is not `0xAA64`.
 
 ## 6. Publish
 
+The preferred route is the **release** workflow, run by hand: Actions → release → *Run
+workflow*, on `master`, with `version` set to the version bumped in step 2. It does steps 3-5
+on a runner and then leaves a **draft** release with the archive attached:
+
+* it refuses to run unless the tree is bumped to that version (the four places of step 2),
+  and takes the driver stamp from the `.inx`, so the built INF cannot carry a different
+  DriverVer than the source;
+* it builds both drivers twice and fails unless the reproducibility verdict is `true`;
+* it runs `verify-package.ps1` (35 criteria) and the four checks of step 4 - the built
+  `DriverVer`, the INF's access policy, the PE machine field and the signature. The
+  signature check is stricter than a local one: the certificate that signed the package has
+  to be the certificate the archive ships, or the install stops with
+  `CERT_E_UNTRUSTEDROOT`;
+* `deploy/prepare-test-cert.ps1` runs before the build. `cargo-wdk` test-signs with the
+  `WDRLocalTestCert` certificate from the *user* store `WDRTestCertStore`, and a machine
+  without one fails inside the package step with `SignTool Error: File not found`. The
+  script creates the certificate when it is missing, trusts it for the length of the run,
+  and drops any `.cer` an earlier build left in the target directories - a stale file would
+  otherwise be packaged beside a signature made with another key;
+* it assembles the archive and attaches it to the run as an artifact first, so a failure in
+  the release step still leaves the archive downloadable;
+* the release notes are the changelog's own `## [<version>]` section plus what the archive
+  is, which driver it carries, the reproducibility note and the fact that known defects are
+  open;
+* a published release for the same tag is never touched - the job stops. An existing draft
+  is updated in place, so a re-run after a failure does not need the release deleted;
+* `dry_run: true` does everything except create or edit a release: build, check, pack,
+  artifact. Use it to inspect an archive without touching the Releases page.
+
+The tag is created together with the draft. A draft that is then abandoned leaves a
+`v<version>` tag behind; delete the tag if that version is not going to be published.
+
+By hand, the same three steps, which is what the workflow automates:
+
 1. Tag the commit `v<version>` and push it with the branch.
 2. Create the release on GitHub with that tag, attach the zip from step 5, and paste the
    `## [<version>]` section of the changelog as the release notes.
@@ -163,5 +197,5 @@ machine field is not `0xAA64`.
    are. The AC-verdict flap is open; a release note that omits it would be the only
    dishonest document in this repository.
 
-The repository is currently private. Making it public is a separate, deliberate step and
-is not part of a release.
+The repository is public. Making it public was a deliberate step, taken once the archive,
+the READMEs and the defect lists described the state honestly.

@@ -111,6 +111,18 @@ jobs:
           & $clang --version | Select-Object -First 1
           "LIBCLANG_PATH=C:\llvm17\bin" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
+      # cargo-wdk test-signs every package it builds, with the certificate it finds in the
+      # user store `WDRTestCertStore`; the image is not guaranteed to carry one, and a run
+      # without one stops inside the package step with `SignTool Error: File not found`.
+      # The release workflow calls the same script with -Trust, because it verifies the
+      # signature it makes; nothing here does, so trust is not needed.
+      - name: Prepare the test signing certificate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          pwsh -NoProfile -File .\deploy\prepare-test-cert.ps1 -ClearCachedCertFiles
+          if ($LASTEXITCODE -ne 0) { throw "prepare-test-cert.ps1 failed with exit code $LASTEXITCODE" }
+
       - name: Install cargo-wdk
         run: cargo install cargo-wdk --locked
 
