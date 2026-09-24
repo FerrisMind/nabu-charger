@@ -1,0 +1,311 @@
+name: release
+
+# Manual only, and deliberately so: a release is a decision, not a side effect of a push.
+# Actions -> Release -> Run workflow, on master, with the version bump already committed
+# (docs/RELEASE.md step 2). The job builds both drivers, runs the release checks, packs
+# the archive, uploads it as a workflow artifact and leaves a DRAFT release carrying it.
+# Nothing becomes visible to anyone until the draft is published.
+#
+# The inputs:
+#   version  - the release version without the leading v, for example 0.3.2. The tag is
+#              v<version> and the archive is nabu-ln8000-driver-<version>-arm64.zip.
+#   dry_run  - build, check and upload the archive only; no release, no tag.
+#   publish  - publish the release instead of leaving it as a draft (ignored on a dry run).
+#
+# The WDK and LLVM installs repeat the ones in ci.yml's kernel job on purpose - keep the
+# two files in step. The version is never edited by this workflow: it verifies that the
+# tree already carries the bump and stops with the list of what to change if not.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version without the leading v (for example 0.3.2)"
+        required: true
+        type: string
+      dry_run:
+        description: "Build, check and upload the archive only - no release, no tag"
+        required: false
+        type: boolean
+        default: false
+      publish:
+        description: "Publish the release instead of leaving it as a draft"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: build, check, pack, draft
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain and the ARM64 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.97.0"
+          targets: aarch64-pc-windows-msvc
+
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            crates/kmdf/target
+            crates/ln8000-kmdf/target
+          key: ${{ runner.os }}-wdk-${{ hashFiles('**/Cargo.lock') }}
+
+      # The image carries no WDK: without it the build stops on
+      # `cannot find directory: ...\Include\10.0.26100.0\km\crt`, because only the SDK is
+      # installed and `wdk-build` looks for the kernel headers under the same version
+      # folder. Same versions as ci.yml and docs/HANDOVER.md.
+      - name: Install the Windows Driver Kit 10.0.26100
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($id in 'Microsoft.WindowsSDK.10.0.26100', 'Microsoft.WindowsWDK.10.0.26100') {
+            Write-Host "winget install --id $id"
+            winget install --id $id --exact --silent `
+              --accept-source-agreements --accept-package-agreements --disable-interactivity
+            # 0 = installed, 0x8A150061 = already installed, 0x8A15002B = no newer version.
+            # The gate is the header check below, not this exit code: the WDK setup also
+            # adds its Visual Studio integration, and a failure there must not be read as
+            # "the headers are missing".
+            Write-Host "  exit code: $LASTEXITCODE"
+          }
+          $crt = 'C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\km\crt'
+          if (-not (Test-Path $crt)) { throw "the kernel headers wdk-build looks for are missing: $crt" }
+          Write-Host "kernel headers present: $crt"
+
+      # bindgen parses the WDF headers with libclang. The image's LLVM (22.x) mangles
+      # them, so 17.0.6 goes next to it in its own directory and LIBCLANG_PATH points there.
+      - name: Install LLVM 17.0.6 for bindgen
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Join-Path $env:RUNNER_TEMP 'LLVM-17.0.6-win64.exe'
+          Invoke-WebRequest -Uri 'https://github.com/llvm/llvm-project/releases/download/llvmorg-17.0.6/LLVM-17.0.6-win64.exe' -OutFile $installer
+          Start-Process -FilePath $installer -ArgumentList '/S', '/D=C:\llvm17' -Wait
+          $clang = 'C:\llvm17\bin\clang.exe'
+          if (-not (Test-Path $clang)) { throw "clang is not where the installer was told to put it: $clang" }
+          & $clang --version | Select-Object -First 1
+          "LIBCLANG_PATH=C:\llvm17\bin" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install cargo-wdk
+        run: cargo install cargo-wdk --locked
+
+      # The bump (docs/RELEASE.md step 2) is a decision, so this workflow checks it instead
+      # of making it. Everything it can get wrong is checked here, before any CPU is spent.
+      - name: Verify the tree carries the bump
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = $env:RELEASE_VERSION
+          if ($version -notmatch '^\d{1,3}\.\d{1,3}\.\d{1,3}$') { throw "the version input '$version' is not x.y.z" }
+
+          function Get-SectionValue([string]$Path, [string]$Section, [string]$Key) {
+            $inSection = $false
+            foreach ($line in (Get-Content -LiteralPath $Path)) {
+              if ($line -match '^\s*\[') { $inSection = $line -match ('^\s*\[' + [regex]::Escape($Section) + '\]'); continue }
+              if ($inSection -and $line -match ('^\s*' + [regex]::Escape($Key) + '\s*=\s*"?([^"\r\n]+)"?')) { return $Matches[1].Trim() }
+            }
+            return $null
+          }
+
+          $mismatch = New-Object System.Collections.Generic.List[string]
+          $rootVersion = Get-SectionValue 'Cargo.toml' 'workspace.package' 'version'
+          if ($rootVersion -ne $version) { $mismatch.Add("[workspace.package] version in Cargo.toml is '$rootVersion'") }
+          foreach ($crate in 'crates/kmdf/Cargo.toml', 'crates/ln8000-kmdf/Cargo.toml') {
+            $v = Get-SectionValue $crate 'package' 'version'
+            if ($v -ne $version) { $mismatch.Add("$crate version is '$v'") }
+          }
+          $changelog = Get-Content -LiteralPath 'CHANGELOG.md' -Raw
+          if ($changelog -notmatch ('(?m)^## \[' + [regex]::Escape($version) + '\]\s*-\s*\d{4}-\d{2}-\d{2}')) {
+            $mismatch.Add("CHANGELOG.md has no dated '## [$version] - YYYY-MM-DD' section (move '## [Unreleased]' into it)")
+          }
+          if ($mismatch.Count -gt 0) {
+            $mismatch | ForEach-Object { Write-Host "  - $_" }
+            throw "the tree is not bumped to ${version}: docs/RELEASE.md step 2 lists the four places that have to move together"
+          }
+
+          $unreleased = [regex]::Match($changelog, '(?ms)^## \[Unreleased\]\s*(.*?)(?=^## \[|\z)').Groups[1].Value.Trim()
+          if ($unreleased) { Write-Host "::warning::'## [Unreleased]' still carries $($unreleased.Length) characters - the move in step 2.4 may be incomplete" }
+
+          # The driver version is the .inx's, and the build stamp is set from it, so the two
+          # cannot drift apart the way the old hand-set default could.
+          $inx = Get-Content -LiteralPath 'crates/ln8000-kmdf/ln8000_kmdf.inx' -Raw
+          $m = [regex]::Match($inx, 'DriverVer\s*=\s*([0-9/]+)\s*,\s*([0-9.]+)')
+          if (-not $m.Success) { throw 'no DriverVer line in crates/ln8000-kmdf/ln8000_kmdf.inx' }
+          $stamp = $m.Groups[2].Value.Trim()
+          "STAMPINF_VERSION=$stamp" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "release version : $version"
+          Write-Host "driver stamp    : $stamp (from the .inx; STAMPINF_VERSION is set from it)"
+          Write-Host "if this stamp is not higher than what the target tablet's DriverStore already holds, the install is refused as 'Outranked'"
+
+      # No RUSTFLAGS here on purpose: the flags must come from the crates'
+      # .cargo/config.toml, exactly as in the documented local build, or the archive would
+      # not be the artifact those flags describe.
+      - name: Build both drivers for ARM64, twice, and compare
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          pwsh -NoProfile -File .\deploy\build-arm64.ps1 -RepoRoot $env:GITHUB_WORKSPACE
+          if ($LASTEXITCODE -ne 0) { throw "build-arm64.ps1 failed with exit code $LASTEXITCODE" }
+          $manifest = Get-Content -LiteralPath 'artifacts\BUILD-MANIFEST.json' -Raw | ConvertFrom-Json
+          Write-Host ("reproducible : " + $manifest.reproducible)
+          Write-Host ("note         : " + $manifest.reproducible_note)
+          if ($manifest.reproducible -ne $true) { throw "the second build did not reproduce the first: " + $manifest.reproducible_note }
+
+      - name: Check the package (35 criteria)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          pwsh -NoProfile -File .\deploy\verify-package.ps1
+          if ($LASTEXITCODE -ne 0) { throw "verify-package.ps1 failed with exit code $LASTEXITCODE" }
+
+      # docs/RELEASE.md step 4: the checks that catch the mistakes this project has made.
+      - name: Check the built INF, the machine field and the signature
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $kit = 'artifacts\driver-ln8000-arm64'
+          $inf = Join-Path $kit 'ln8000_kmdf.inf'
+          $text = Get-Content -LiteralPath $inf -Raw
+          $built = ([regex]::Match($text, 'DriverVer\s*=\s*([^\r\n]+)')).Groups[1].Value.Trim()
+          $inx = ([regex]::Match((Get-Content -LiteralPath 'crates\ln8000-kmdf\ln8000_kmdf.inx' -Raw), 'DriverVer\s*=\s*([^\r\n]+)')).Groups[1].Value.Trim()
+          if ($built -ne $inx) { throw "the built INF says DriverVer = $built, the .inx says $inx" }
+          Write-Host "DriverVer in the built INF: $built"
+          if ($text -notmatch 'HKR,,Security,,"D:P\(A;;GA;;;SY\)\(A;;GA;;;BA\)"') { throw "the built INF carries no device access policy" }
+          foreach ($name in 'ln8000_kmdf.sys', 'ln8000_kmdf.cat') {
+            $sig = Get-AuthenticodeSignature (Join-Path $kit $name)
+            Write-Host ("  {0}: {1}" -f $name, $sig.Status)
+            if ($sig.Status -ne 'Valid') { throw "$name is not validly signed: $($sig.Status)" }
+          }
+          $bytes = [IO.File]::ReadAllBytes((Join-Path $kit 'ln8000_kmdf.sys'))
+          $pe = [BitConverter]::ToInt32($bytes, 0x3C)
+          $machine = [BitConverter]::ToUInt16($bytes, $pe + 4)
+          if ($machine -ne 0xAA64) { throw ('the PE machine field is 0x{0:X4}, not 0xAA64 (ARM64)' -f $machine) }
+          Write-Host "machine field: 0xAA64 (ARM64)"
+          "DRIVER_VER=$built" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Assemble the archive
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          pwsh -NoProfile -File .\deploy\assemble-release.ps1 -Version $env:RELEASE_VERSION -RepoRoot $env:GITHUB_WORKSPACE
+          if ($LASTEXITCODE -ne 0) { throw "assemble-release.ps1 failed with exit code $LASTEXITCODE" }
+          $zip = "artifacts\release\nabu-ln8000-driver-$($env:RELEASE_VERSION)-arm64.zip"
+          if (-not (Test-Path $zip)) { throw "the archive was not produced: $zip" }
+          $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLower()
+          Write-Host "archive : $zip"
+          Write-Host "sha256  : $hash"
+          "ZIP_PATH=$zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "ZIP_SHA256=$hash" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Upload the archive as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          # A dry run is labelled as one: this artifact is not a released file, and the
+          # name should not invite anyone to treat it as one.
+          name: nabu-ln8000-driver-${{ inputs.version }}-arm64${{ inputs.dry_run && '-dryrun' || '' }}
+          path: artifacts/release/*.zip
+          if-no-files-found: error
+
+      # The release notes are the changelog's own section for this version, plus the facts
+      # a release note owes the reader: what the archive is, which driver it carries, what
+      # the reproducibility check said, and that known defects are open.
+      - name: Draft the release
+        if: ${{ !inputs.dry_run }}
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          PUBLISH: ${{ inputs.publish }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Exit codes are checked by hand below, so a failing native command must not throw.
+          if (Get-Variable PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue) {
+            $PSNativeCommandUseErrorActionPreference = $false
+          }
+          $version = $env:RELEASE_VERSION
+          $tag = "v$version"
+          $draft = -not [bool]::Parse($env:PUBLISH)
+
+          $changelog = Get-Content -LiteralPath 'CHANGELOG.md' -Raw
+          $section = [regex]::Match($changelog, '(?ms)^## \[' + [regex]::Escape($version) + '\].*?(?=^## \[|\z)').Value.TrimEnd()
+          $manifest = Get-Content -LiteralPath 'artifacts\BUILD-MANIFEST.json' -Raw | ConvertFrom-Json
+          $body = @(
+            $section,
+            '',
+            '---',
+            '',
+            ('**Archive:** `nabu-ln8000-driver-{0}-arm64.zip`, sha256 `{1}`.' -f $version, $env:ZIP_SHA256),
+            ('**Driver version in the archive:** `{0}`, from `crates/ln8000-kmdf/ln8000_kmdf.inx`.' -f $env:DRIVER_VER),
+            ('**Reproducibility:** ' + $manifest.reproducible_note + '.'),
+            '',
+            'Test signing on and Secure Boot off are required - the packages are test-signed. ' +
+            '`INSTALL.md` inside the archive is the installation procedure.',
+            '',
+            '**Known defects are open in this version.** They are listed in the README under ' +
+            '"Known defects, not fixed" and in `docs/FINDINGS.md`.'
+          ) -join "`n"
+          $notes = Join-Path $env:RUNNER_TEMP 'release-notes.md'
+          [IO.File]::WriteAllText($notes, $body + "`n", (New-Object Text.UTF8Encoding($false)))
+
+          $null = gh release view $tag --json isDraft 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            $isDraft = (gh release view $tag --json isDraft --jq .isDraft) -eq 'true'
+            if (-not $isDraft) { throw "release $tag is already published - nothing here touches a published release. Bump the version, or edit that release by hand." }
+            gh release edit $tag --title "nabu-ln8000-driver $version" --notes-file $notes
+            if ($LASTEXITCODE -ne 0) { throw "gh release edit failed with exit code $LASTEXITCODE" }
+            gh release upload $tag $env:ZIP_PATH --clobber
+            if ($LASTEXITCODE -ne 0) { throw "gh release upload failed with exit code $LASTEXITCODE" }
+            Write-Host "updated the draft $tag"
+          } else {
+            $ghArgs = @('release', 'create', $tag,
+                        '--title', "nabu-ln8000-driver $version",
+                        '--notes-file', $notes,
+                        '--target', $env:GITHUB_SHA)
+            if ($draft) { $ghArgs += '--draft' }
+            $ghArgs += $env:ZIP_PATH
+            gh @ghArgs
+            if ($LASTEXITCODE -ne 0) { throw "gh release create failed with exit code $LASTEXITCODE" }
+            if ($draft) { Write-Host "draft $tag created with the archive attached" } else { Write-Host "release $tag published" }
+          }
+          $url = gh release view $tag --json url --jq .url
+          if ($LASTEXITCODE -ne 0) { $url = 'https://github.com/' + $env:GITHUB_REPOSITORY + '/releases/tag/' + $tag }
+          "RELEASE_URL=$url" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Summary
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          $lines = @(
+            ('## nabu-ln8000-driver ' + $env:RELEASE_VERSION),
+            '',
+            ('* archive: `' + $env:ZIP_PATH + '`, sha256 `' + $env:ZIP_SHA256 + '`'),
+            ('* driver version in the archive: `' + $env:DRIVER_VER + '`'),
+            ('* reproducibility: ' + ((Get-Content -LiteralPath 'artifacts\BUILD-MANIFEST.json' -Raw | ConvertFrom-Json).reproducible_note))
+          )
+          if ($env:DRY_RUN -eq 'true') {
+            $lines += '* dry run: no release and no tag were created; the archive is attached to this run'
+          } else {
+            $lines += ('* release: ' + $env:RELEASE_URL + ' (a draft until it is published)')
+          }
+          $lines += ''
+          $lines += 'The archive is also attached to this workflow run as an artifact.'
+          $lines -join "`n" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
