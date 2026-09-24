@@ -183,6 +183,11 @@ if (-not $SkipBuild) {
             # A foreign CARGO_TARGET_DIR cannot be used for this: cargo-wdk fails
             # with NoWdkConfigurationsDetected and produces nothing.
             $env:CARGO_TARGET_DIR = $null
+            # Cargo colours that progress line when CARGO_TERM_COLOR says so, which CI sets to
+            # `always`, and the escape codes land between the word and the crate name: the
+            # check below then reads "compiled nothing" from a build that did compile. The
+            # output goes to a file here, where colour is worth nothing.
+            $env:CARGO_TERM_COLOR = 'never'
             $archRelease = Join-Path (Join-Path $RepoRoot $t.Crate) 'target\aarch64-pc-windows-msvc\release'
             if (Test-Path $archRelease) { Remove-Item -LiteralPath $archRelease -Recurse -Force }
             # The log is written through cmd, not with PowerShell redirection: with
@@ -192,9 +197,14 @@ if (-not $SkipBuild) {
             $buildLogPath = Join-Path $env:TEMP ('nabu-build-' + $t.Pkg + '.log')
             $cmdLine = 'cargo wdk build --target-arch arm64 --profile release > "' + $buildLogPath + '" 2>&1'
             & cmd /c $cmdLine
+            $buildExit = $LASTEXITCODE
             $buildOut = Get-Content -LiteralPath $buildLogPath -Raw
+            $buildTail = ((@($buildOut -split "`r?`n") | Where-Object { $_ -ne '' }) | Select-Object -Last 10) -join ' | '
+            if ($buildExit -ne 0) {
+                throw ("the second build of '" + $t.Name + "' failed with exit code " + $buildExit + ': ' + $buildTail)
+            }
             if ($buildOut -notmatch ('Compiling ' + [regex]::Escape($t.Pkg) + ' v')) {
-                throw ("the second build of '" + $t.Name + "' compiled nothing, so it cannot witness reproducibility")
+                throw ("the second build of '" + $t.Name + "' compiled nothing, so it cannot witness reproducibility; its output ends with: " + $buildTail)
             }
         } finally { Pop-Location }
     }
