@@ -628,6 +628,14 @@ per full cycle) with quiet windows 13:13-13:17 and from 13:31; and one with **no
   outside them - its only other sample above 0.5 is 13:34:15, the moment the adapter came off.
   `DisplayEnhancementService` stayed `Running` and stayed cheap (`deCpu` max 0.05), which weakens it
   as the CPU source without proving causality either way.
+* The levels the oscillation moves between are values the OS already holds for different power
+  sources: on battery the tablet sat at `51` for the whole 2.6 h, and the single step when the
+  adapter went back in at 16:27:32 was `51 -> 73` - the AC level, applied once, cleanly, with no
+  episode. The episodes then alternated `73 <-> 85` and (earlier) `58 <-> 95`, so one level of each
+  pair matches a stored power-source brightness while the other two do not, and the power source
+  itself never flipped. That points at whatever makes the OS re-decide the brightness - the `Power`
+  host spinning is the same suspect - but it is a hint, not a cause: no reading in this record shows
+  who asked for the flip.
 
 This is a separate defect from the phantom power-source flip: the `[Unreleased]` fix removes a
 verdict from a reflection tick and can neither produce nor suppress it. The campaign that carries
