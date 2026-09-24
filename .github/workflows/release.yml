@@ -107,6 +107,9 @@ jobs:
       # drops a stale `WDRLocalTestCert.cer` from the restored build cache.
       - name: Prepare the test signing certificate
         shell: pwsh
+        # The step is a certificate store and a few file deletions; if it ever blocks, fail
+        # here after ten minutes instead of holding the job for the six-hour default.
+        timeout-minutes: 10
         run: |
           $ErrorActionPreference = 'Stop'
           pwsh -NoProfile -File .\deploy\prepare-test-cert.ps1 -Trust -ClearCachedCertFiles

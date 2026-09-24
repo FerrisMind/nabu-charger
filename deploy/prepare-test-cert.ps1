@@ -9,10 +9,12 @@
   a build that finds none stops inside the package step with `SignTool Error: File not found` -
   which is what the first release dry run did.
 
-  A certificate is created in `Cert:\CurrentUser\My` and moved into the store through
-  `certutil -importPFX`, which creates the store on the way in: both
-  `New-SelfSignedCertificate -CertStoreLocation` and `Import-Certificate` refuse a store that
-  does not exist yet.
+  A certificate created by `New-SelfSignedCertificate` lives in `Cert:\CurrentUser\My`; it is
+  put into the cargo-wdk store with the .NET store API, which creates a store that does not
+  exist yet. `X509Store.Add` writes the certificate's key reference with it, so signtool can
+  sign from the store the way it signs from `My`. This is the same thing `makecert -ss` does,
+  without an external process: a certutil command that decides to ask a question would wait for
+  an answer that never comes, which is how the first attempt at this step hung a runner.
 
 .PARAMETER StoreName
   The user store cargo-wdk reads. Default WDRTestCertStore.
@@ -21,7 +23,7 @@
   The subject cargo-wdk asks signtool for. Default CN=WDRLocalTestCert.
 
 .PARAMETER Trust
-  Also import the certificate into the user `Root` and `TrustedPublisher` stores, so that
+  Also add the certificate to the user `Root` and `TrustedPublisher` stores, so that
   Authenticode verification returns Valid instead of UnknownError. The archive ships the .cer
   and INSTALL.md has the reader import it into the machine stores; this is that same step, for
   the machine that builds.
@@ -45,66 +47,83 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-# certutil writes progress to stderr; with $PSNativeCommandUseErrorActionPreference set (the
-# default in newer PowerShell versions) that would throw before the exit code is read.
-if (Get-Variable PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue) {
-  $PSNativeCommandUseErrorActionPreference = $false
+
+function Get-StoreCertificate([string]$Name, [string]$WantedSubject) {
+  try {
+    $store = New-Object System.Security.Cryptography.X509Certificates.X509Store($Name, 'CurrentUser')
+    $store.Open('ReadOnly')
+    try {
+      return @($store.Certificates | Where-Object { $_.Subject -eq $WantedSubject -and $_.HasPrivateKey }) | Select-Object -First 1
+    } finally { $store.Close() }
+  } catch {
+    return $null
+  }
 }
 
-$storePath = "Cert:\CurrentUser\$StoreName"
-$cert = $null
-if (Test-Path $storePath) {
-  $cert = Get-ChildItem $storePath |
-    Where-Object { $_.Subject -eq $Subject -and $_.HasPrivateKey } |
-    Select-Object -First 1
+function Add-ToStore([string]$Name, $Certificate) {
+  $store = New-Object System.Security.Cryptography.X509Certificates.X509Store($Name, 'CurrentUser')
+  # ReadWrite creates the store if it is not there yet; a certificate kept in a store that
+  # already holds the same one is not added twice, so this is safe to repeat.
+  $store.Open('ReadWrite')
+  try { $store.Add($Certificate) } finally { $store.Close() }
 }
 
+Write-Host "store under test: Cert:\CurrentUser\$StoreName"
+$cert = Get-StoreCertificate $StoreName $Subject
 if ($cert) {
-  Write-Host "test certificate already in ${storePath}: $($cert.Thumbprint)"
+  Write-Host "certificate already there: $($cert.Thumbprint)"
 } else {
-  Write-Host "no $Subject certificate in ${storePath}: creating one"
+  Write-Host 'no certificate in that store: creating one in Cert:\CurrentUser\My'
   $made = New-SelfSignedCertificate -Subject $Subject -CertStoreLocation 'Cert:\CurrentUser\My' `
     -Type CodeSigningCert -KeyUsage DigitalSignature -KeyExportPolicy Exportable `
     -NotAfter (Get-Date).AddYears(5)
-  $pfx = Join-Path ([IO.Path]::GetTempPath()) 'WDRLocalTestCert.pfx'
-  $password = [guid]::NewGuid().ToString('n')
-  Export-PfxCertificate -Cert $made -FilePath $pfx `
-    -Password (ConvertTo-SecureString $password -AsPlainText -Force) | Out-Null
-  & certutil -user -f -p $password -importPFX $StoreName $pfx
-  if ($LASTEXITCODE -ne 0) { throw "certutil could not put the certificate into ${StoreName} (exit code $LASTEXITCODE)" }
-  Remove-Item -LiteralPath $pfx -Force
+  Write-Host "created $($made.Thumbprint); moving it into ${StoreName}"
+  Add-ToStore $StoreName $made
   Remove-Item -LiteralPath (Join-Path 'Cert:\CurrentUser\My' $made.Thumbprint) -Force
-  $cert = Get-ChildItem $storePath |
-    Where-Object { $_.Subject -eq $Subject -and $_.HasPrivateKey } |
-    Select-Object -First 1
-  if (-not $cert) { throw "the certificate did not land in ${storePath}" }
+  $cert = Get-StoreCertificate $StoreName $Subject
+  if (-not $cert) { throw "the certificate did not land in Cert:\CurrentUser\$StoreName" }
+  Write-Host "certificate in place: $($cert.Thumbprint), private key: $($cert.HasPrivateKey)"
 }
 
 if ($Trust) {
-  $cer = Join-Path ([IO.Path]::GetTempPath()) 'WDRLocalTestCert.cer'
-  Export-Certificate -Cert $cert -FilePath $cer -Force | Out-Null
   foreach ($name in 'Root', 'TrustedPublisher') {
-    $have = Get-ChildItem "Cert:\CurrentUser\$name" | Where-Object { $_.Thumbprint -eq $cert.Thumbprint }
-    if ($have) { Write-Host "already trusted in $name" }
+    $have = Get-StoreCertificate $name $Subject
+    if ($have -and $have.Thumbprint -eq $cert.Thumbprint) { Write-Host "already trusted in $name" }
     else {
-      Import-Certificate -FilePath $cer -CertStoreLocation "Cert:\CurrentUser\$name" | Out-Null
-      Write-Host "imported into $name"
+      Add-ToStore $name $cert
+      Write-Host "added to ${name}: Authenticode verification will read Valid on this machine"
     }
   }
 }
 
 if ($ClearCachedCertFiles) {
   $repoRoot = Split-Path -Parent $PSScriptRoot
-  foreach ($pattern in @(
-      'crates\*\target\aarch64-pc-windows-msvc\release\WDRLocalTestCert.cer',
-      'crates\*\target\aarch64-pc-windows-msvc\release\*_package\WDRLocalTestCert.cer',
-      'crates\*\target\aarch64-pc-windows-msvc\debug\WDRLocalTestCert.cer',
-      'crates\*\target\aarch64-pc-windows-msvc\debug\*_package\WDRLocalTestCert.cer',
-      'crates\*\target\release\WDRLocalTestCert.cer',
-      'crates\*\target\release\*_package\WDRLocalTestCert.cer')) {
-    Get-ChildItem -Path (Join-Path $repoRoot $pattern) -ErrorAction SilentlyContinue |
-      ForEach-Object { Write-Host "removing the cached $($_.FullName)"; Remove-Item -LiteralPath $_.FullName -Force }
+  $removed = 0
+  # Two levels of directories under `target` (the architecture directory and the profile
+  # directory below it), one level below each profile for the package folder: no recursive
+  # walk over a build output that a cache restore has just made very large.
+  foreach ($crate in 'kmdf', 'ln8000-kmdf') {
+    $targetRoot = Join-Path $repoRoot "crates\$crate\target"
+    if (-not (Test-Path -LiteralPath $targetRoot)) { continue }
+    $level1 = @(Get-ChildItem -LiteralPath $targetRoot -Directory -ErrorAction SilentlyContinue)
+    foreach ($dir in @($targetRoot) + ($level1 | Select-Object -ExpandProperty FullName)) {
+      foreach ($probe in @($dir, (Join-Path $dir 'release'), (Join-Path $dir 'debug'))) {
+        if (-not (Test-Path -LiteralPath $probe -PathType Container)) { continue }
+        $candidates = @((Join-Path $probe 'WDRLocalTestCert.cer'))
+        foreach ($leaf in Get-ChildItem -LiteralPath $probe -Directory -ErrorAction SilentlyContinue) {
+          $candidates += (Join-Path $leaf.FullName 'WDRLocalTestCert.cer')
+        }
+        foreach ($path in $candidates) {
+          if (Test-Path -LiteralPath $path -PathType Leaf) {
+            Remove-Item -LiteralPath $path -Force
+            Write-Host "removed a cached $($path.Substring($repoRoot.Length + 1))"
+            $removed++
+          }
+        }
+      }
+    }
   }
+  Write-Host "cached certificate files removed: $removed"
 }
 
 Write-Host "certificate: $($cert.Subject), thumbprint $($cert.Thumbprint), expires $($cert.NotAfter.ToString('yyyy-MM-dd'))"
