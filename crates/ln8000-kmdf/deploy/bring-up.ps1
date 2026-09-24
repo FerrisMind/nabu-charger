@@ -59,6 +59,61 @@ function Is-Admin {
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+# The charge measurement reads GetSystemPowerStatus, the API the tray and Settings use.
+# Win32_Battery is the obvious source and it is the wrong one here: on this tablet it
+# returns no instances even when a working battery is published (measured 24.09.2026 with
+# the driver's battery in place and GetSystemPowerStatus reporting 52 %).
+function Get-PowerStatus {
+    if (-not ('NabuBringUp.PowerStatus' -as [type])) {
+        Add-Type -Namespace NabuBringUp -Name PowerStatus -MemberDefinition @'
+[StructLayout(LayoutKind.Sequential)]
+public struct SPS { public byte AC; public byte Flag; public byte Life; public byte Full; public uint Run; public uint FullRun; public uint Flags; public uint Sec; }
+[DllImport("kernel32.dll", SetLastError=true)] public static extern bool GetSystemPowerStatus(out SPS s);
+'@ -ErrorAction Stop
+    }
+    $s = New-Object NabuBringUp.PowerStatus+SPS
+    $ok = [NabuBringUp.PowerStatus]::GetSystemPowerStatus([ref]$s)
+    if (-not $ok) { return $null }
+    return [pscustomobject]@{
+        Ok      = $ok
+        ACLine  = $s.AC
+        Flag    = $s.Flag
+        LifePct = $s.Life
+        FullPct = $s.Full
+        Notes   = (Get-PowerStatusNote $s.AC $s.Flag $s.Life)
+    }
+}
+
+function Get-PowerStatusNote {
+    param([int]$AC, [int]$Flag, [int]$Life)
+    if ($Flag -eq 128) { return 'no system battery (BatteryFlag 128)' }
+    if ($Life -eq 255) { return 'charge unknown (LifePercent 255)' }
+    $bits = @()
+    if ($Flag -band 8) { $bits += 'charging' }
+    if ($Flag -band 1) { $bits += 'high' }
+    if ($Flag -band 2) { $bits += 'low' }
+    if ($Flag -band 4) { $bits += 'critical' }
+    if (-not $bits.Count) { $bits += 'mid level' }
+    return ('battery present, ' + ($bits -join '/'))
+}
+
+# One shape for the two sources, so the interval comparison does not care which answered.
+function Get-ChargeView {
+    $ps = Get-PowerStatus
+    if ($ps -and $ps.LifePct -ne 255) {
+        return [pscustomobject]@{ Pct = [int]$ps.LifePct; AC = $ps.ACLine; Note = $ps.Notes }
+    }
+    $w = Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($w) {
+        return [pscustomobject]@{
+            Pct  = [int]$w.EstimatedChargeRemaining
+            AC   = 'unknown'
+            Note = 'Win32_Battery: ' + $w.Name + ', status ' + $w.BatteryStatus
+        }
+    }
+    return $null
+}
+
 Add-Content -LiteralPath $log -Value 'Fast charging report for nabu (Xiaomi Pad 5)'
 Add-Content -LiteralPath $log -Value ("Start time: " + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
 Write-Host ''
@@ -110,6 +165,34 @@ Capture 'DRIVER SERVICE' {
     & sc.exe qc ln8000_kmdf
 }
 
+Capture 'PMIC PLATFORM (qcpmic*, qcspmi)' {
+    # The charger stack this driver negotiates through. Community "usbfix"
+    # packages replace qcpmicext8150.sys inside the DriverStore, which changes
+    # the layer the pump driver depends on - the file size and the write date
+    # below are what tells those machines apart.
+    foreach ($d in (Get-CimInstance Win32_SystemDriver -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match 'qcpmic|qcspmi' })) {
+        $path = $d.PathName -replace '^\\\?\?\\', ''
+        $info = ''
+        if ($path -and (Test-Path -LiteralPath $path)) {
+            $item = Get-Item -LiteralPath $path
+            $info = (' | ' + $item.Name + ' ' + $item.Length + ' bytes, ver ' +
+                $item.VersionInfo.FileVersion + ', ' + $item.LastWriteTime.ToString('yyyy-MM-dd'))
+        }
+        ($d.Name + ' | ' + $d.State + $info)
+    }
+    if (Test-Path 'C:\drivers\qcpmicext8150_fix20.sys') {
+        'usbfix fix20 DETECTED: C:\drivers\qcpmicext8150_fix20.sys exists.'
+        'The PMIC driver is a community replacement - the charger stack differs'
+        'from the one this driver was verified on.'
+    }
+    if (Test-Path 'C:\usbfix_backup') {
+        $names = Get-ChildItem 'C:\usbfix_backup' -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty Name
+        'usbfix backup folder present: ' + ($names -join ', ')
+    }
+}
+
 $inf = Join-Path $PackageDir 'ln8000_kmdf.inf'
 $skipReason = ''
 if ($SkipInstall) {
@@ -138,7 +221,45 @@ if (Test-Path -LiteralPath $diag) {
     Capture 'DRIVER' { 'tool nabu-ln8000.ps1 not found next to the script' }
 }
 
+Capture 'BATTERY DEVICES' {
+    # Two batteries in Windows is the symptom this section exists for: the
+    # platform stack may publish one of its own, and this driver publishes
+    # another unless PublishBattery=0. The three sources disagree on purpose -
+    # that disagreement is itself evidence.
+    $list = @(Get-PnpDevice -Class Battery -ErrorAction SilentlyContinue)
+    'battery-class devnodes: ' + $list.Count
+    $list | ForEach-Object { ($_.Status + ' | ' + $_.FriendlyName + ' | ' + $_.InstanceId) }
+    'Win32_Battery instances: ' + @(Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue).Count
+    $ps = Get-PowerStatus
+    if ($ps) {
+        'GetSystemPowerStatus: AC line ' + $ps.ACLine + ', flag ' + $ps.Flag + ', charge ' +
+            $ps.LifePct + ' %, ' + $ps.Notes
+        '  (this is the source the tray icon and Settings read; Win32_Battery can stay empty)'
+    } else {
+        'GetSystemPowerStatus did not answer'
+    }
+}
+
+Capture 'DRIVER MARKS (Device Parameters)' {
+    # Every value the driver writes for a post-mortem: the SPMI probes
+    # (SpmiProbeSuperuser, HvdcpVia), the session counters, the thermal guard and
+    # the battery flags. This is what a remote report is read from.
+    $base = 'HKLM:\SYSTEM\CurrentControlSet\Enum\ACPI\QCOM057E'
+    if (-not (Test-Path $base)) { return 'no ACPI\QCOM057E enum key - the node never came up' }
+    Get-ChildItem $base -ErrorAction SilentlyContinue | ForEach-Object {
+        $params = Get-ItemProperty -Path (Join-Path $_.PSPath 'Device Parameters') -ErrorAction SilentlyContinue
+        if (-not $params) { return 'no Device Parameters values yet' }
+        'instance ' + $_.PSChildName
+        $params.PSObject.Properties |
+            Where-Object { $_.Name -notmatch '^PS' } |
+            Sort-Object Name |
+            ForEach-Object { '  ' + $_.Name + ' = ' + $_.Value }
+    }
+}
+
 Capture 'BATTERY: FIRST MEASUREMENT' {
+    $ps = Get-PowerStatus
+    if ($ps) { 'GetSystemPowerStatus: charge ' + $ps.LifePct + ' %, AC line ' + $ps.ACLine + ', ' + $ps.Notes }
     Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue |
         Select-Object Name, DeviceID, BatteryStatus, EstimatedChargeRemaining,
                       EstimatedRunTime, DesignVoltage, Chemistry |
@@ -147,11 +268,11 @@ Capture 'BATTERY: FIRST MEASUREMENT' {
 
 Section ("BATTERY: SECOND MEASUREMENT AFTER " + $ChargeSampleSeconds + " s")
 Write-Host ("  waiting " + $ChargeSampleSeconds + " s to estimate the charge change...") -ForegroundColor Yellow
-$first = Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue | Select-Object -First 1
+$first = Get-ChargeView
 Start-Sleep -Seconds $ChargeSampleSeconds
-$second = Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue | Select-Object -First 1
+$second = Get-ChargeView
 if ($first -and $second) {
-    $delta = [int]$second.EstimatedChargeRemaining - [int]$first.EstimatedChargeRemaining
+    $delta = [int]$second.Pct - [int]$first.Pct
     if ($delta -gt 0) {
         $verdict = 'charge is RISING'
     } elseif ($delta -lt 0) {
@@ -159,16 +280,28 @@ if ($first -and $second) {
     } else {
         $verdict = 'charge is UNCHANGED'
     }
+    # The percentage is whole numbers, so a slow charge reads as UNCHANGED over a short
+    # interval. The driver's own marks carry a finer witness: the pack's gauge current and
+    # charge flag, which move long before the percentage does.
+    $marks = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Enum\ACPI\QCOM057E\*\Device Parameters' -ErrorAction SilentlyContinue
+    if ($marks) {
+        $fine = 'marks: BattPct ' + $marks.BattPct + ', GaugeCharging ' + $marks.GaugeCharging +
+                ', SocRaw ' + $marks.SocRaw + ', FgIbatUa ' + $marks.FgIbatUa +
+                ', CellVbatMv ' + $marks.CellVbatMv
+    } else {
+        $fine = 'marks: no Device Parameters values under ACPI\QCOM057E'
+    }
     $lines = @(
-        ("start  : charge " + $first.EstimatedChargeRemaining + " %, status " + $first.BatteryStatus),
-        ("end    : charge " + $second.EstimatedChargeRemaining + " %, status " + $second.BatteryStatus),
+        ("start  : charge " + $first.Pct + " %, AC line " + $first.AC + ", " + $first.Note),
+        ("end    : charge " + $second.Pct + " %, AC line " + $second.AC + ", " + $second.Note),
         ("delta  : " + $delta + " % over " + $ChargeSampleSeconds + " s"),
-        ("verdict: " + $verdict)
+        ("verdict: " + $verdict),
+        $fine
     )
     $lines | ForEach-Object { Add-Content -LiteralPath $log -Value $_ }
     $lines | ForEach-Object { Write-Host ("  " + $_) }
 } else {
-    Add-Content -LiteralPath $log -Value 'WMI did not return battery information'
+    Add-Content -LiteralPath $log -Value 'no power source answered: neither GetSystemPowerStatus nor Win32_Battery'
 }
 
 Capture 'WINDOWS POWER REPORT' {

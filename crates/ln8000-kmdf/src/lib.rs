@@ -758,6 +758,13 @@ struct DriverParams {
     /// Raw FCC value from the [`FCC_POLICY_VALUE_NAME`] parameter (0 - the policy
     /// is off: both when the parameter is absent and when it is zero).
     fcc_raw: u32,
+    /// Whether to attach the Windows battery class ([`battery::initialize`]).
+    /// Default is on: on the stock-ish stack the Xiaomi miniclass never publishes
+    /// `GUID_DEVICE_BATTERY`, so without us Windows has no battery meter at all.
+    /// `PublishBattery=0` opts out for stacks that bring a battery of their own
+    /// (modified-PMIC community packs): a second battery confuses the aggregate
+    /// meter, and the pump does not need BattC to charge.
+    publish_battery: bool,
 }
 
 /// Fills the buffer with the characters of a string and returns the length.
@@ -1367,6 +1374,8 @@ unsafe fn read_parameters(device: WDFDEVICE) -> DriverParams {
     // Applied `ProtectionProfile` value: `None` - there is no parameter in the
     // registry and the code profile stays (`for_qc35_class_b`, loops enabled).
     let mut protection_profile: Option<u32> = None;
+    // Battery class opt-out: absent or non-zero keeps the current behaviour.
+    let mut publish_battery = true;
 
     let mut device_key: WDFKEY = WDF_NO_HANDLE.cast();
     // SAFETY: the device was created; the key is only opened for reading.
@@ -1393,6 +1402,7 @@ unsafe fn read_parameters(device: WDFDEVICE) -> DriverParams {
             limits,
             telemetry_ms,
             fcc_raw,
+            publish_battery,
         };
     }
 
@@ -1429,6 +1439,7 @@ unsafe fn read_parameters(device: WDFDEVICE) -> DriverParams {
             limits,
             telemetry_ms,
             fcc_raw,
+            publish_battery,
         };
     }
 
@@ -1464,6 +1475,18 @@ unsafe fn read_parameters(device: WDFDEVICE) -> DriverParams {
             telemetry_ms = ms;
         } else {
             println!("ln8000-kmdf: telemetry period {ms} ms outside the 100..60000 bounds, keeping {telemetry_ms}");
+        }
+    }
+
+    // `PublishBattery=0` removes our battery from Windows: the escape hatch for
+    // stacks that already provide one (modified-PMIC community packs report a
+    // second battery alongside ours). Any non-zero value, and the absence of the
+    // parameter, keep the battery class attached.
+    // SAFETY: the Parameters key is open for reading.
+    if let Some(value) = unsafe { query_ulong(params_key, "PublishBattery") } {
+        publish_battery = value != 0;
+        if value == 0 {
+            println!("ln8000-kmdf: battery class disabled (PublishBattery=0)");
         }
     }
 
@@ -1557,6 +1580,7 @@ unsafe fn read_parameters(device: WDFDEVICE) -> DriverParams {
         limits,
         telemetry_ms,
         fcc_raw,
+        publish_battery,
     }
 }
 
@@ -2213,8 +2237,18 @@ unsafe extern "C" fn evt_prepare_hardware(
 
     // 4c. Publish GUID_DEVICE_BATTERY via BattC (tray / Settings SoC).
     // Xiaomi qcbattminiclass never enables the interface; we estimate SoC from VBAT.
+    // `PublishBattery=0` skips the attachment: the holds and the gauge trend in
+    // battery.rs keep running (the telemetry tick feeds them, and the Batt* marks
+    // keep flowing), only the Windows-visible battery is not created.
     // SAFETY: FDO exists; PASSIVE_LEVEL.
-    let batt_st = unsafe { battery::initialize(device) };
+    let batt_st = if params.publish_battery {
+        mark_device_value(device, "BattPub", 1);
+        unsafe { battery::initialize(device) }
+    } else {
+        mark_device_value(device, "BattPub", 0);
+        println!("ln8000-kmdf: battery not published (PublishBattery=0)");
+        wdk_sys::STATUS_UNSUCCESSFUL
+    };
     if batt_st >= 0 {
         // Re-borrow after HVDCP (it also touches `state()`).
         let st = unsafe { state() };

@@ -4,8 +4,9 @@
 #     .\install-driver.ps1
 #
 # What it does:
-#   1) checks that test signing of drivers is enabled (the driver is signed with
-#      the WDK test certificate);
+#   1) checks the two requirements together and prints the raw bcdedit line: test
+#      signing on, Secure Boot off (the driver is signed with the WDK test
+#      certificate);
 #   2) installs the package through pnputil;
 #   3) checks that the ACPI\QCOM057E device got the ln8000_kmdf driver;
 #   4) starts the service and prints the state through the diagnostic tool.
@@ -31,8 +32,21 @@ function Assert-Admin {
 }
 
 function Get-TestSigning {
+  # bcdedit prints its field names and values in English even on localized Windows
+  # (checked on ru-RU), so matching the value is safe. The raw line is returned as well
+  # and shown, so a machine where the parse fails says so instead of reporting a silent
+  # "no" - the line is also absent until the setting has been written once.
   $out = & bcdedit /enum '{current}' 2>&1 | Out-String
-  return ($out -match 'testsigning\s+Yes')
+  $line = ($out -split "`r?`n" | Where-Object { $_ -match 'testsigning' } | Select-Object -First 1)
+  if ($line) {
+    $line = $line.Trim()
+  } else {
+    $line = 'no testsigning line in bcdedit output (it appears once the setting is written)'
+  }
+  return [pscustomobject]@{
+    On   = [bool]($out -match 'testsigning\s+Yes')
+    Line = $line
+  }
 }
 
 # Secure Boot ignores the testsigning setting, so a test-signed package cannot load with
@@ -49,24 +63,43 @@ if (-not (Test-Path -LiteralPath $inf)) {
   throw "not found: $inf - put the driver package (inf, sys, cat) next to the script"
 }
 
-Write-Host '=== 1. signature check ===' -ForegroundColor Cyan
+Write-Host '=== 1. requirements: test signing and Secure Boot ===' -ForegroundColor Cyan
 if (-not $SkipSignatureCheck) {
-  if (Get-TestSigning) {
-    Write-Host '  test signing is enabled (testsigning Yes)' -ForegroundColor Green
+  # Both requirements are reported before either one stops the run, and Secure Boot is
+  # the one that cannot be fixed from inside Windows: it overrides test signing, so a
+  # test-signed package is refused while it is on, whatever bcdedit says.
+  $secureBoot = Get-SecureBoot
+  $testSigning = Get-TestSigning
+
+  if ($secureBoot -eq $true) {
+    Write-Host '  Secure Boot: ENABLED - a test-signed driver cannot load' -ForegroundColor Yellow
+  } elseif ($secureBoot -eq $false) {
+    Write-Host '  Secure Boot: off' -ForegroundColor Green
   } else {
-    Write-Host '  test signing is DISABLED.' -ForegroundColor Yellow
-    Write-Host '  The driver is signed with the WDK test certificate, so enable the mode:' -ForegroundColor Yellow
-    Write-Host '      bcdedit /set testsigning on' -ForegroundColor Yellow
-    Write-Host '  and reboot the tablet, then repeat the installation.' -ForegroundColor Yellow
-    throw 'test signing is disabled'
+    Write-Host '  Secure Boot: cannot be read on this machine (Confirm-SecureBootUEFI failed)' -ForegroundColor DarkGray
   }
-  # Secure Boot ignores the testsigning setting entirely, so a test-signed package is
-  # refused with it on even when the mode above reads Yes.
-  if ((Get-SecureBoot) -eq $true) {
-    Write-Host '  Secure Boot is ENABLED.' -ForegroundColor Yellow
-    Write-Host '  A test-signed driver cannot load while Secure Boot is on:' -ForegroundColor Yellow
-    Write-Host '  turn it off in the UEFI settings and repeat the installation.' -ForegroundColor Yellow
-    throw 'Secure Boot is enabled'
+  Write-Host ('  bcdedit: ' + $testSigning.Line)
+  if ($testSigning.On) {
+    Write-Host '  test signing: enabled' -ForegroundColor Green
+  } else {
+    Write-Host '  test signing: DISABLED' -ForegroundColor Yellow
+  }
+
+  $blocked = @()
+  if ($secureBoot -eq $true) { $blocked += 'Secure Boot' }
+  if (-not $testSigning.On) { $blocked += 'test signing' }
+
+  if ($secureBoot -eq $true) {
+    Write-Host '  Turn Secure Boot off in the UEFI settings and repeat. No command in' -ForegroundColor Yellow
+    Write-Host '  Windows changes it.' -ForegroundColor Yellow
+  }
+  if (-not $testSigning.On) {
+    Write-Host '  The driver carries the WDK test certificate, so the mode has to be on:' -ForegroundColor Yellow
+    Write-Host '      bcdedit /set testsigning on' -ForegroundColor Yellow
+    Write-Host '  then reboot the tablet and repeat the installation.' -ForegroundColor Yellow
+  }
+  if ($blocked.Count) {
+    throw ('cannot install yet: ' + ($blocked -join ' and '))
   }
 }
 

@@ -172,6 +172,31 @@ Get-Content SHA256SUMS.txt | ForEach-Object {
 On Linux or macOS: `sha256sum -c SHA256SUMS.txt`. The file uses LF line endings, so it
 verifies on either.
 
+## Community usbfix packages and the PMIC layer
+
+Fast charging is negotiated through the PMIC peripheral layer: the driver opens
+`\Device\Spmi\SUPERUSER` and works on the APSD/HVDCP registers of the PM8150B. That
+layer is a Qualcomm driver, `qcpmicext8150.sys`.
+
+The `usbfix` packages circulating for nabu (fix20 and relatives) replace that file
+inside `C:\Windows\System32\DriverStore\...` with a patched build - the copy seen here
+is 60 344 bytes against the stock 66 664 bytes, under the same declared version
+1.0.1680.0000. What they fix is the OTG power latch that leaves the tablet refusing to
+charge after a storage device is unplugged, which is the same charger layer this driver
+negotiates through. The combination has not been measured here: the pump may fail to
+negotiate (no fast charge, the platform path keeps charging on its own), and two
+drivers end up writing the same charger registers. If you run one of those packages,
+`bring-up.ps1` now records the PMIC driver versions, the battery device list and the
+driver's own marks - send that report.
+
+Two batteries in Windows are ours plus the machine's own. This driver attaches the
+battery class itself because the Xiaomi miniclass (`ACPI\QCOM052D`) never publishes
+`GUID_DEVICE_BATTERY`: without it Windows has no battery meter at all. To remove ours,
+set `PublishBattery` to `0` under
+`HKLM\SYSTEM\CurrentControlSet\Enum\ACPI\QCOM057E\<instance>\Device Parameters\Parameters`
+and restart the device node (`pnputil /restart-device`); no rebuild and no reboot are
+needed, and the pump charges without the battery class.
+
 ## Known defects
 
 These are open in this version. They are listed here rather than only in the

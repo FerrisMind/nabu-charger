@@ -237,6 +237,40 @@ More detail: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md),
   predates the working access path - read it for what was ruled out, not for the
   current state.
 
+### Community driver packs and the PMIC stack
+
+The pump driver negotiates Quick Charge through the PMIC peripheral layer: it opens
+`\Device\Spmi\SUPERUSER` and drives the APSD/HVDCP registers of the PM8150B. That
+layer is a Qualcomm driver, `qcpmicext8150.sys`, and community threads for nabu
+ship patched copies of it.
+
+Verified on the development tablet:
+
+| | value |
+|---|---|
+| `qcpmicext8150.sys` in the DriverStore | 66 664 bytes, version 1.0.1680.0000 |
+| Windows build | 10.0.26200 |
+| SPMI probe (`SpmiProbeSuperuser`) | 0, that is the SUPERUSER object opens |
+
+**Known conflict: the `usbfix` packages (fix20 and relatives).** They replace
+`qcpmicext8150.sys` inside `C:\Windows\System32\DriverStore\...` with a patched
+build of their own - 60 344 bytes under the same version number. What they fix is
+the OTG power latch that leaves the tablet refusing to charge after a disk is
+unplugged, and that is the same charger layer this driver negotiates through. No
+measurement of the combination exists: on such a machine the pump may fail to
+negotiate (no fast charge; the platform path keeps charging on its own), and two
+drivers write the same charger registers. If you run one of those packs, run
+`.\bring-up.ps1` and send the report: it now records the PMIC driver versions, the
+battery device list and the driver's own marks.
+
+**Two batteries in Windows** are ours plus the machine's own. This driver attaches
+the battery class itself because the Xiaomi miniclass (`ACPI\QCOM052D`) never
+publishes `GUID_DEVICE_BATTERY` - without it Windows has no battery meter at all.
+On a stack that brings a battery of its own, both appear. To remove ours, set the
+`PublishBattery` parameter in the device's `Parameters` key to `0` and restart the
+device node; no rebuild and no reboot are needed, and the pump charges without the
+battery class.
+
 ## Building and installing the driver
 
 The short version is below. The full procedure, the diagnostic tool, the configuration

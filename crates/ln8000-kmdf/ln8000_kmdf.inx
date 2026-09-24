@@ -29,7 +29,7 @@ PnpLockDown = 1
 ; already has. It must stay ABOVE every ln8000_kmdf package already in the
 ; tablet's DriverStore - a lower DriverVer is refused as "Outranked". The query
 ; that lists them is in docs/RELEASE.md ("the Outranked trap").
-DriverVer   = 09/24/2026,20.47.10.677
+DriverVer   = 09/24/2026,20.47.10.679
 
 [DestinationDirs]
 DefaultDestDir = 13
@@ -102,6 +102,10 @@ HKR, Parameters, TelemetryMs,     %REG_DWORD%, 250
 HKR, Parameters, BusRetryCount,   %REG_DWORD%, 2
 HKR, Parameters, NtcAlarmCfg,     %REG_DWORD%, 226
 HKR, Parameters, WatchdogEnabled, %REG_DWORD%, 0
+; 0 = do not attach the Windows battery class. Escape hatch for stacks that
+; bring a battery of their own (modified-PMIC community packs report a second
+; battery alongside ours); the pump does not need BattC to charge.
+HKR, Parameters, PublishBattery,  %REG_DWORD%, 1
 ; 0 = pump protections as in the tablet Device Tree, 1 = loops enabled.
 ; Under Windows the pump itself, not SMB5, drives the battery: with 0 (as in the
 ; DTS) only the hardware VBAT_OV ~ V_FLOAT*1.02 limits the voltage, and a clean

@@ -250,6 +250,40 @@ Mais detalhes: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md),
   ao caminho de acesso funcional - leia-o pelo que foi descartado, não pelo estado
   atual.
 
+### Pacotes da comunidade e a camada PMIC
+
+O carregamento rápido passa pela camada periférica do PMIC: o driver abre
+`\Device\Spmi\SUPERUSER` e opera os registradores de APSD/HVDCP do PM8150B. Essa
+camada é um driver da Qualcomm, `qcpmicext8150.sys`, e circulam cópias modificadas
+dele nos tópicos sobre o nabu.
+
+Verificado no tablet de desenvolvimento:
+
+| | valor |
+|---|---|
+| `qcpmicext8150.sys` no DriverStore | 66 664 bytes, versão 1.0.1680.0000 |
+| Build do Windows | 10.0.26200 |
+| Sonda de SPMI (`SpmiProbeSuperuser`) | 0, ou seja, o objeto SUPERUSER abre |
+
+**Conflito conhecido: os pacotes `usbfix` (fix20 e parentes).** Eles substituem
+`qcpmicext8150.sys` em `C:\Windows\System32\DriverStore\...` por um build próprio -
+60 344 bytes com o mesmo número de versão. O que eles corrigem é a trava de energia
+do OTG que deixa o tablet sem carregar depois de remover um disco, e é exatamente a
+mesma camada de carregamento por onde este driver negocia. Não há medição da
+combinação: nessa máquina a bomba pode não negociar (sem carregamento rápido, com o
+caminho da plataforma seguindo sozinho), e dois drivers escrevem nos mesmos
+registradores de carga. Se você usa um desses pacotes, rode `.\bring-up.ps1` e envie
+o relatório: ele agora registra as versões dos drivers de PMIC, a lista de
+dispositivos de bateria e as marcas do driver.
+
+**Duas baterias no Windows** são a nossa mais a própria bateria da máquina. Este
+driver anexa a classe de bateria por conta própria porque a miniclasse da Xiaomi
+(`ACPI\QCOM052D`) nunca publica `GUID_DEVICE_BATTERY` - sem isso o Windows não tem
+medidor de carga nenhum. Em uma pilha que já traz bateria própria, as duas
+aparecem. Para remover a nossa, defina o parâmetro `PublishBattery` como `0` na
+chave `Parameters` do dispositivo e reinicie o nó: não precisa recompilar nem
+reiniciar o sistema, e a bomba carrega sem a classe de bateria.
+
 ## Compilando e instalando o driver
 
 A versão curta está abaixo. O procedimento completo, a ferramenta de diagnóstico, os

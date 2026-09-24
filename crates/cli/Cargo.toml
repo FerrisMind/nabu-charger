@@ -16,7 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 # The dependency name is not `core`: otherwise clap-derive does not find `core::env` from std.
-charger_core = { package = "charger-core", path = "../core", version = "0.3.2" }
+charger_core = { package = "charger-core", path = "../core", version = "0.3.3" }
 host = { workspace = true }
 ln8000 = { workspace = true }
 clap = { version = "4.5.40", features = ["derive"] }

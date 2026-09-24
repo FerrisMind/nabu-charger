@@ -5,6 +5,75 @@ and versions follow [SemVer](https://semver.org/lang/ru/).
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-09-24
+
+This release comes out of a report from a community machine running a patched PMIC
+stack (the `usbfix` / fix20 package, which replaces `qcpmicext8150.sys`). Two of its
+three complaints are answered by a switch and by diagnostics; the third is a documented
+incompatibility rather than a guessed fix. The battery switch was measured live on the
+development tablet with the driver stamp `20.47.10.678`, a test build; the released
+archive itself is verified on the same tablet before the release is published.
+
+### Added
+
+* **`PublishBattery` - the battery this driver publishes can be turned off without a
+  rebuild.** The driver attaches the Windows battery class itself because the Xiaomi
+  miniclass (`ACPI\QCOM052D`) never publishes `GUID_DEVICE_BATTERY`, so without it
+  Windows has no battery meter at all. On a stack that brings a battery of its own the
+  result is two batteries in the tray. `PublishBattery=0` under
+  `<device>\Device Parameters\Parameters` skips the attachment; the default is `1` in the
+  INF and in code, so an absent value keeps publishing. The pump needs no battery class
+  to charge, and the telemetry marks keep flowing either way.
+  Measured on the tablet, reading `GetSystemPowerStatus` (the source the tray and
+  Settings use): `PublishBattery=1` - `BatteryFlag=0`, `LifePercent=53`, and the
+  percentage tracks the driver's own `BattPct` (53 → 52 → 51 as the pack discharged);
+  `PublishBattery=0` after a device-node restart - `BatteryFlag=128` ("no system
+  battery"), `LifePercent=255`, then back to present when set to `1` again. The driver
+  marks the choice as `BattPub`.
+* **`bring-up.ps1` now records what a remote report was missing:** the PMIC platform
+  layer (every `qcpmic*` / `qcspmi` service with its file name, size, version and date -
+  the fingerprint that identifies a `usbfix` install), a battery inventory
+  (`Get-PnpDevice -Class Battery`, `Win32_Battery`, and `GetSystemPowerStatus`, which is
+  the one of the three that answers), and the full driver marks dump from
+  `Device Parameters`. The battery interval also reads `GetSystemPowerStatus` now, so the
+  charge-change verdict is no longer dead on a machine where `Win32_Battery` returns
+  nothing (measured: it returns no instances even while the driver's battery is published
+  and Windows reports 52 %), and it prints the pack's own witness
+  (`BattPct`, `GaugeCharging`, `SocRaw`, `FgIbatUa`, `CellVbatMv`) next to the percentage.
+* **`install-driver.ps1` reports both requirements before it stops.** Secure Boot and
+  test signing are printed together with the raw `bcdedit` `testsigning` line, and the
+  throw names both blockers, so a run that refuses to install says which of the two it
+  is. Secure Boot is named first: it cannot be changed from inside Windows and it
+  overrides test signing entirely.
+* **Documentation for the community PMIC packages:** a section in all three READMEs, in
+  the generated `INSTALL.md` and a `PublishBattery` row in
+  [docs/DEPLOY-LN8000.md](docs/DEPLOY-LN8000.md).
+
+### Changed
+
+* Windows driver version `20.47.10.677` → `20.47.10.679` (`DriverVer` in the `.inx` and
+  `STAMPINF_VERSION` in `deploy/build-arm64.ps1`, in lockstep). `20.47.10.678` was a
+  local build used to measure the battery switch; it never shipped, and the released
+  number is above it so an install over that test build is accepted.
+
+### Known, and deliberately not fixed
+
+* **A patched `qcpmicext8150.sys` (`usbfix` / fix20) is outside the verified
+  configuration.** That layer is what the driver negotiates Quick Charge through
+  (`\Device\Spmi\SUPERUSER`, the APSD/HVDCP registers). The package replaces the stock
+  66 664-byte file with a 60 344-byte build under the same declared version
+  `1.0.1680.0000`, and its target is the OTG power latch - charger-layer behaviour.
+  Nothing here has been measured against it: a modified stack may leave the pump unable
+  to negotiate (no fast charge, the platform path charging on its own), and both drivers
+  write the same charge registers. It is documented rather than patched around, because a
+  fix for a binary that cannot be inspected from this repository would be a guess.
+* `BattPct` / `BattVbat` / `BattPwr` stop being updated with `PublishBattery=0`, and the
+  `BattClassOk` / `BattWmiOk` marks are not cleared by a device-node restart: on a boot
+  that starts with 0 they are simply absent. Judge the switch by what Windows reports,
+  not by those marks.
+* On an *update* install the new INF default may not appear in `Device Parameters`:
+  specify `PublishBattery` by hand to change it. An absent value means `1`.
+
 ## [0.3.2] - 2026-09-24
 
 ### Fixed

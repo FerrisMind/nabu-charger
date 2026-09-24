@@ -173,6 +173,7 @@ The defaults are set by the INF and overridden in the device registry:
 | `BusRetryCount` | 2 | operation retries on a bus failure (0...8) |
 | `WatchdogEnabled` | 0 | enable the chip watchdog timer (0/1) |
 | `ProtectionProfile` | 1 | `1` - the pump `V_FLOAT`/`IIN` loops are on, `0` - as in the Device Tree (loops off, only the hardware `VBAT_OV` holds the voltage). Under Windows the pump, not SMB5, drives the battery, so the default is `1` |
+| `PublishBattery` | 1 | `1` - the driver attaches the Windows battery class and publishes `GUID_DEVICE_BATTERY` (the Xiaomi miniclass does not, so without this there is no battery meter); `0` - it does not attach it. Set `0` on stacks that bring a battery of their own - a modified-PMIC community pack shows a second battery next to ours. The pump charges either way; the telemetry marks keep flowing, only the Windows-visible battery, `BattPct` and `BattPwr` stop being updated |
 
 **The parameters are read by the driver at device start** - they can be changed without
 a rebuild. Key: `<device>\Device Parameters\Parameters`, that is, for example

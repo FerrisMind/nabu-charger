@@ -6,7 +6,7 @@ members = ["crates/core", "crates/host", "crates/cli", "crates/ln8000", "crates/
 exclude = ["crates/kmdf"]
 
 [workspace.package]
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
 rust-version = "1.85"
 license = "GPL-2.0-or-later"
@@ -14,10 +14,10 @@ repository = "https://github.com/FerrisMind/nabu-charger"
 publish = false
 
 [workspace.dependencies]
-core = { package = "charger-core", path = "crates/core", version = "0.3.2" }
-host = { path = "crates/host", version = "0.3.2" }
-ln8000 = { path = "crates/ln8000", version = "0.3.2" }
-spb = { path = "crates/spb", version = "0.3.2" }
+core = { package = "charger-core", path = "crates/core", version = "0.3.3" }
+host = { path = "crates/host", version = "0.3.3" }
+ln8000 = { path = "crates/ln8000", version = "0.3.3" }
+spb = { path = "crates/spb", version = "0.3.3" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
