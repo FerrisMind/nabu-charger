@@ -41,7 +41,8 @@ there — a process that is not elevated is refused with `ERROR_ACCESS_DENIED` (
 backlight reset is fixed in the tree and awaits a release: a tick that reads only the pump's
 `2 · VBAT` reflection now carries no verdict, and the removal path stays on the hardware bit
 (three ticks, measured at 1.1 s from cable-out) · ⚠️ a ~1 Hz panel-brightness oscillation,
-measured on the adapter and on battery alike, is a **separate** defect and is still unexplained
+measured on the adapter and on battery alike, is a **separate** defect and takes the third-party
+Ultra Performance power scheme to appear (stock Balanced is clean)
 
 Every row below rests on a measurement on the tablet, not on a passing test. Where a
 defect is listed as unfixed, a live capture shows it happening — the evidence is in
@@ -88,7 +89,7 @@ and with the adapter off as well as on — and is listed on its own.
 | Defect | What it does |
 |---|---|
 | AC arrives seconds after the cable | The verdict (`OnlineRaw`) is on the first tick, but Windows reads the *next* one and the pump bring-up blocks the tick: measured **8.7 s** from insertion to `pwr = 1` on a Quick Charge brick, 5.6 s on a plain 5 V one. **Fixed in the tree** (unreleased, `20.47.10.674`): the online hold is front-armed, and the 24.09 replug carried the flag in its first sample |
-| Panel brightness oscillates about once a second | The OS brightness flips between two fixed levels every 1.1–1.3 s, in episodes of minutes, with no power-source event, no `Kernel-Power` 105 and no change in the driver's marks; the `Power` service host burns about one core during an episode. Not `ADAPTBRIGHT` (off and on both flicker), not the refresh rate, not input, not tied to the adapter: 24.09 brought two episodes on the charger (43–53 % SOC) and one on battery (27–30 % SOC, no power-state transition in a 2.6 h record). An episode starts when the brightness is changed by hand, and while one runs the power scheme's stored brightness is rewritten between the levels the panel shows — so the writes are in Windows' own brightness pipeline. Cause not established; the 24.09 record is in `docs/FINDINGS.md` |
+| Panel brightness oscillates about once a second | The OS brightness flips between two fixed levels every 1.1–1.3 s, in episodes of minutes, with no power-source event, no `Kernel-Power` 105 and no change in the driver's marks; the `Power` service host burns about one core during an episode. Not `ADAPTBRIGHT` (off and on both flicker), not the refresh rate, not input, not tied to the adapter: 24.09 brought two episodes on the charger (43–53 % SOC) and one on battery (27–30 % SOC, no power-state transition in a 2.6 h record). An episode starts when the brightness is changed by hand, and while one runs the power scheme's stored brightness is rewritten between the levels the panel shows, so the writes are in Windows' own brightness pipeline. It also takes the third-party "Ultra Performance" power scheme: on stock Balanced the same hand-driven brightness moves produce no episode, and switching back to that scheme and moving the slider brings the flicker back within seconds. What inside the scheme starts the loop is open; the 24.09 record is in `docs/FINDINGS.md` |
 | Die temperature is published while the ADC hibernates | `AdcValid` bit 1 is reported for a channel that is asleep, so **160.0 °C** is published and every consumer prints it faithfully |
 | LN8000 VBAT reads low | 42–43 mV below the fuel gauge, and that channel feeds the 2:1 gate |
 | `EngageState` disagrees with `SuMode` | Publishes 4 (NO_HEADROOM) while `SuMode` stays 3 (switching); mark-only noise |

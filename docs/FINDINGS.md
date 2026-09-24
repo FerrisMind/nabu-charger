@@ -655,10 +655,29 @@ one whose onset was watched live. Measured properties:
   16:27:32, when the adapter went back in, was the panel restored to the level Windows keeps for AC
   and was not an episode.
 
+* The scheme is what it needs; the operator's A-B test settled that. With the stock **Balanced**
+  scheme (`381b4222-f694-41f0-9685-ff5bb260df2e`) active he moved the brightness by hand, repeatedly,
+  and no episode followed; switching back to the duplicated **Ultra Performance** scheme
+  (`6a93ec26-284d-4943-9fc4-c9616def55c6`, "Revision - Ultra Performance") and moving the slider
+  brought the oscillation back within seconds. The tablet's own record agrees: the last block in the
+  file is a short one, 7.5 s (17:11:51-17:11:58, 25 fast samples, the slider passing `20`, `38`,
+  `42` and the level settling at `64`), and the file has not been appended since - which is the
+  poller's three-minute idle cadence, with the `Power` host read at 0 % a minute later. The active
+  scheme was read as the Ultra one at 16:34 and 16:43, mid-episode, and as Balanced at 17:12, after
+  the test; the attribution of that last short block rests on the operator's report, not on a scheme
+  read taken during it. Both schemes carry a customized brightness value (Balanced `64/64`, Ultra
+  `14/14`); the Ultra one additionally customizes `ADAPTBRIGHT` (`0/0`), and it is the only scheme on
+  the machine that is a duplicate with third-party edits. What inside it starts the write loop is
+  the open question, and re-creating a stock Ultimate Performance scheme
+  (`powercfg -duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61`) and repeating the slider move
+  is the test that separates "Ultimate Performance is broken on this port" from "this edited copy
+  is".
+
 This is a separate defect from the phantom power-source flip: the `[Unreleased]` fix removes a
 verdict from a reflection tick and can neither produce nor suppress it. The campaign that carries
 the causal fields has now been read (`flick677.log`, `marks676.csv`, `pwr676.log` on the tablet);
-the cause is still open (item 12 below).
+the cause is traced to the power scheme (item 12 below), and what inside it starts the loop is
+still open.
 
 ## 6. The 2:1 switching window is derived from the pack voltage, not fixed
 
@@ -827,7 +846,8 @@ understood that is said explicitly.
    Evidence: `docs/COMPAT-MATRIX.md:29-33,118-122`; `docs/COMPAT-MATRIX.md:136-143` (the correction
    about the percentage signal).
 
-12. **The panel brightness oscillates about once a second and the cause is not established.**
+12. **The panel brightness oscillates about once a second, and it takes the third-party Ultra
+    Performance power scheme to happen.**
     Episodes on 24.09 flipped the OS brightness between two fixed levels (`73 <-> 85`, later
     `58 <-> 95`, `51 <-> 85`, `69 <-> 97`) every 1.1-1.3 s for minutes, with no power-source event,
     no `Kernel-Power` 105, and the driver's marks constant; the `Power` service host burned about
@@ -839,12 +859,16 @@ understood that is said explicitly.
     about the writer: the episodes start when the brightness is changed by hand, and while one runs
     the power scheme's stored `VIDEONORMALLEVEL` is rewritten between the same two levels the panel
     shows, settling when the episode ends - so the writes are in Windows' own brightness/scheme
-    pipeline, not in the driver or the panel. The active scheme is a duplicated third-party one
-    (`6a93ec26-...`, "Revision - Ultra Performance"). The full measurement record is the 24.09
-    subsection above. Evidence: the registry-only sampler and the
+    pipeline, not in the driver or the panel. The scheme itself is the requirement: on stock
+    Balanced the same hand-driven brightness moves produce no episode, and switching to the
+    duplicated Ultra Performance scheme (`6a93ec26-...`, "Revision - Ultra Performance") and moving
+    the slider brings it back within seconds - the workaround is to run Balanced, and what inside
+    that scheme starts the write loop is the open question. The full measurement record is the
+    24.09 subsection above. Evidence: the registry-only sampler and the
     `flick677.log`/`marks676.csv`/`pwr676.log` campaign on the tablet; `powercfg /query
     SCHEME_CURRENT SUB_VIDEO`, `powercfg /requests` and a per-process CPU sample taken mid-episode;
-    the driver marks in
+    the operator's A-B test, with the scheme list and the per-scheme brightness values read over
+    SSH; the driver marks in
     `HKLM\SYSTEM\CurrentControlSet\Enum\ACPI\QCOM057E\2&DABA3FF&0\Device Parameters`.
 
 ---

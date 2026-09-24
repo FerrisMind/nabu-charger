@@ -33,7 +33,10 @@ and versions follow [SemVer](https://semver.org/lang/ru/).
   105 and no change in the driver's own marks - so that oscillation has a different cause
   and the marks above are what tell the two apart. The adapter is not part of it either:
   two episodes ran while it charged the pack and a third ran on battery with no adapter
-  at all (27-30 % SOC, not one power-state transition in a 2.6 h record).
+  at all (27-30 % SOC, not one power-state transition in a 2.6 h record). It takes the
+  third-party "Ultra Performance" power scheme as well: the operator's A-B test showed the
+  same hand-driven brightness moves produce no episode on stock Balanced and the flicker
+  back within seconds on that scheme again. Run Balanced if it appears.
 * **AC now arrives with the cable, not one blocked tick later.** The verdict was
   already correct on the first tick that saw the adapter (`OnlineRaw = 1`), but the
   hold that publishes `POWER_ON_LINE` needed two consecutive raw-true samples

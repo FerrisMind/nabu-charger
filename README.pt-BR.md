@@ -45,7 +45,8 @@ veredito de CA por trás do reset do brilho está corrigida na árvore e aguarda
 tick que lê apenas o reflexo `2 · VBAT` não carrega mais veredito, e a remoção continua sendo
 encerrada pelo bit de hardware (três ticks, medidos em 1.1 s a partir da remoção do cabo) ·
 ⚠️ uma oscilação de ~1 Hz do brilho da tela, medida tanto com a fonte conectada quanto na
-bateria, é um defeito **separado** e ainda não explicado
+bateria, é um defeito **separado** e exige o esquema de energia de terceiros Ultra Performance
+(no Balanced de fábrica não acontece)
 
 Cada linha abaixo se apoia em uma medição feita no tablet, não em um teste que passou.
 Onde um defeito está marcado como não corrigido, uma captura ao vivo mostra o defeito
@@ -96,7 +97,7 @@ com a fonte conectada quanto sem ela — e está listada separadamente.
 | Defeito | O que ele faz |
 |---|---|
 | O CA chega segundos depois do cabo | O veredito (`OnlineRaw`) está no primeiro tick, mas o Windows lê o *seguinte* e a subida da bomba bloqueia o tick: medidos **8,7 s** da inserção até `pwr = 1` numa fonte Quick Charge e 5,6 s numa fonte de 5 V simples. **Corrigido na árvore** (não lançado, `20.47.10.674`): a retenção online é armada na frente, e na reconexão de 24.09 o sinalizador já estava na primeira amostra |
-| O brilho da tela oscila cerca de uma vez por segundo | O brilho do sistema alterna entre dois níveis fixos a cada 1,1–1,3 s, em episódios de minutos, sem evento de fonte, sem `Kernel-Power` 105 e sem mudança nas marcas do driver; o host do serviço `Power` consome cerca de um núcleo durante o episódio. Não é `ADAPTBRIGHT` (pisca com Off e com On), nem a taxa de atualização, nem entrada, nem dependente da fonte: 24.09 trouxe dois episódios na fonte (43–53 %) e um na bateria (27–30 %, nenhuma transição de estado de energia em 2,6 h de registro). O episódio começa quando o brilho é mudado à mão e, enquanto dura, o brilho guardado no esquema de energia é reescrito entre os dois níveis que a tela mostra — as escritas estão no próprio pipeline do Windows. Causa não estabelecida; o registro de 24.09 está em `docs/FINDINGS.md` |
+| O brilho da tela oscila cerca de uma vez por segundo | O brilho do sistema alterna entre dois níveis fixos a cada 1,1–1,3 s, em episódios de minutos, sem evento de fonte, sem `Kernel-Power` 105 e sem mudança nas marcas do driver; o host do serviço `Power` consome cerca de um núcleo durante o episódio. Não é `ADAPTBRIGHT` (pisca com Off e com On), nem a taxa de atualização, nem entrada, nem dependente da fonte: 24.09 trouxe dois episódios na fonte (43–53 %) e um na bateria (27–30 %, nenhuma transição de estado de energia em 2,6 h de registro). O episódio começa quando o brilho é mudado à mão e, enquanto dura, o brilho guardado no esquema de energia é reescrito entre os dois níveis que a tela mostra — as escritas estão no próprio pipeline do Windows. Também exige o esquema de terceiros "Ultra Performance": no Balanced de fábrica os mesmos movimentos manuais não geram episódio, e voltar a esse esquema e mexer no controle deslizante traz a oscilação de volta em segundos. O que dentro do esquema inicia o ciclo está em aberto; o registro de 24.09 está em `docs/FINDINGS.md` |
 | A temperatura do cristal é publicada com o ADC hibernando | O bit 1 de `AdcValid` é reportado para um canal adormecido, então **160,0 °C** é publicado e todo consumidor o imprime fielmente |
 | O VBAT do LN8000 lê baixo | 42–43 mV abaixo do medidor de combustível, e esse canal alimenta o portão do modo 2:1 |
 | `EngageState` discorda de `SuMode` | Publica 4 (NO_HEADROOM) enquanto `SuMode` fica em 3 (switching); ruído apenas na marca |
