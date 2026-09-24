@@ -280,8 +280,11 @@ para ARM64, mas os IOCTLs dele são stubs e ele não foi implantado no tablet �
 status acima diz quais respondem.
 
 `deploy/assemble-release.ps1 -Version <x.y.z>` empacota o kit instalável no arquivo de
-release. Todo o procedimento — os dois números de versão e por que existem dois, e as
-verificações que condicionam um release — está em [docs/RELEASE.md](docs/RELEASE.md).
+release, e é o que o workflow **release** (`.github/workflows/release.yml`) executa: ele
+começa apenas à mão, pela aba Actions, e compila, verifica e empacota num runner, deixando um
+rascunho de release com o arquivo anexado. Todo o procedimento — os dois números de versão e
+por que existem dois, e as verificações que condicionam um release — está em
+[docs/RELEASE.md](docs/RELEASE.md).
 
 ### Instalação no tablet
 

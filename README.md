@@ -268,8 +268,11 @@ but its IOCTLs are stubs and it has not been deployed on the tablet — the stat
 above says which ones answer.
 
 `deploy/assemble-release.ps1 -Version <x.y.z>` packs the installable kit into the release
-archive. The whole procedure — the two version numbers and why there are two, and the
-checks that gate a release — is in [docs/RELEASE.md](docs/RELEASE.md).
+archive, and that is what the **release** workflow (`.github/workflows/release.yml`) runs:
+it starts only by hand, from the Actions tab, and it builds, checks and packs on a runner
+and leaves a draft release carrying the archive. The whole procedure — the two version
+numbers and why there are two, and the checks that gate a release — is in
+[docs/RELEASE.md](docs/RELEASE.md).
 
 ### Install on the tablet
 
