@@ -121,8 +121,8 @@ fica com a plataforma — estão em
 
 O `cargo test --workspace` cobre 195 testes — unitários, de integração e doctests —
 nos cinco crates do workspace raiz. Os dois drivers em modo kernel declaram o
-próprio workspace, porque precisam do WDK e do `cargo-wdk`, que o ambiente normal de
-CI não tem.
+próprio workspace, porque precisam do WDK e do `cargo-wdk`; o job `kernel-driver` em
+`.github/workflows/ci.yml` instala os dois e os compila para ARM64.
 
 ## Início rápido
 

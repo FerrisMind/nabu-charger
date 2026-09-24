@@ -113,8 +113,8 @@ is left to the platform — are in
 
 `cargo test --workspace` covers 195 tests - unit, integration and doctests - in
 the five crates of the root workspace. The two kernel-mode drivers declare their
-own workspace, because they need the WDK and `cargo-wdk`, which the regular CI
-environment does not have.
+own workspace, because they need the WDK and `cargo-wdk`; the `kernel-driver` job in
+`.github/workflows/ci.yml` installs both of those and builds them for ARM64.
 
 ## Quick start
 

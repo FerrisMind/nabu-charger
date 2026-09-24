@@ -34,6 +34,11 @@ cd crates/kmdf; cargo wdk build              # driver, aarch64
 | LLVM / clang | **17.0.6** | `bindgen` in `wdk-sys`; on 23.x the parsing of the WDF headers breaks |
 | `cargo-wdk` | the latest, with `cargo install cargo-wdk --locked` | KMDF build |
 
+The `kernel-driver` job in `.github/workflows/ci.yml` installs the last three of these
+itself - the WDK through `winget`, LLVM 17.0.6 into `C:\llvm17` - so the versions in the
+table are the ones to keep in step with that file. The commands below are the local
+setup, and the LLVM path is the local one.
+
 ```powershell
 rustup target add aarch64-pc-windows-msvc
 cargo install cargo-wdk --locked
