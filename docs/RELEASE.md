@@ -169,14 +169,17 @@ on a runner and then leaves a **draft** release with the archive attached:
   signature check is stricter than a local one: the package has to be signed, the signature
   has to be intact, and the certificate it was made with has to be the certificate the
   archive ships, or the install stops with `CERT_E_UNTRUSTEDROOT`;
-* `deploy/prepare-test-cert.ps1` runs before the build. `cargo-wdk` test-signs with the
-  `WDRLocalTestCert` certificate from the *user* store `WDRTestCertStore`, and a machine
-  without one fails inside the package step with `SignTool Error: File not found`. The
-  script creates the certificate when it is missing and drops any `.cer` an earlier build
-  left in the target directories - a stale file would otherwise be packaged beside a
-  signature made with another key. It touches no trust store: the packages are test-signed,
-  the runner reads `UnknownError` from them the way a development machine does, and the
-  certificate becomes trusted on the tablet, from the `.cer` in the package;
+* `deploy/prepare-test-signing.ps1` runs before the build and only removes cached files.
+  `cargo-wdk` test-signs with a certificate from the *user* store `WDRTestCertStore` - the one
+  already there, or a new one from `makecert` - and it skips making one when it finds a
+  `WDRLocalTestCert.cer` in the output directory, which the build cache restores. A machine
+  whose store holds no certificate then fails inside the package step with
+  `SignTool Error: File not found`. Creating the certificate in the workflow instead does not
+  work: `certmgr` and `signtool` read different stores on a runner, `cargo-wdk` adds a second
+  certificate with the same subject, and signtool refuses the package with `Multiple
+  certificates were found`. No trust store is touched - a test-signed package is untrusted on
+  the machine that builds it, and it becomes trusted on the tablet, from the `.cer` in the
+  archive;
 * it assembles the archive and attaches it to the run as an artifact first, so a failure in
   the release step still leaves the archive downloadable;
 * the release notes are the changelog's own `## [<version>]` section plus what the archive

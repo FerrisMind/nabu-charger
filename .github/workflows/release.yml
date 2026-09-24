@@ -99,20 +99,23 @@ jobs:
           & $clang --version | Select-Object -First 1
           "LIBCLANG_PATH=C:\llvm17\bin" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      # cargo-wdk test-signs every package with the certificate it finds in the *user* store
-      # `WDRTestCertStore`, subject `WDRLocalTestCert`, and hands that store name to signtool.
-      # The image carries no such certificate: the first dry run stopped inside the build with
-      # `SignTool Error: File not found`. The script creates one when it is missing and drops a
-      # stale `WDRLocalTestCert.cer` from the restored build cache.
+      # cargo-wdk test-signs every package with a certificate from the user store
+      # `WDRTestCertStore` (subject `WDRLocalTestCert`), and it skips making one when it finds a
+      # `WDRLocalTestCert.cer` in the output directory - which the build cache restores. A runner
+      # whose store holds no certificate then stops inside the build with
+      # `SignTool Error: File not found`, which is what the first dry run did. The script
+      # removes the cached file so cargo-wdk's own path runs, and prints which certificate the
+      # build will use. It touches no trust store: the packages are test-signed, and the
+      # certificate becomes trusted on the tablet, from the .cer in the archive.
       - name: Prepare the test signing certificate
         shell: pwsh
-        # The step is a certificate store and a few file deletions; if it ever blocks, fail
-        # here after ten minutes instead of holding the job for the six-hour default.
+        # The step is a few file deletions; if it ever blocks, fail here after ten minutes
+        # instead of holding the job for the six-hour default.
         timeout-minutes: 10
         run: |
           $ErrorActionPreference = 'Stop'
-          pwsh -NoProfile -File .\deploy\prepare-test-cert.ps1 -ClearCachedCertFiles
-          if ($LASTEXITCODE -ne 0) { throw "prepare-test-cert.ps1 failed with exit code $LASTEXITCODE" }
+          pwsh -NoProfile -File .\deploy\prepare-test-signing.ps1
+          if ($LASTEXITCODE -ne 0) { throw "prepare-test-signing.ps1 failed with exit code $LASTEXITCODE" }
 
       - name: Install cargo-wdk
         run: cargo install cargo-wdk --locked

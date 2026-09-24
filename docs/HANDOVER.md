@@ -46,9 +46,11 @@ $env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"
 ```
 
 A driver build test-signs its package, and `cargo-wdk` takes the certificate from the user
-store `WDRTestCertStore`. A machine that has none - a fresh one, or a CI runner - stops in
-the package step with `SignTool Error: File not found`; `deploy/prepare-test-cert.ps1`
-creates the certificate and is what `ci.yml` and `release.yml` call before they build.
+store `WDRTestCertStore`; on a machine that has never built a driver the store is empty and
+the build stops in the package step with `SignTool Error: File not found`. The store fills
+with a `makecert` certificate on the first build that has no cached `.cer` next to its
+output, which is what `deploy/prepare-test-signing.ps1` arranges for `ci.yml` and
+`release.yml`.
 
 ## 3. Building and running the tools
 
