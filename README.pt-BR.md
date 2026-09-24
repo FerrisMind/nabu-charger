@@ -27,20 +27,23 @@ você estiver portando o Windows para um tablet da classe nabu, e não usando es
 ## Estado do projeto
 
 Última versão: **0.3.1**, com o driver **20.47.10.672** — o pacote ARM64 instalável está
-anexado a ela (`nabu-ln8000-driver-0.3.1-arm64.zip`). É esse pacote que está instalado no
-tablet de desenvolvimento (`oem166.inf`, nó do dispositivo em `OK` / `CM_PROB_NONE`), e as
-medições abaixo foram feitas nele: uma fonte Quick Charge negociou até 8.3 V, `Iin`
-0.23–1.28 A, carga 196 → 199, o sinalizador de carregamento 338 ms após o veredito e a
-remoção liberada em 1.1 s.
+anexado a ela (`nabu-ln8000-driver-0.3.1-arm64.zip`). O tablet de desenvolvimento foi além
+desse pacote: agora ele roda **20.47.10.674** (`oem168.inf`, nó do dispositivo em `OK` /
+`CM_PROB_NONE`), cujas duas correções ainda não foram lançadas e estão descritas abaixo e no
+changelog. Medições feitas no pacote 0.3.1 lançado: uma fonte Quick Charge negociou até
+8.3 V, `Iin` 0.23–1.28 A, carga 196 → 199, o sinalizador de carregamento 338 ms após o
+veredito e a remoção liberada em 1.1 s.
 
 A versão anterior, **0.3.0** (driver 20.47.10.665), introduziu a política de acesso
 verificada nela — um processo sem elevação é recusado com `ERROR_ACCESS_DENIED` (5).
 
 **Resumo:** ✅ carregamento rápido com uma fonte Quick Charge · ✅ telemetria ao vivo da
 bomba · ⚠️ uma fonte Power Delivery ainda não aumenta a carga da bateria · ⚠️ a queda do
-veredito de CA por trás do reset do brilho — a liberação passou a três ticks (750 ms) e foi
-medida em 1.1 s a partir da remoção do cabo, mas a rota do veto de duplicação, que lê uma
-bomba que saiu da comutação como "sem fonte", continua aberta
+veredito de CA por trás do reset do brilho está corrigida na árvore e aguarda lançamento: um
+tick que lê apenas o reflexo `2 · VBAT` não carrega mais veredito, e a remoção continua sendo
+encerrada pelo bit de hardware (três ticks, medidos em 1.1 s a partir da remoção do cabo) ·
+⚠️ uma oscilação de ~1 Hz do brilho da tela com a fonte conectada é um defeito **separado** e
+ainda não explicado
 
 Cada linha abaixo se apoia em uma medição feita no tablet, não em um teste que passou.
 Onde um defeito está marcado como não corrigido, uma captura ao vivo mostra o defeito
@@ -60,7 +63,8 @@ defeitos mais adiante.
 | 🔋 Fonte Power Delivery (USB-C) | O driver obtém CA, mas a bateria não ganha carga; a negociação acima de 5 V fica com a parte Type-C da plataforma, então os 33 W completos ficam fora de alcance | ⚠️ |
 | 🖥 A superfície de IOCTL do driver SMB | `GET_STATUS` responde; `READ_REG`, `WRITE_REG`, `SET_ICL`, `GET_JOURNAL`, `DETECT_START`, `APPLY_POLICY` retornam `STATUS_NOT_IMPLEMENTED`. A lógica por trás deles está escrita e testada com mock; a ligação no kernel não | ⚠️ |
 | 🔬 Enquadramento da resposta SPMI | Não confirmado por engenharia reversa, então as leituras de registrador seguem provisórias | ⚠️ |
-| 💡 Queda do veredito de CA / reset do brilho | **Não corrigida.** Uma captura ao vivo mostra CA → CC → CA em 2,647 s com o cabo imóvel e a bomba ociosa | ❌ |
+| 💡 Queda do veredito de CA / reset do brilho | Corrigida na árvore (não lançada, driver `20.47.10.674`), aguardando lançamento. A captura de 22.09 está em `docs/FINDINGS.md`; a build de 24.09 foi confirmada ao vivo: um tick sem veredito na remoção, CC 1,0 s depois do cabo, CA na primeira amostra após reconectar | ⚠️ |
+| 💡 O brilho da tela oscila cerca de uma vez por segundo com a fonte conectada | Medido em 24.09: o brilho do sistema alterna entre dois níveis fixos a cada 1,1–1,3 s por minutos enquanto a bateria carrega, sem evento de fonte, sem `Kernel-Power` 105 e com as marcas do driver constantes. Independente de `ADAPTBRIGHT`, `DisplayEnhancementService`, taxa de atualização, entrada e nível de carga | ❌ |
 | 📱 Outros dispositivos SM8150 | Só o Xiaomi Pad 5 foi testado; o driver se associa se o nó existir em I²C 0x51 | ⚠️ |
 | 🧩 Um dispositivo com LN8000 mas sem o nó `PEIC` na DSDT | Não suportado — exige alteração de ACPI | ❌ |
 
@@ -69,19 +73,28 @@ defeitos mais adiante.
 Todos são achados ao vivo ou no código, e cada um tem reprodução; não há suposições
 aqui.
 
-**O veredito de CA cai com a fonte conectada** — é o que importa, e a correção
-implantada não o cobre. Quando a bomba sai do modo 2:1, `Iin` fica no piso de 39 mA do
-ADC e `Vin` recua para `2 · VBAT`, que é o ponto de operação *normal* de uma bomba 2:1,
-não evidência de ausência. O veto de VBUS dobrado em `online_raw` lê isso como "sem
-adaptador", a retenção de 8 s expira, e o Windows vê uma troca de fonte de energia — é
-assim que acontece o reset do brilho relatado. Medido no tablet com o cabo imóvel:
-CA → CC → CA em 2,647 s, com o bit 4 de `Fault1Sts` *limpo*, ou seja, o próprio detector
-de VBUS do hardware dizia que o cabo estava lá, e com todas as leituras plenamente
-utilizáveis, então o novo ramo `held` nunca foi alcançável.
+**O veredito de CA caía com a fonte conectada** — o que importava. Quando a bomba sai do
+modo 2:1, `Iin` fica no piso de 39 mA do ADC e `Vin` recua para `2 · VBAT`, que é o ponto de
+operação *normal* de uma bomba 2:1, não evidência de ausência. O veto de VBUS dobrado em
+`online_raw` lia isso como "sem adaptador", a retenção de 8 s expirava, e o Windows via uma
+troca de fonte de energia — é assim que acontecia o reset do brilho relatado. Medido no
+tablet com o cabo imóvel: CA → CC → CA em 2,647 s, com o bit 4 de `Fault1Sts` *limpo*, ou
+seja, o próprio detector de VBUS do hardware dizia que o cabo estava lá, e com todas as
+leituras plenamente utilizáveis.
+
+**Corrigido na árvore, ainda fora de um lançamento** (driver `20.47.10.674`, `oem168.inf`):
+um tick que lê apenas o reflexo não carrega veredito e por isso não envelhece a retenção,
+enquanto uma remoção real continua sendo encerrada pelo bit de hardware. Confirmado ao vivo
+em 24.09: a remoção produziu exatamente um tick `OnlineRaw = 2` / `DoubledVeto = 1`, a
+liberação veio três ticks depois pelo bit 4 de `FAULT1`, e o Windows viu CC 1,0 s depois do
+cabo. A mesma build traz a correção de latência da tabela abaixo. A oscilação de brilho
+medida no mesmo dia é um defeito diferente — ela ocorre sem nenhum evento de fonte — e está
+listada separadamente.
 
 | Defeito | O que ele faz |
 |---|---|
-| O CA chega segundos depois do cabo | O veredito (`OnlineRaw`) está no primeiro tick, mas o Windows lê o *seguinte* e a subida da bomba bloqueia o tick: medidos **8,7 s** da inserção até `pwr = 1` numa fonte Quick Charge e 5,6 s numa fonte de 5 V simples. Correção planejada, fora desta versão |
+| O CA chega segundos depois do cabo | O veredito (`OnlineRaw`) está no primeiro tick, mas o Windows lê o *seguinte* e a subida da bomba bloqueia o tick: medidos **8,7 s** da inserção até `pwr = 1` numa fonte Quick Charge e 5,6 s numa fonte de 5 V simples. **Corrigido na árvore** (não lançado, `20.47.10.674`): a retenção online é armada na frente, e na reconexão de 24.09 o sinalizador já estava na primeira amostra |
+| O brilho da tela oscila cerca de uma vez por segundo | Com a fonte conectada e a bateria carregando, o brilho do sistema alterna entre dois níveis fixos a cada 1,1–1,3 s, em episódios de minutos, sem evento de fonte, sem `Kernel-Power` 105 e sem mudança nas marcas do driver; o host do serviço `Power` consome cerca de um núcleo durante o episódio. Não é `ADAPTBRIGHT` (pisca com Off e com On), nem a taxa de atualização, nem entrada, nem o nível de carga. Causa não estabelecida; o registro de 24.09 está em `docs/FINDINGS.md` |
 | A temperatura do cristal é publicada com o ADC hibernando | O bit 1 de `AdcValid` é reportado para um canal adormecido, então **160,0 °C** é publicado e todo consumidor o imprime fielmente |
 | O VBAT do LN8000 lê baixo | 42–43 mV abaixo do medidor de combustível, e esse canal alimenta o portão do modo 2:1 |
 | `EngageState` discorda de `SuMode` | Publica 4 (NO_HEADROOM) enquanto `SuMode` fica em 3 (switching); ruído apenas na marca |
