@@ -3,6 +3,51 @@
 The format is based on [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/),
 and versions follow [SemVer](https://semver.org/lang/ru/).
 
+## [Unreleased]
+
+### Fixed
+
+* **The AC verdict no longer flips while the brick stays attached, and a tick that
+  reads only a reflection carries no verdict.** The one rejection in `online_raw` that
+  also happens with a live adapter is the doubling veto: while the pump is out of
+  transfer its input node floats
+  and the ADC reads `2 · VBAT`, so the old verdict aged the online hold until the 8 s
+  window expired and Windows saw AC → DC → AC with the cable motionless (measured 22.09:
+  2.647 s per cycle, `FAULT1` bit 4 clear on every row, `Kernel-Power` 105 eleven times
+  in twelve seconds). A tick that reads the reflection now carries **no verdict**:
+  `is_reflection_tick` is the single source of that test, `online_raw` keeps its
+  documented `false` for the bool callers, and `online_raw_with_evidence` answers `None`,
+  which leaves the hold untouched. A real removal is unaffected - it is ended by the
+  hardware bit, which asserted 283 ms after the cable of 22.09 came out (`unplug_release`
+  then needs three ticks). That bit is now the only witness that ends the window without
+  a measurement: were a removal ever to go unreported by it, the flag would stand until
+  the next measurement instead of expiring on a reflection - it asserted on both
+  recorded removals and stayed set for hours. The bool verdict tests and the
+  4.2-4.6 V phantom route are untouched.
+  Confirmed live on 24.09 with `20.47.10.674`: the pull at 13:34:09 produced one
+  `OnlineRaw = 2` / `DoubledVeto = 1` tick (`Vin = 7.728 V = 2 · VBAT`, `Iin = 39 mA`),
+  the release came with `FAULT1` bit 4 three ticks later, and Windows saw DC 1,0 s after
+  the cable. The phantom unplug is not the whole backlight story: on the same day, with
+  `20.47.10.674` installed, the panel brightness oscillated about once a second between
+  two fixed levels for minutes at a time - with the adapter attached, no `Kernel-Power`
+  105 and no change in the driver's own marks - so that oscillation has a different cause
+  and the marks above are what tell the two apart.
+* **AC now arrives with the cable, not one blocked tick later.** The verdict was
+  already correct on the first tick that saw the adapter (`OnlineRaw = 1`), but the
+  hold that publishes `POWER_ON_LINE` needed two consecutive raw-true samples
+  (`HOLD_ARM_RUN`) - and the HVDCP bring-up runs inside the same telemetry callback
+  that publishes it, so the second sample could not arrive for seconds. The 23.09
+  capture with `20.47.10.672` shows both marks frozen for 8,5 s and Windows on AC
+  8,7 s after the cable went in. The online hold is now front-armed
+  (`HOLD_FRONT_RUN = 1`): the tick that measures the adapter publishes it, while
+  extension still needs a run, so a lone sample buys exactly one `ONLINE_HOLD_MS`
+  window. The charging hold keeps the run rule: its witness (a window peak, a SOC
+  rise up to `SOC_RISE_HOLD_MS` old) carries history and cannot go true before the
+  bring-up has run.
+  Confirmed live on 24.09 with `20.47.10.674`: after the replug at 13:34:14 the first
+  sample already carried the flag (`BattPwr = 5`, `OnlineRaw = 1`, `Vin = 5.088 V`), where
+  the 23.09 capture with `20.47.10.672` needed 8,5 s.
+
 ## [0.3.1] - 2026-09-23
 
 Four changes to the input-presence and charging decisions, all measured on the

@@ -2661,8 +2661,11 @@ unsafe extern "C" fn evt_telemetry_timer(_timer: WDFTIMER) {
                 sample.vbus_uv,
             )),
         );
-        // The raw verdict before any hold: 1 online, 0 offline, 2 no evidence (no
-        // usable sample and the hardware did not say VBUS was gone).
+        // The raw verdict before any hold: 1 online, 0 offline, 2 no evidence. Both
+        // routes to 2 are visible next to it - an unreadable tick with the bit clear
+        // (`InputUsable = 0`) and the pump's own `2 · VBAT` reflection (`InputUsable = 1`
+        // with `DoubledVeto = 1`), which a live brick produces while the pump is out of
+        // transfer and which must not age the hold.
         mark_device_value(
             device,
             "OnlineRaw",

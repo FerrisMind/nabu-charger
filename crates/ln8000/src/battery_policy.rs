@@ -113,32 +113,75 @@ pub struct Hold {
     pub last_true_ms: u64,
     /// Consecutive raw `true` samples seen so far.
     true_run: u32,
+    /// Samples a cold hold needs to arm: [`HOLD_ARM_RUN`], or [`HOLD_FRONT_RUN`]
+    /// for a hold built with [`Hold::front_armed`].
+    front_run: u32,
 }
 
-/// Consecutive raw `true` samples required to arm or extend a hold.
+/// Consecutive raw `true` samples required to **extend** a hold, and to arm one
+/// that is not front-armed.
 ///
-/// One lone `true` between `false` samples must not re-arm the window: a raw
+/// One lone `true` between `false` samples must not move the window: a raw
 /// predicate flapping faster than `hold_ms` would otherwise pin the flag
 /// forever without any sustained evidence. With this requirement the flag is
 /// bounded — it clears `hold_ms` after the last *run* of [`HOLD_ARM_RUN`]
 /// consecutive true samples.
 pub const HOLD_ARM_RUN: u32 = 2;
 
+/// Consecutive raw `true` samples required to arm a **front-armed** hold
+/// ([`Hold::front_armed`]) — one, because the tick that carries the first `true`
+/// is the only sample the driver gets for the next several seconds.
+///
+/// The HVDCP bring-up runs inside the same telemetry callback that publishes the
+/// verdict (`evt_telemetry_timer` negotiates only after the sample is out), and it
+/// blocks the timer for seconds. Measured on 23.09 with `20.47.10.672`:
+/// `OnlineRaw = 1` at 23:48:00.250 and the next tick at 23:48:09.011 — 8,5 s in
+/// which a run-arming rule kept the hold cold with the adapter already attached,
+/// so Windows showed AC 8,7 s after the cable. The verdict does not need that
+/// second sample: it is a direct ADC measurement of the input, with the
+/// doubled-VBUS veto in front of it.
+///
+/// The price is bounded and known: a hold armed by one sample that no second
+/// sample confirms lives exactly `hold_ms` from that sample (a lone `true` never
+/// moves `last_true_ms`), so a raw predicate chattering with at least one `true`
+/// per window can keep the flag up where a run-armed hold would have dropped it.
+/// Only the online verdict pays it: it is a measurement of the adapter, while the
+/// charging witness carries history (a window peak and a SOC rise up to
+/// [`SOC_RISE_HOLD_MS`] old) and cannot appear before the bring-up anyway.
+pub const HOLD_FRONT_RUN: u32 = 1;
+
 impl Hold {
-    /// Never-held state.
+    /// Never-held state, armed by a run of [`HOLD_ARM_RUN`] samples.
     #[must_use]
     pub const fn new() -> Self {
         Self {
             held: false,
             last_true_ms: 0,
             true_run: 0,
+            front_run: HOLD_ARM_RUN,
+        }
+    }
+
+    /// Never-held state that arms on its **first** raw `true` sample
+    /// ([`HOLD_FRONT_RUN`]) instead of waiting for a run. Extension is unchanged:
+    /// only a run of [`HOLD_ARM_RUN`] moves the window, so a single sample buys
+    /// exactly one window.
+    #[must_use]
+    pub const fn front_armed() -> Self {
+        Self {
+            held: false,
+            last_true_ms: 0,
+            true_run: 0,
+            front_run: HOLD_FRONT_RUN,
         }
     }
 
     /// Applies one sample of the raw predicate.
     ///
-    /// `raw` true for [`HOLD_ARM_RUN`] consecutive samples → held, and the
-    /// timestamp moves to `now_ms` (a fresh run re-arms the full hold window).
+    /// `raw` true for the hold's arming run → held, and the timestamp moves to
+    /// `now_ms` (a fresh run re-arms the full hold window). A cold hold arms by
+    /// [`HOLD_FRONT_RUN`] if it was built with [`Self::front_armed`] and by
+    /// [`HOLD_ARM_RUN`] otherwise; an already held one always needs the run.
     /// `raw` false while held → stays held while `now_ms - last_true_ms <
     /// hold_ms`; at `hold_ms` and beyond the hold ends. Timestamps are
     /// monotonic; a non-monotonic `now_ms` keeps the hold (saturating
@@ -147,11 +190,19 @@ impl Hold {
     pub const fn update(self, raw: bool, now_ms: u64, hold_ms: u64) -> Self {
         if raw {
             let true_run = self.true_run.saturating_add(1);
-            if true_run >= HOLD_ARM_RUN {
+            // A run extends a window that already exists; a cold hold arms by its
+            // own rule, which is one sample for a front-armed hold.
+            let needed_run = if self.held {
+                HOLD_ARM_RUN
+            } else {
+                self.front_run
+            };
+            if true_run >= needed_run {
                 Self {
                     held: true,
                     last_true_ms: now_ms,
                     true_run,
+                    front_run: self.front_run,
                 }
             } else {
                 // First sample of a run: not evidence yet, do not extend.
@@ -159,6 +210,7 @@ impl Hold {
                     held: self.held,
                     last_true_ms: self.last_true_ms,
                     true_run,
+                    front_run: self.front_run,
                 }
             }
         } else if self.held && now_ms.saturating_sub(self.last_true_ms) < hold_ms {
@@ -166,12 +218,14 @@ impl Hold {
                 held: self.held,
                 last_true_ms: self.last_true_ms,
                 true_run: 0,
+                front_run: self.front_run,
             }
         } else {
             Self {
                 held: false,
                 last_true_ms: self.last_true_ms,
                 true_run: 0,
+                front_run: self.front_run,
             }
         }
     }
@@ -298,7 +352,7 @@ pub const fn online_raw(vbus_uv: u32, vbat_uv: u32, iin_ua: u32, vac_unplug: boo
     if vac_unplug {
         return false;
     }
-    if vbus_uv >= VBUS_ONLINE_UV && vin_is_doubled_vbat(vbat_uv, vbus_uv) {
+    if is_reflection_tick(vbus_uv, vbat_uv, iin_ua, vac_unplug) {
         return false;
     }
     if vbus_uv >= VBUS_ELEVATED_UV {
@@ -323,6 +377,44 @@ pub const fn online_raw(vbus_uv: u32, vbat_uv: u32, iin_ua: u32, vac_unplug: boo
         return false;
     }
     true
+}
+
+/// True when the tick's `Vin` is the converter's own `2 · VBAT` reflection and
+/// nothing above it in the ladder has spoken: no current into the pack, the
+/// hardware's VBUS bit clear, the rail at or above [`VBUS_ONLINE_UV`].
+///
+/// This is the one rejection in [`online_raw`] that also happens **with a live
+/// adapter attached**, and that is a measurement rather than a possibility. While
+/// the pump is out of transfer its input node is unloaded, so the ADC reads the
+/// reflection - which the notes call the pump's normal operating point rather than
+/// evidence of absence (`docs/FINDINGS.md`). Live 22.09: AC → DC → AC in 2.647 s
+/// with the cable motionless and the pump idle, `FAULT1` bit 4 clear on every row
+/// (the hardware's own VBUS detector said the cable was there, so the new
+/// `held`-branch was never reachable) and `Microsoft-Windows-Kernel-Power` 105
+/// eleven times in twelve seconds - each one a power-source change that re-applies
+/// the display policy. That is the reported backlight reset.
+///
+/// A tick that reads the reflection therefore carries **no verdict**: it is the pump
+/// talking about itself, not about the cable. [`online_raw_with_evidence`] answers
+/// `None` for it, which leaves the online hold untouched, and only the hardware bit
+/// ends the window without a measurement. [`online_raw`] keeps its historical answer
+/// (`false`) for the bool callers: on the node alone, a reflection is not an adapter.
+///
+/// The reflection is also the only route into the 4.6 V gate: a cell below ~2.3 V
+/// reflects to less than [`VBUS_ONLINE_UV`], and such a tick is decided by the
+/// floor/headroom branch instead - see the open defect in `README.md`.
+#[must_use]
+pub const fn is_reflection_tick(vbus_uv: u32, vbat_uv: u32, iin_ua: u32, vac_unplug: bool) -> bool {
+    // The two guards that sit above the veto in `online_raw`, repeated so that the
+    // predicate is complete on its own: current into the pack wins outright, and the
+    // hardware's unplug bit is a verdict of its own.
+    if vbus_uv >= VBUS_CHARGING_MIN_UV && iin_ua >= IIN_CHARGING_UA {
+        return false;
+    }
+    if vac_unplug {
+        return false;
+    }
+    vbus_uv >= VBUS_ONLINE_UV && vin_is_doubled_vbat(vbat_uv, vbus_uv)
 }
 
 /// [`online_raw`] for one tick **together with that tick's authority to age the
@@ -350,12 +442,23 @@ pub const fn online_raw(vbus_uv: u32, vbat_uv: u32, iin_ua: u32, vac_unplug: boo
 ///
 /// * `input_readings_usable` → `Some(online_raw(..))`: a real measurement, and
 ///   the existing chain decides;
+/// * a readable tick that is a [`is_reflection_tick`] → `None`: the node is the
+///   pump's own `2 · VBAT`, which is what a *live* adapter looks like while the pump
+///   is out of transfer (the measured flap above). No current, no hardware verdict,
+///   no verdict from the node either — a cable must not be declared gone on the
+///   strength of the pump's own reflection;
 /// * not usable and `vac_unplug` set → `Some(false)`: the hardware itself says
 ///   VBUS is gone (`FAULT1` bit 4, read fresh from the chip in the same tick at
 ///   `ln8000-kmdf/src/lib.rs:2524`), so the hold must age exactly as before;
 /// * not usable and `vac_unplug` clear → `None`: no measurement and no hardware
 ///   verdict. The caller must **leave the hold untouched**
 ///   ([`Hold::update_evidence`]) — an unreadable tick is not evidence of absence.
+///
+/// A real removal still ends the window on the spot, through the bit: measured on
+/// 22.09 at 23:49:48.591 the node read its reflection (`8 144 000` against a
+/// `4 090 000` cell) with bit 4 clear, and the bit asserted by 23:49:48.874, 283 ms
+/// later — [`unplug_release`] then needs three ticks, and the tray went to battery
+/// 1.1 s after the cable came out.
 ///
 /// `vac_unplug` is deliberately trusted only in the "not usable" case: while a
 /// real `Vin`/`Iin` measurement exists, [`online_raw`] keeps its current
@@ -375,6 +478,13 @@ pub const fn online_raw_with_evidence(
     input_readings_usable: bool,
 ) -> Option<bool> {
     if input_readings_usable {
+        if is_reflection_tick(vbus_uv, vbat_uv, iin_ua, vac_unplug) {
+            // Not "gone": the node is the pump's own reflection while it is out of
+            // transfer, which happens with the brick attached (measured flap). The
+            // hold must not age on it - the hardware bit is the only witness that
+            // ends the window without a measurement.
+            return None;
+        }
         return Some(online_raw(vbus_uv, vbat_uv, iin_ua, vac_unplug));
     }
     if vac_unplug {
@@ -649,16 +759,67 @@ mod tests {
     }
 
     #[test]
-    fn single_true_sample_never_arms() {
-        // A lone tick of "evidence" between false samples is not a run.
+    fn one_sample_arms_only_the_front_armed_hold() {
+        // A lone tick of "evidence" between false samples is not a run: a hold armed
+        // by run (the charging one) stays cold.
         let st = Hold::new().update(true, 0, ONLINE_HOLD_MS);
-        assert!(!st.held, "a single true does not arm the hold");
+        assert!(!st.held, "a single true does not arm a run-armed hold");
         let st = st.update(false, TICK_MS, ONLINE_HOLD_MS);
         let st = st.update(true, 2 * TICK_MS, ONLINE_HOLD_MS);
-        assert!(!st.held, "true/false chatter does not arm the hold");
+        assert!(!st.held, "true/false chatter does not arm a run-armed hold");
         // Two consecutive true samples do arm it.
         let st = st.update(true, 3 * TICK_MS, ONLINE_HOLD_MS);
         assert!(st.held, "two true samples in a row arm the hold");
+
+        // The online verdict arms on the tick that sees the adapter: that tick is the
+        // only sample for the next several seconds, because the bring-up runs inside
+        // the same callback (HOLD_FRONT_RUN, measured 23.09).
+        let st = Hold::front_armed().update(true, 0, ONLINE_HOLD_MS);
+        assert!(
+            st.held,
+            "the online verdict publishes with the cable, not one blocked tick later"
+        );
+        // That one sample buys exactly one window: a lone true never moves
+        // `last_true_ms`, so the flag dies `hold_ms` after it unless a run confirms it.
+        let mut st = st.update(false, TICK_MS, ONLINE_HOLD_MS);
+        assert!(st.held, "one offline tick does not clear AC");
+        let mut now = TICK_MS;
+        while now < ONLINE_HOLD_MS - TICK_MS {
+            now += TICK_MS;
+            st = st.update(false, now, ONLINE_HOLD_MS);
+        }
+        assert!(st.held, "the window runs to its end");
+        now += TICK_MS;
+        let st = st.update(false, now, ONLINE_HOLD_MS);
+        assert!(
+            !st.held,
+            "an unconfirmed single sample does not outlive its window"
+        );
+    }
+
+    #[test]
+    fn a_lone_true_never_extends_even_a_front_armed_hold() {
+        // True every other tick: never two in a row, so the window must stay where the
+        // arming sample put it, and the flag must drop at the end of that one window.
+        let armed_at = 0_u64;
+        let mut st = Hold::front_armed().update(true, armed_at, ONLINE_HOLD_MS);
+        assert!(st.held);
+        let mut now = armed_at;
+        for i in 0..(ONLINE_HOLD_MS / TICK_MS) {
+            now += TICK_MS;
+            let raw = i % 2 == 1;
+            st = st.update(raw, now, ONLINE_HOLD_MS);
+        }
+        assert_eq!(
+            st.last_true_ms, armed_at,
+            "chatter must not move the window, only a run of HOLD_ARM_RUN does"
+        );
+        now += TICK_MS;
+        let st = st.update(false, now, ONLINE_HOLD_MS);
+        assert!(
+            !st.held,
+            "with no confirmed run the hold ends one window after the single sample"
+        );
     }
 
     #[test]
@@ -769,6 +930,67 @@ mod tests {
         // The same node with a credible cell under it is a brick: `4 055 000` against
         // `5 056 000` is not half, and that is the reading the tray must accept.
         assert!(online_raw(5_056_000, 4_055_000, IIN_FLOOR_UA, false));
+    }
+
+    #[test]
+    fn a_reflection_tick_carries_no_verdict() {
+        // The flap of 22.09 in one row: the pump left transfer, the node relaxed to its
+        // own `2 · VBAT`, the current sat on the 39 mA floor and the hardware bit stayed
+        // clear while the brick was attached. As a bool the row is "not an adapter" -
+        // the ladder's historical answer; for the hold it is no evidence either way, and
+        // that is what keeps Windows from seeing a power-source change.
+        const FLAP_VIN_UV: u32 = 8_464_000;
+        const FLAP_VBAT_UV: u32 = 4_232_000;
+        assert!(!online_raw(FLAP_VIN_UV, FLAP_VBAT_UV, IIN_FLOOR_UA, false));
+        assert_eq!(
+            online_raw_with_evidence(FLAP_VIN_UV, FLAP_VBAT_UV, IIN_FLOOR_UA, false, true),
+            None,
+            "the pump's own reflection is not a verdict about the cable"
+        );
+        // The hardware bit is the witness that does end the window without a measurement.
+        assert_eq!(
+            online_raw_with_evidence(FLAP_VIN_UV, FLAP_VBAT_UV, IIN_FLOOR_UA, true, true),
+            Some(false),
+            "a reflection with the unplug bit set is a removal"
+        );
+        // Current outranks the reflection in both APIs: 2 A into the pack is an adapter
+        // whatever the node looks like.
+        assert!(online_raw(FLAP_VIN_UV, FLAP_VBAT_UV, 2_000_000, false));
+        assert_eq!(
+            online_raw_with_evidence(FLAP_VIN_UV, FLAP_VBAT_UV, 2_000_000, false, true),
+            Some(true)
+        );
+        // A node that is not half the cell is not a reflection and keeps its verdict: the
+        // 5 V brick of 22.09 (`4 416 000` against a `4 145 000` cell) reads `Some(true)`.
+        assert_eq!(
+            online_raw_with_evidence(4_416_000, 4_145_000, IIN_FLOOR_UA, false, true),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn a_sustained_reflection_never_clears_the_online_window() {
+        // The operator's bug at low state of charge: while the pump is out of transfer the
+        // node reads the reflection for seconds, and on every such tick the old verdict
+        // aged the hold until the window expired - Windows saw AC -> DC -> AC and
+        // re-applied the display policy (`Kernel-Power` 105, eleven events in twelve
+        // seconds on 22.09). A reflection tick carries no verdict, so 30 s of them must
+        // leave an armed window exactly as it was.
+        let armed_at = 250_u64;
+        let mut st = arm(true, ONLINE_HOLD_MS);
+        let mut now = armed_at;
+        let reflected = online_raw_with_evidence(8_464_000, 4_232_000, IIN_FLOOR_UA, false, true);
+        assert_eq!(reflected, None, "the row under test is the reflection");
+        while now < armed_at + 30_000 {
+            now += TICK_MS;
+            st = st.update_evidence(reflected, now, ONLINE_HOLD_MS);
+        }
+        assert!(st.held, "the pump's reflection does not end the AC window");
+        assert_eq!(st.last_true_ms, armed_at, "and does not move its timestamp");
+        // The hardware's own verdict still ends it on the spot (`hold_ms = 0`), which is
+        // the removal path: the bit asserted 283 ms after the cable of 22.09 came out.
+        let released = st.update(false, now, 0);
+        assert!(!released.held, "the hardware bit still releases the flag");
     }
 
     // --- Input sample validity (ADC hibernation / bus failure) -------------

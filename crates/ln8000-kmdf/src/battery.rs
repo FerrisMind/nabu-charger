@@ -70,9 +70,18 @@ static mut LAST_VBUS_UV: u32 = 0;
 static mut LAST_IIN_UA: u32 = 0;
 /// Hysteresis of the "adapter online" flag: a single tick below the Vin threshold
 /// does not clear `POWER_ON_LINE` (see [`ONLINE_HOLD_MS`]).
-static mut ONLINE_HOLD: Hold = Hold::new();
+///
+/// Front-armed: the tick that sees the adapter publishes AC, because the HVDCP
+/// bring-up blocks the telemetry callback for seconds and would otherwise leave the
+/// verdict waiting for a second sample it cannot get (see
+/// [`ln8000::battery_policy::HOLD_FRONT_RUN`]; measured 23.09: 8,7 s from cable to AC).
+static mut ONLINE_HOLD: Hold = Hold::front_armed();
 /// Hysteresis of the "charging" flag: Iin drops to the ADC floor (39 mA) on every
 /// QC3 pulse and mode transition, so the hold is longer - [`CHARGING_HOLD_MS`].
+///
+/// Run-armed, unlike the online flag: the charging witness carries history (a window
+/// peak and a SOC rise up to [`ln8000::battery_policy::SOC_RISE_HOLD_MS`] old) and
+/// cannot turn true before the bring-up has run, so a second sample costs it nothing.
 static mut CHARGING_HOLD: Hold = Hold::new();
 /// Consecutive ticks the hardware's "VBUS gone" verdict has held with no current.
 ///

@@ -29,7 +29,7 @@ PnpLockDown = 1
 ; already has. It must stay ABOVE every ln8000_kmdf package already in the
 ; tablet's DriverStore - a lower DriverVer is refused as "Outranked". The query
 ; that lists them is in docs/RELEASE.md ("the Outranked trap").
-DriverVer   = 09/22/2026,20.47.10.672
+DriverVer   = 09/24/2026,20.47.10.674
 
 [DestinationDirs]
 DefaultDestDir = 13
